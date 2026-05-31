@@ -1,0 +1,542 @@
+diff --git a/kernel/kernel.c b/kernel/kernel.c
+index 8c60fde..98ce6fa 100644
+--- a/kernel/kernel.c
++++ b/kernel/kernel.c
+@@ -15,6 +15,7 @@
+ #include "../fs/ramfs.h"
+ #include "../fs/diskfs.h"
+ #include "../fs/blockfs.h"
++#include "../fs/devfs.h"
+ #include "../drivers/ata.h"
+ #include "../auth/users.h"
+ #include "../process/process.h"
+@@ -105,6 +106,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
+         ok("No ATA disk (filesystem is RAM-only this session)");
+     }
+ 
++    /* Populate /dev with character devices (/dev/sda, zero, null, random).
++     * Must come after ata_init() so /dev/sda is created when a disk exists. */
++    devfs_init();            ok("Device files in /dev (sda, zero, null, random)");
++
+     /* Users (reads /etc/passwd which may now come from disk) */
+     users_init();            ok("User accounts (/etc/passwd, /etc/shadow)");
+ 
+diff --git a/shell/commands.c b/shell/commands.c
+index 70268eb..ab4356e 100644
+--- a/shell/commands.c
++++ b/shell/commands.c
+@@ -1277,6 +1277,271 @@ static int cmd_sync(int argc, char **argv)
+     return 1;
+ }
+ 
++/* ---------- dd: convert and copy a file (Linux-style) ----------
++ *
++ * Supported operands (all of the classic ones that make sense here):
++ *
++ *   if=FILE        input file/device  (default: read from pipe stdin)
++ *   of=FILE        output file/device (default: write to terminal)
++ *   bs=N           block size in bytes (default 512). Accepts suffixes:
++ *                  c=1, w=2, b=512, k/K=1024, M=1024*1024
++ *   ibs=N, obs=N   separate input/output block sizes (override bs=)
++ *   count=N        copy at most N input blocks (default: until EOF)
++ *   skip=N         skip N ibs-sized blocks at the start of input
++ *   seek=N         seek N obs-sized blocks at the start of output
++ *   conv=LIST      comma-separated: notrunc, sync, noerror
++ *                    notrunc - don't truncate output before writing
++ *                    sync    - pad each input block with zeros to ibs
++ *                    noerror - keep going past short reads
++ *   status=LEVEL   none | noxfer | progress (progress prints a live counter)
++ *
++ * Examples:
++ *   dd if=/dev/zero of=/tmp/big.bin bs=1K count=64
++ *   dd if=/dev/sda  of=/tmp/mbr.bin bs=512 count=1
++ *   dd if=hello.txt of=/dev/null
++ *   dd if=/dev/random of=/tmp/noise bs=16 count=4
++ */
++
++/* Parse a size like "512", "4K", "2M", "1b". Returns 0 on parse error. */
++static uint32_t dd_parse_size(const char *s)
++{
++    if (!s || !*s) return 0;
++    uint32_t v = 0;
++    while (*s >= '0' && *s <= '9') {
++        v = v * 10 + (uint32_t)(*s - '0');
++        s++;
++    }
++    /* unit suffix */
++    switch (*s) {
++        case 0:  return v;
++        case 'c': return v * 1u;
++        case 'w': return v * 2u;
++        case 'b': return v * 512u;
++        case 'k': case 'K': return v * 1024u;
++        case 'M': return v * 1024u * 1024u;
++        default:  return 0;
++    }
++}
++
++static bool dd_str_startswith(const char *s, const char *prefix)
++{
++    while (*prefix) {
++        if (*s++ != *prefix++) return false;
++    }
++    return true;
++}
++
++static int cmd_dd(int argc, char **argv)
++{
++    const char *if_path = NULL, *of_path = NULL;
++    uint32_t ibs = 512, obs = 512;
++    bool bs_set = false, ibs_set = false, obs_set = false;
++    uint32_t count = 0;            /* 0 == unlimited */
++    uint32_t skip = 0, seek = 0;
++    bool conv_notrunc = false, conv_sync = false, conv_noerror = false;
++    enum { ST_DEFAULT, ST_NONE, ST_NOXFER, ST_PROGRESS } status = ST_DEFAULT;
++
++    for (int i = 1; i < argc; i++) {
++        const char *a = argv[i];
++        if (dd_str_startswith(a, "if=")) {
++            if_path = a + 3;
++        } else if (dd_str_startswith(a, "of=")) {
++            of_path = a + 3;
++        } else if (dd_str_startswith(a, "bs=")) {
++            uint32_t v = dd_parse_size(a + 3);
++            if (v == 0) { kprintf("dd: invalid bs=%s\n", a + 3); return 1; }
++            ibs = obs = v; bs_set = true;
++        } else if (dd_str_startswith(a, "ibs=")) {
++            uint32_t v = dd_parse_size(a + 4);
++            if (v == 0) { kprintf("dd: invalid ibs=%s\n", a + 4); return 1; }
++            ibs = v; ibs_set = true;
++        } else if (dd_str_startswith(a, "obs=")) {
++            uint32_t v = dd_parse_size(a + 4);
++            if (v == 0) { kprintf("dd: invalid obs=%s\n", a + 4); return 1; }
++            obs = v; obs_set = true;
++        } else if (dd_str_startswith(a, "count=")) {
++            count = (uint32_t)atoi(a + 6);
++        } else if (dd_str_startswith(a, "skip=")) {
++            skip = (uint32_t)atoi(a + 5);
++        } else if (dd_str_startswith(a, "seek=")) {
++            seek = (uint32_t)atoi(a + 5);
++        } else if (dd_str_startswith(a, "conv=")) {
++            const char *p = a + 5;
++            char tok[32]; int ti = 0;
++            for (;; p++) {
++                if (*p == ',' || *p == 0) {
++                    tok[ti] = 0; ti = 0;
++                    if (strcmp(tok, "notrunc") == 0) conv_notrunc = true;
++                    else if (strcmp(tok, "sync") == 0) conv_sync = true;
++                    else if (strcmp(tok, "noerror") == 0) conv_noerror = true;
++                    else if (tok[0]) {
++                        kprintf("dd: unknown conv=%s\n", tok); return 1;
++                    }
++                    if (*p == 0) break;
++                } else if (ti < (int)sizeof(tok) - 1) {
++                    tok[ti++] = *p;
++                }
++            }
++        } else if (dd_str_startswith(a, "status=")) {
++            const char *v = a + 7;
++            if (strcmp(v, "none") == 0)         status = ST_NONE;
++            else if (strcmp(v, "noxfer") == 0)  status = ST_NOXFER;
++            else if (strcmp(v, "progress") == 0) status = ST_PROGRESS;
++            else { kprintf("dd: bad status=%s\n", v); return 1; }
++        } else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
++            kprintf("usage: dd [if=FILE] [of=FILE] [bs=N] [count=N] "
++                    "[skip=N] [seek=N] [conv=notrunc,sync,noerror] "
++                    "[status=progress]\n");
++            return 0;
++        } else {
++            kprintf("dd: unrecognized operand '%s'\n", a);
++            return 1;
++        }
++    }
++    (void)bs_set; (void)ibs_set; (void)obs_set;
++
++    /* ---- open input ---- */
++    vfs_node_t *in_node  = NULL;
++    uint32_t    in_off   = 0;
++    shell_state_t *s = shell_get_state();
++    const uint8_t *pipe_buf = NULL;
++    uint32_t       pipe_len = 0;
++
++    if (if_path) {
++        in_node = resolve_arg(if_path);
++        if (!in_node) {
++            kprintf("dd: %s: No such file or directory\n", if_path); return 1;
++        }
++        if (in_node->type == VFS_DIRECTORY) {
++            kprintf("dd: %s: Is a directory\n", if_path); return 1;
++        }
++        if (!vfs_check_access(in_node, ACC_READ)) {
++            kprintf("dd: %s: Permission denied\n", if_path); return 1;
++        }
++        in_off = skip * ibs;
++    } else if (s->pipe_in) {
++        pipe_buf = (const uint8_t *)s->pipe_in;
++        pipe_len = s->pipe_in_len;
++        if (skip * ibs >= pipe_len) pipe_len = 0;
++        else { pipe_buf += skip * ibs; pipe_len -= skip * ibs; }
++    } else {
++        kprintf("dd: no input (use if=FILE or pipe into dd)\n"); return 1;
++    }
++
++    /* ---- open output ---- */
++    vfs_node_t *out_node = NULL;
++    uint32_t    out_off  = 0;
++    if (of_path) {
++        out_node = resolve_arg(of_path);
++        if (!out_node) {
++            /* create it */
++            out_node = vfs_create(of_path, s->cwd);
++            if (!out_node) {
++                kprintf("dd: cannot create '%s'\n", of_path); return 1;
++            }
++        }
++        if (out_node->type == VFS_DIRECTORY) {
++            kprintf("dd: %s: Is a directory\n", of_path); return 1;
++        }
++        if (!vfs_check_access(out_node, ACC_WRITE)) {
++            kprintf("dd: %s: Permission denied\n", of_path); return 1;
++        }
++        /* Regular files: truncate unless conv=notrunc. Devices keep their
++         * "size" field as a capacity hint, so we never touch it. */
++        if (!conv_notrunc && out_node->type == VFS_FILE) {
++            out_node->size = 0;
++        }
++        out_off = seek * obs;
++    }
++
++    /* Use a heap buffer so we can support large bs= (e.g. 1M). */
++    uint8_t *buf = (uint8_t *)kmalloc(ibs);
++    if (!buf) { kprintf("dd: out of memory\n"); return 1; }
++
++    /* ---- copy loop ---- */
++    uint32_t blocks_in_full = 0, blocks_in_part = 0;
++    uint32_t blocks_out_full = 0, blocks_out_part = 0;
++    uint32_t bytes_total = 0;
++    uint32_t t_start = uptime();
++    uint32_t next_progress = t_start + 1;
++
++    for (uint32_t b = 0; count == 0 || b < count; b++) {
++        uint32_t got;
++        if (in_node) {
++            got = vfs_read(in_node, in_off, ibs, buf);
++            in_off += got;
++        } else {
++            got = (pipe_len > ibs) ? ibs : pipe_len;
++            if (got) memcpy(buf, pipe_buf, got);
++            pipe_buf += got; pipe_len -= got;
++        }
++        if (got == 0) break;        /* EOF */
++
++        bool partial = (got < ibs);
++        if (partial) {
++            if (conv_sync) { memset(buf + got, 0, ibs - got); got = ibs; }
++            if (!conv_noerror && got < ibs && !conv_sync) {
++                /* still write what we got, then exit the loop normally */
++            }
++        }
++        if (partial && (conv_sync || got == ibs)) blocks_in_full++;
++        else if (partial) blocks_in_part++;
++        else blocks_in_full++;
++
++        /* write ---- */
++        uint32_t left = got, src = 0;
++        while (left > 0) {
++            uint32_t chunk = (left > obs) ? obs : left;
++            uint32_t wrote;
++            if (out_node) {
++                wrote = vfs_write(out_node, out_off, chunk, buf + src);
++                out_off += wrote;
++                if (out_node->type == VFS_FILE && out_off > out_node->size)
++                    out_node->size = out_off;
++            } else {
++                /* stdout: emit to terminal */
++                for (uint32_t i = 0; i < chunk; i++)
++                    vga_putchar((char)buf[src + i]);
++                wrote = chunk;
++            }
++            if (wrote == 0) {
++                kprintf("\ndd: write error at offset %u\n", out_off);
++                kfree(buf);
++                return 1;
++            }
++            if (wrote < chunk) blocks_out_part++;
++            else if (chunk == obs) blocks_out_full++;
++            else blocks_out_part++;
++            bytes_total += wrote;
++            left -= wrote; src += wrote;
++        }
++
++        /* live progress */
++        if (status == ST_PROGRESS && uptime() >= next_progress) {
++            kprintf("\r%u bytes copied", bytes_total);
++            next_progress = uptime() + 1;
++        }
++
++        if (partial && !conv_noerror) break;   /* short read -> stop */
++    }
++
++    kfree(buf);
++
++    /* ---- final report ---- */
++    if (status != ST_NONE) {
++        if (status == ST_PROGRESS) kprintf("\n");
++        kprintf("%u+%u records in\n",  blocks_in_full,  blocks_in_part);
++        kprintf("%u+%u records out\n", blocks_out_full, blocks_out_part);
++        if (status != ST_NOXFER) {
++            uint32_t secs = uptime() - t_start;
++            if (secs == 0) secs = 1;
++            kprintf("%u bytes copied, %u s, %u B/s\n",
++                    bytes_total, secs, bytes_total / secs);
++        }
++    }
++    return 0;
++}
++
+ static int cmd_help(int argc, char **argv);   /* fwd */
+ 
+ /* ---------- command table ---------- */
+@@ -1307,6 +1572,7 @@ static const command_t table[] = {
+     {"grep",     cmd_grep,     "filter lines matching a pattern (-ivnc)"},
+     {"umask",    cmd_umask,    "show/set default permission mask"},
+     {"sync",     cmd_sync,     "save the filesystem to disk (persist)"},
++    {"dd",       cmd_dd,       "convert and copy (dd if=/dev/zero of=f bs=1K count=4)"},
+     {"clear",    cmd_clear,    "clear the screen"},
+     {"cls",      cmd_clear,    "clear the screen"},
+     {"uname",    cmd_uname,    "system info (-a for all)"},
+diff --git a/fs/devfs.h b/fs/devfs.h
+new file mode 100644
+--- /dev/null
++++ b/fs/devfs.h
+@@ -0,0 +1,21 @@
++/* fs/devfs.h  -  populate /dev with the classic Unix character devices.
++ *
++ * Creates VFS device nodes under /dev:
++ *   /dev/sda     - raw access to the primary ATA master (only if a disk is
++ *                  present). Reads/writes go byte-addressed through the ATA
++ *                  driver (sector-aligned chunks are buffered transparently).
++ *   /dev/zero    - infinite source of 0x00 bytes; writes are discarded.
++ *   /dev/null    - the bit bucket: reads return EOF, writes are discarded.
++ *   /dev/random  - pseudo-random byte stream (deterministic LCG seeded from
++ *                  the timer; perfectly fine for educational use, not crypto).
++ *
++ * Call devfs_init() once at boot, AFTER ramfs_init() and ata_init().
++ */
++#ifndef FS_DEVFS_H
++#define FS_DEVFS_H
++
++#include "../lib/types.h"
++
++void devfs_init(void);
++
++#endif /* FS_DEVFS_H */
+diff --git a/fs/devfs.c b/fs/devfs.c
+new file mode 100644
+--- /dev/null
++++ b/fs/devfs.c
+@@ -0,0 +1,204 @@
++/* fs/devfs.c  -  /dev/{sda,zero,null,random} character devices.
++ *
++ * Each device is a regular VFS node of type VFS_DEVICE with its own read/write
++ * callbacks. This means every existing tool (cat, hexdump, dd, cp, ...) works
++ * with them out of the box, because they all go through vfs_read/vfs_write.
++ *
++ * /dev/sda is the most interesting one: it exposes the raw disk as a byte
++ * stream. Since ATA only knows about 512-byte sectors, we transparently
++ * read-modify-write whole sectors when the caller's range is not aligned.
++ * `dd if=/dev/sda of=backup.img bs=512 count=100` Just Works.
++ */
++#include "devfs.h"
++#include "vfs.h"
++#include "ramfs.h"
++#include "../drivers/ata.h"
++#include "../drivers/timer.h"
++#include "../lib/string.h"
++
++/* ---------- /dev/zero ---------- */
++
++static uint32_t zero_read(vfs_node_t *n, uint32_t off, uint32_t size,
++                          uint8_t *buf)
++{
++    (void)n; (void)off;
++    memset(buf, 0, size);
++    return size;
++}
++
++static uint32_t zero_write(vfs_node_t *n, uint32_t off, uint32_t size,
++                           uint8_t *buf)
++{
++    (void)n; (void)off; (void)buf;
++    return size;   /* silently consume everything */
++}
++
++/* ---------- /dev/null ---------- */
++
++static uint32_t null_read(vfs_node_t *n, uint32_t off, uint32_t size,
++                          uint8_t *buf)
++{
++    (void)n; (void)off; (void)size; (void)buf;
++    return 0;      /* always EOF */
++}
++
++static uint32_t null_write(vfs_node_t *n, uint32_t off, uint32_t size,
++                           uint8_t *buf)
++{
++    (void)n; (void)off; (void)buf;
++    return size;
++}
++
++/* ---------- /dev/random  (LCG, NOT cryptographic) ---------- */
++
++static uint32_t rand_state = 0xCAFEBABEu;
++
++static uint32_t rand_next(void)
++{
++    /* Numerical Recipes LCG; perfectly fine for an educational kernel. */
++    rand_state = rand_state * 1664525u + 1013904223u;
++    return rand_state;
++}
++
++static uint32_t random_read(vfs_node_t *n, uint32_t off, uint32_t size,
++                            uint8_t *buf)
++{
++    (void)n; (void)off;
++    /* Stir with the current tick count so consecutive opens differ. */
++    rand_state ^= uptime() * 2654435761u;
++    for (uint32_t i = 0; i < size; i++)
++        buf[i] = (uint8_t)(rand_next() >> 24);
++    return size;
++}
++
++static uint32_t random_write(vfs_node_t *n, uint32_t off, uint32_t size,
++                             uint8_t *buf)
++{
++    /* Writes mix into the entropy pool. */
++    (void)n; (void)off;
++    for (uint32_t i = 0; i < size; i++)
++        rand_state = rand_state * 31u + buf[i];
++    return size;
++}
++
++/* ---------- /dev/sda  (raw ATA disk, byte-addressed) ---------- */
++
++/* Read `size` bytes starting at byte offset `off` from the raw disk into buf.
++ * Handles unaligned starts/ends by reading the surrounding sector(s). */
++static uint32_t sda_read(vfs_node_t *n, uint32_t off, uint32_t size,
++                         uint8_t *buf)
++{
++    (void)n;
++    if (!ata_present()) return 0;
++
++    uint32_t disk_bytes = ata_total_sectors() * ATA_SECTOR_SIZE;
++    if (off >= disk_bytes) return 0;
++    if (off + size > disk_bytes) size = disk_bytes - off;
++    if (size == 0) return 0;
++
++    uint8_t sect[ATA_SECTOR_SIZE];
++    uint32_t done = 0;
++    while (done < size) {
++        uint32_t pos     = off + done;
++        uint32_t lba     = pos / ATA_SECTOR_SIZE;
++        uint32_t soff    = pos % ATA_SECTOR_SIZE;
++        uint32_t want    = size - done;
++
++        /* Fast path: aligned full-sector reads, do them in big chunks. */
++        if (soff == 0 && want >= ATA_SECTOR_SIZE) {
++            uint32_t nsec = want / ATA_SECTOR_SIZE;
++            if (nsec > 255) nsec = 255;     /* LBA28 PIO limit per command */
++            if (ata_read_sectors(lba, (uint8_t)nsec, buf + done) != 0)
++                break;
++            done += nsec * ATA_SECTOR_SIZE;
++            continue;
++        }
++
++        /* Slow path: partial sector, buffer one sector and memcpy. */
++        if (ata_read_sectors(lba, 1, sect) != 0) break;
++        uint32_t chunk = ATA_SECTOR_SIZE - soff;
++        if (chunk > want) chunk = want;
++        memcpy(buf + done, sect + soff, chunk);
++        done += chunk;
++    }
++    return done;
++}
++
++/* Write `size` bytes to the raw disk at byte offset `off`. Unaligned regions
++ * trigger a read-modify-write of the affected sector(s). */
++static uint32_t sda_write(vfs_node_t *n, uint32_t off, uint32_t size,
++                          uint8_t *buf)
++{
++    (void)n;
++    if (!ata_present()) return 0;
++
++    uint32_t disk_bytes = ata_total_sectors() * ATA_SECTOR_SIZE;
++    if (off >= disk_bytes) return 0;
++    if (off + size > disk_bytes) size = disk_bytes - off;
++    if (size == 0) return 0;
++
++    uint8_t sect[ATA_SECTOR_SIZE];
++    uint32_t done = 0;
++    while (done < size) {
++        uint32_t pos  = off + done;
++        uint32_t lba  = pos / ATA_SECTOR_SIZE;
++        uint32_t soff = pos % ATA_SECTOR_SIZE;
++        uint32_t want = size - done;
++
++        if (soff == 0 && want >= ATA_SECTOR_SIZE) {
++            uint32_t nsec = want / ATA_SECTOR_SIZE;
++            if (nsec > 255) nsec = 255;
++            if (ata_write_sectors(lba, (uint8_t)nsec, buf + done) != 0)
++                break;
++            done += nsec * ATA_SECTOR_SIZE;
++            continue;
++        }
++
++        /* read-modify-write the partial sector */
++        if (ata_read_sectors(lba, 1, sect) != 0) break;
++        uint32_t chunk = ATA_SECTOR_SIZE - soff;
++        if (chunk > want) chunk = want;
++        memcpy(sect + soff, buf + done, chunk);
++        if (ata_write_sectors(lba, 1, sect) != 0) break;
++        done += chunk;
++    }
++    return done;
++}
++
++/* ---------- init ---------- */
++
++static vfs_node_t *make_dev(vfs_node_t *dev_dir, const char *name,
++                            read_fn r, write_fn w, uint32_t size,
++                            uint32_t perms)
++{
++    vfs_node_t *n = ramfs_create_node(dev_dir, name, VFS_DEVICE);
++    if (!n) return NULL;
++    n->read        = r;
++    n->write       = w;
++    n->size        = size;
++    n->permissions = perms;
++    n->owner_uid   = 0;   /* root */
++    n->owner_gid   = 0;
++    return n;
++}
++
++void devfs_init(void)
++{
++    /* /dev was created by ramfs_init(); just look it up. */
++    vfs_node_t *root = vfs_get_root();
++    vfs_node_t *dev  = vfs_finddir(root, "dev");
++    if (!dev) return;
++
++    /* world-readable pseudo devices */
++    make_dev(dev, "zero",   zero_read,   zero_write,   0, 0666);
++    make_dev(dev, "null",   null_read,   null_write,   0, 0666);
++    make_dev(dev, "random", random_read, random_write, 0, 0644);
++
++    /* /dev/sda only if a real disk is attached. Its "size" is the disk size
++     * in bytes, so `stat /dev/sda` and `ls -l /dev/sda` show the capacity. */
++    if (ata_present()) {
++        uint32_t bytes = ata_total_sectors() * ATA_SECTOR_SIZE;
++        /* root rw, group/others read-only — same as Linux's default for sdX */
++        make_dev(dev, "sda", sda_read, sda_write, bytes, 0640);
++    }
++}
