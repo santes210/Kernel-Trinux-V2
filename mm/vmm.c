@@ -55,13 +55,20 @@ void vmm_init(void)
 {
     memset(page_directory, 0, sizeof(page_directory));
 
-    /* Identity-map the first 256 MiB (covers kernel + the 96 MiB heap). */
+    /* Identity-map the first 256 MiB (covers kernel + the heap).
+     *
+     * We add PAGE_USER so ring-3 (userspace) code can execute and access its
+     * own stack/data, which live in this same identity-mapped region (this is
+     * a single-address-space kernel: privilege is enforced by the CPL of the
+     * code segment, not by separate page tables per process). The kernel still
+     * runs at CPL 0 and userspace at CPL 3 via the GDT selectors. */
     for (int t = 0; t < IDENTITY_TABLES; t++) {
         for (int p = 0; p < PAGES_PER_TABLE; p++) {
             uint32_t phys = (t * PAGES_PER_TABLE + p) * 0x1000;
-            page_tables[t][p] = phys | PAGE_PRESENT | PAGE_RW;
+            page_tables[t][p] = phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
         }
-        page_directory[t] = ((uint32_t)page_tables[t]) | PAGE_PRESENT | PAGE_RW;
+        page_directory[t] = ((uint32_t)page_tables[t])
+                            | PAGE_PRESENT | PAGE_RW | PAGE_USER;
     }
 
     isr_register_handler(14, page_fault_handler);

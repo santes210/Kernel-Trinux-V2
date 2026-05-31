@@ -11,7 +11,7 @@ typedef enum {
 } proc_state_t;
 
 #define PROC_NAME_MAX 32
-#define MAX_PROCESSES 64
+#define MAX_PROCESSES 128
 
 /* Saved CPU context for cooperative/round-robin switching. */
 typedef struct {

@@ -17,6 +17,8 @@
 #include "../lib/string.h"
 #include "../lib/printf.h"
 #include "../include/kernel.h"
+#include "../cpu/syscall.h"
+#include "../user/userprog.h"
 
 #define READ_BUF 4096
 
@@ -52,16 +54,35 @@ static void perm_string(uint32_t type, uint32_t perms, char *out)
 
 /* ---------- navigation & files ---------- */
 
+/* Pick a VGA colour for a directory entry, ls/dircolors style:
+ *   directories   -> light blue
+ *   executables   -> light green (any rwx execute bit set)
+ *   regular files -> default grey */
+static uint8_t ls_entry_color(vfs_node_t *n)
+{
+    if (n->type == VFS_DIRECTORY)
+        return vga_entry_color(VGA_LIGHT_BLUE, VGA_BLACK);
+    if (n->permissions & 0111)   /* any execute bit -> executable */
+        return vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK);
+    return vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK);
+}
+
 static int cmd_ls(int argc, char **argv)
 {
     bool longfmt = false;
+    bool showall = false;        /* -a: include dotfiles */
     const char *target = NULL;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-l") == 0)
-            longfmt = true;
-        else
+        /* support combined short flags, e.g. "-la" / "-al" */
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            for (const char *f = argv[i] + 1; *f; f++) {
+                if (*f == 'l') longfmt = true;
+                else if (*f == 'a') showall = true;
+            }
+        } else {
             target = argv[i];
+        }
     }
 
     vfs_node_t *node = target ? resolve_arg(target)
@@ -84,28 +105,28 @@ static int cmd_ls(int argc, char **argv)
         return 0;
     }
 
+    bool printed = false;
     for (uint32_t i = 0; ; i++) {
         vfs_node_t *child = vfs_readdir(node, i);
         if (!child)
             break;
+        /* hide dotfiles unless -a was given */
+        if (!showall && child->name[0] == '.')
+            continue;
         if (longfmt) {
             char perms[11];
             perm_string(child->type, child->permissions, perms);
             kprintf("%s %-6s %6u  ", perms,
                     users_name_for_uid(child->owner_uid), child->size);
         }
-        if (child->type == VFS_DIRECTORY) {
-            vga_print_color(child->name,
-                            vga_entry_color(VGA_LIGHT_BLUE, VGA_BLACK));
+        vga_print_color(child->name, ls_entry_color(child));
+        if (child->type == VFS_DIRECTORY)
             kprintf("/");
-            if (!longfmt) kprintf("  ");
-        } else {
-            kprintf("%s", child->name);
-            if (!longfmt) kprintf("  ");
-        }
+        if (!longfmt) kprintf("  ");
         if (longfmt) kprintf("\n");
+        printed = true;
     }
-    if (!longfmt) kprintf("\n");
+    if (!longfmt && printed) kprintf("\n");
     return 0;
 }
 
@@ -161,7 +182,7 @@ static const char *diagnose_create_failure(const char *path, vfs_node_t *cwd)
     if (!vfs_check_access(parent, ACC_WRITE)) return "Permission denied";
     if (vfs_finddir(parent, name))            return "File exists";
     if (parent->child_count >= VFS_MAX_CHILDREN)
-        return "Directory full (max 64 entries per dir)";
+        return "Directory full (too many entries per dir)";
     return "Out of memory";
 }
 
@@ -803,6 +824,320 @@ static int cmd_wc(int argc, char **argv)
         if (r < sizeof(buf)) break;
     }
     kprintf("  %u  %u  %u  %s\n", lines, words, chars, argv[1]);
+    return 0;
+}
+
+/* ---------- text-processing filters (sort/uniq/cut/tee/seq) ----------
+ *
+ * These all share one pattern: gather input text from either a file argument
+ * or the pipe (stdin), then transform it. gather_input() centralizes that. */
+
+/* Load input text into `buf` (NUL-terminated). Source is the file `path` if
+ * non-NULL, otherwise the shell pipe. Returns the length, or -1 on error
+ * (after printing a message prefixed with `who`). */
+static int gather_input(const char *who, const char *path,
+                        char *buf, uint32_t bufsz)
+{
+    shell_state_t *s = shell_get_state();
+    uint32_t len = 0;
+    if (path) {
+        vfs_node_t *node = resolve_arg(path);
+        if (!node || node->type != VFS_FILE) {
+            kprintf("%s: %s: No such file\n", who, path);
+            return -1;
+        }
+        if (!vfs_check_access(node, ACC_READ)) {
+            kprintf("%s: %s: Permission denied\n", who, path);
+            return -1;
+        }
+        len = vfs_read(node, 0, bufsz - 1, (uint8_t *)buf);
+    } else if (s->pipe_in) {
+        len = s->pipe_in_len;
+        if (len > bufsz - 1) len = bufsz - 1;
+        memcpy(buf, s->pipe_in, len);
+    } else {
+        kprintf("%s: no input (give a file or use a pipe)\n", who);
+        return -1;
+    }
+    buf[len] = '\0';
+    return (int)len;
+}
+
+/* sort: print input lines in ascending order. Flags: -r (reverse),
+ * -u (unique, drop adjacent-after-sort duplicates), -n (numeric). */
+#define MAX_LINES 256
+static int cmd_sort(int argc, char **argv)
+{
+    bool reverse = false, uniq = false, numeric = false;
+    const char *file = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1]) {
+            for (const char *f = argv[i] + 1; *f; f++) {
+                if (*f == 'r') reverse = true;
+                else if (*f == 'u') uniq = true;
+                else if (*f == 'n') numeric = true;
+            }
+        } else file = argv[i];
+    }
+
+    static char data[8192];
+    int len = gather_input("sort", file, data, sizeof(data));
+    if (len < 0) return 1;
+
+    /* split into lines (in place) */
+    char *lines[MAX_LINES];
+    int n = 0;
+    char *p = data;
+    while (*p && n < MAX_LINES) {
+        lines[n++] = p;
+        char *nl = strchr(p, '\n');
+        if (!nl) break;
+        *nl = '\0';
+        p = nl + 1;
+    }
+
+    /* simple insertion sort (n is small, lines are short) */
+    for (int i = 1; i < n; i++) {
+        char *key = lines[i];
+        int j = i - 1;
+        while (j >= 0) {
+            int cmp;
+            if (numeric) cmp = atoi(lines[j]) - atoi(key);
+            else         cmp = strcmp(lines[j], key);
+            bool swap = reverse ? (cmp < 0) : (cmp > 0);
+            if (!swap) break;
+            lines[j + 1] = lines[j];
+            j--;
+        }
+        lines[j + 1] = key;
+    }
+
+    const char *prev = NULL;
+    for (int i = 0; i < n; i++) {
+        if (uniq && prev && strcmp(prev, lines[i]) == 0) continue;
+        kprintf("%s\n", lines[i]);
+        prev = lines[i];
+    }
+    return 0;
+}
+
+/* uniq: collapse *adjacent* duplicate lines. -c prefixes each with its count. */
+static int cmd_uniq(int argc, char **argv)
+{
+    bool count = false;
+    const char *file = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0) count = true;
+        else file = argv[i];
+    }
+
+    static char data[8192];
+    int len = gather_input("uniq", file, data, sizeof(data));
+    if (len < 0) return 1;
+
+    char *p = data;
+    char prev[1024]; prev[0] = '\0';
+    bool have_prev = false;
+    uint32_t run = 0;
+    while (*p) {
+        char line[1024];
+        int i = 0;
+        while (*p && *p != '\n' && i < (int)sizeof(line) - 1) line[i++] = *p++;
+        line[i] = '\0';
+        if (*p == '\n') p++;
+
+        if (have_prev && strcmp(prev, line) == 0) {
+            run++;
+        } else {
+            if (have_prev) {
+                if (count) kprintf("%7u %s\n", run, prev);
+                else       kprintf("%s\n", prev);
+            }
+            strncpy(prev, line, sizeof(prev) - 1);
+            prev[sizeof(prev) - 1] = '\0';
+            have_prev = true;
+            run = 1;
+        }
+    }
+    if (have_prev) {
+        if (count) kprintf("%7u %s\n", run, prev);
+        else       kprintf("%s\n", prev);
+    }
+    return 0;
+}
+
+/* cut: select fields/characters from each line.
+ *   cut -d<delim> -f<n>   field n (1-based) split on <delim>
+ *   cut -c<n>             character n (1-based) of each line */
+static int cmd_cut(int argc, char **argv)
+{
+    char delim = '\t';
+    int field = 0, charpos = 0;
+    const char *file = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1] == 'd') {
+            delim = argv[i][2] ? argv[i][2] : (i + 1 < argc ? argv[++i][0] : '\t');
+        } else if (argv[i][0] == '-' && argv[i][1] == 'f') {
+            field = argv[i][2] ? atoi(argv[i] + 2) : (i + 1 < argc ? atoi(argv[++i]) : 0);
+        } else if (argv[i][0] == '-' && argv[i][1] == 'c') {
+            charpos = argv[i][2] ? atoi(argv[i] + 2) : (i + 1 < argc ? atoi(argv[++i]) : 0);
+        } else {
+            file = argv[i];
+        }
+    }
+    if (field == 0 && charpos == 0) {
+        kprintf("usage: cut -f<n> [-d<delim>] | -c<n>  [file]\n");
+        return 1;
+    }
+
+    static char data[8192];
+    int len = gather_input("cut", file, data, sizeof(data));
+    if (len < 0) return 1;
+
+    char *p = data;
+    while (*p) {
+        char line[1024];
+        int i = 0;
+        while (*p && *p != '\n' && i < (int)sizeof(line) - 1) line[i++] = *p++;
+        line[i] = '\0';
+        if (*p == '\n') p++;
+
+        if (charpos > 0) {
+            int L = (int)strlen(line);
+            if (charpos <= L) kprintf("%c\n", line[charpos - 1]);
+            else kprintf("\n");
+        } else {
+            /* split on delim, print the field-th token */
+            int f = 1; char *start = line; bool printed = false;
+            for (char *q = line; ; q++) {
+                if (*q == delim || *q == '\0') {
+                    if (f == field) {
+                        char save = *q; *q = '\0';
+                        kprintf("%s\n", start); *q = save;
+                        printed = true; break;
+                    }
+                    f++;
+                    start = q + 1;
+                    if (*q == '\0') break;
+                }
+            }
+            if (!printed) kprintf("\n");
+        }
+    }
+    return 0;
+}
+
+/* tee: copy stdin to a file AND to the terminal. */
+static int cmd_tee(int argc, char **argv)
+{
+    bool append = false;
+    const char *file = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-a") == 0) append = true;
+        else file = argv[i];
+    }
+    if (!file) { kprintf("usage: tee [-a] <file>\n"); return 1; }
+
+    static char data[8192];
+    int len = gather_input("tee", NULL, data, sizeof(data));
+    if (len < 0) return 1;
+
+    /* echo to terminal */
+    for (int i = 0; i < len; i++) vga_putchar(data[i]);
+
+    /* write to file */
+    vfs_node_t *node = vfs_create(file, shell_get_state()->cwd);
+    if (!node) {
+        kprintf("tee: cannot write '%s': %s\n", file,
+                diagnose_create_failure(file, shell_get_state()->cwd));
+        return 1;
+    }
+    if (!append) node->size = 0;
+    vfs_write(node, node->size, (uint32_t)len, (uint8_t *)data);
+    return 0;
+}
+
+/* seq: print a sequence of numbers. seq N | seq A B | seq A STEP B */
+static int cmd_seq(int argc, char **argv)
+{
+    if (argc < 2) { kprintf("usage: seq [first [incr]] last\n"); return 1; }
+    int first = 1, incr = 1, last;
+    if (argc == 2)      { last = atoi(argv[1]); }
+    else if (argc == 3) { first = atoi(argv[1]); last = atoi(argv[2]); }
+    else                { first = atoi(argv[1]); incr = atoi(argv[2]); last = atoi(argv[3]); }
+    if (incr == 0) { kprintf("seq: increment must not be zero\n"); return 1; }
+
+    if (incr > 0) for (int v = first; v <= last; v += incr) kprintf("%d\n", v);
+    else          for (int v = first; v >= last; v += incr) kprintf("%d\n", v);
+    return 0;
+}
+
+/* basename: strip directory (and optional suffix) from a path. */
+static int cmd_basename(int argc, char **argv)
+{
+    if (argc < 2) { kprintf("usage: basename <path> [suffix]\n"); return 1; }
+    char out[PATH_MAX];
+    path_basename(argv[1], out);
+    if (argc > 2) {
+        int bl = (int)strlen(out), sl = (int)strlen(argv[2]);
+        if (sl < bl && strcmp(out + bl - sl, argv[2]) == 0)
+            out[bl - sl] = '\0';
+    }
+    kprintf("%s\n", out);
+    return 0;
+}
+
+/* dirname: strip the last component from a path. */
+static int cmd_dirname(int argc, char **argv)
+{
+    if (argc < 2) { kprintf("usage: dirname <path>\n"); return 1; }
+    char out[PATH_MAX];
+    path_dirname(argv[1], out);
+    kprintf("%s\n", out);
+    return 0;
+}
+
+/* which: report whether a name is a built-in command. */
+static int cmd_which(int argc, char **argv)
+{
+    if (argc < 2) { kprintf("usage: which <command>\n"); return 1; }
+    int rc = 0;
+    const command_t *t = commands_table();
+    int nt = commands_count();
+    for (int i = 1; i < argc; i++) {
+        bool found = false;
+        for (int j = 0; j < nt; j++) {
+            if (strcmp(t[j].name, argv[i]) == 0) { found = true; break; }
+        }
+        if (found) kprintf("%s: shell built-in command\n", argv[i]);
+        else { kprintf("%s: not found\n", argv[i]); rc = 1; }
+    }
+    return rc;
+}
+
+/* env: print a few environment-like values (this kernel has no real env). */
+static int cmd_env(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    shell_state_t *s = shell_get_state();
+    user_t *u = current_user();
+    char cwd[PATH_MAX];
+    vfs_get_path(s->cwd, cwd);
+    kprintf("USER=%s\n", u ? u->name : s->user);
+    kprintf("HOME=%s\n", (u && u->home[0]) ? u->home : "/home/user");
+    kprintf("HOSTNAME=%s\n", s->hostname);
+    kprintf("PWD=%s\n", cwd);
+    kprintf("SHELL=mysh\n");
+    kprintf("TERM=trinux-vga\n");
+    return 0;
+}
+
+/* yes: repeatedly print a string (bounded so it can't hang the shell). */
+static int cmd_yes(int argc, char **argv)
+{
+    const char *msg = (argc > 1) ? argv[1] : "y";
+    for (int i = 0; i < 100; i++) kprintf("%s\n", msg);
+    kprintf("(yes: stopped after 100 lines)\n");
     return 0;
 }
 
@@ -1773,6 +2108,27 @@ static int cmd_dd(int argc, char **argv)
     return 0;
 }
 
+/* usertest - launch a ring-3 (userspace) program. It runs unprivileged and
+ * can only reach the kernel via int 0x80 syscalls. `usertest bad` runs a
+ * program that tries a privileged instruction to prove isolation works. */
+static int cmd_usertest(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "bad") == 0) {
+        kprintf("Launching ring-3 program that violates privilege...\n");
+        int rc = usermode_run("badboy", userprog_badboy);
+        kprintf("(returned %d)\n", rc);
+        return 0;
+    }
+    kprintf("Dropping to ring 3 and running a userspace demo program.\n");
+    kprintf("It talks to the kernel ONLY through int 0x80 syscalls.\n");
+    int code = usermode_run("usertest", userprog_main);
+    vga_set_color(vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK));
+    kprintf("\n  [ring0] back in the kernel; user program exited with code %d\n",
+            code);
+    vga_set_color(shell_get_state()->color);
+    return 0;
+}
+
 static int cmd_help(int argc, char **argv);   /* fwd */
 
 /* ---------- command table ---------- */
@@ -1801,6 +2157,16 @@ static const command_t table[] = {
     {"tail",     cmd_tail,     "show last n lines"},
     {"wc",       cmd_wc,       "count lines, words, chars (also via pipe)"},
     {"grep",     cmd_grep,     "filter lines matching a pattern (-ivnc)"},
+    {"sort",     cmd_sort,     "sort lines (-r reverse, -u unique, -n numeric)"},
+    {"uniq",     cmd_uniq,     "drop adjacent duplicate lines (-c count)"},
+    {"cut",      cmd_cut,      "select fields/chars (cut -d: -f1, cut -c3)"},
+    {"tee",      cmd_tee,      "copy stdin to a file and the screen (-a append)"},
+    {"seq",      cmd_seq,      "print a number sequence (seq 1 5)"},
+    {"basename", cmd_basename, "strip directory from a path"},
+    {"dirname",  cmd_dirname,  "strip last component from a path"},
+    {"which",    cmd_which,    "locate a built-in command"},
+    {"env",      cmd_env,      "show environment-like values"},
+    {"yes",      cmd_yes,      "repeat a string (bounded to 100 lines)"},
     {"umask",    cmd_umask,    "show/set default permission mask"},
     {"sync",     cmd_sync,     "save the filesystem to disk (persist)"},
     {"dd",       cmd_dd,       "convert and copy (dd if=/dev/zero of=f bs=1K count=4)"},
@@ -1833,17 +2199,38 @@ static const command_t table[] = {
     {"color",    cmd_color,    "change terminal colors"},
     {"history",  cmd_history,  "show command history"},
     {"alias",    cmd_alias,    "create command aliases"},
+    {"usertest", cmd_usertest, "run a ring-3 userspace program (int 0x80 demo)"},
     {"help",     cmd_help,     "show this help"},
 };
 
 static int cmd_help(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    /* help <cmd>: show detailed info for a single command. */
+    if (argc > 1) {
+        for (unsigned i = 0; i < ARRAY_LEN(table); i++) {
+            if (strcmp(table[i].name, argv[1]) == 0) {
+                vga_set_color(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
+                kprintf("%s", table[i].name);
+                vga_set_color(shell_get_state()->color);
+                kprintf(" - %s\n", table[i].help);
+                return 0;
+            }
+        }
+        kprintf("help: no help topic for '%s'. Type 'help' for the list.\n",
+                argv[1]);
+        return 1;
+    }
+
     vga_set_color(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
-    kprintf("Available commands:\n");
+    kprintf("Available commands (try 'help <command>' for details):\n");
     vga_set_color(shell_get_state()->color);
-    for (unsigned i = 0; i < ARRAY_LEN(table); i++)
-        kprintf("  %-10s %s\n", table[i].name, table[i].help);
+    /* print 3 per row to fit the 80-col screen */
+    int col = 0;
+    for (unsigned i = 0; i < ARRAY_LEN(table); i++) {
+        kprintf("  %-12s", table[i].name);
+        if (++col == 4) { kprintf("\n"); col = 0; }
+    }
+    if (col != 0) kprintf("\n");
     return 0;
 }
 

@@ -491,6 +491,7 @@ void shell_login_prompt(void)
  * Recognized syntax:
  *   - Whitespace splits tokens.
  *   - '>'  and '>>' are always their own tokens (even with no spaces).
+ *   - '<'  (input redirection) is always its own token too.
  *   - Double quotes preserve spaces inside; the quote chars are stripped.
  */
 static int tokenize(char *line, char **argv)
@@ -517,12 +518,22 @@ static int tokenize(char *line, char **argv)
             continue;
         }
 
+        /* '<' (input redirection) is a standalone token too */
+        if (*src == '<') {
+            argv[argc++] = dst;
+            *dst++ = '<';
+            src++;
+            if (dst < scratch_end) *dst++ = '\0';
+            continue;
+        }
+
         argv[argc++] = dst;
         bool in_quotes = false;
         while (*src && dst < scratch_end) {
             if (*src == '"') { in_quotes = !in_quotes; src++; continue; }
             if (!in_quotes && (*src == ' ' || *src == '\t')) break;
             if (!in_quotes && *src == '>') break;   /* break BEFORE the '>' */
+            if (!in_quotes && *src == '<') break;   /* break BEFORE the '<' */
             *dst++ = *src++;
         }
         if (dst < scratch_end) *dst++ = '\0';
@@ -574,7 +585,39 @@ static void run_pipeline(char *line)
 
         bool last = (i == nstages - 1);
 
-        /* feed this stage the previous stage's output */
+        /* Input redirection: '< file' on the FIRST stage feeds the file's
+         * contents as stdin (same channel a pipe would use). We read the file
+         * into a static buffer, then strip the '<' and filename from argv so
+         * the command itself never sees them. Only meaningful when this stage
+         * has no piped input already. */
+        static char redir_in[PIPE_BUF];
+        for (int a = 0; a < argc; a++) {
+            if (strcmp(argv[a], "<") == 0) {
+                const char *fname = (a + 1 < argc) ? argv[a + 1] : NULL;
+                if (fname && cur_in == NULL) {
+                    vfs_node_t *f = vfs_resolve(fname, state.cwd);
+                    if (!f || f->type == VFS_DIRECTORY) {
+                        kprintf("%s: No such file or directory\n", fname);
+                    } else {
+                        uint32_t n = vfs_read(f, 0, sizeof(redir_in) - 1,
+                                              (uint8_t *)redir_in);
+                        redir_in[n] = '\0';
+                        cur_in = redir_in;
+                        cur_in_len = n;
+                    }
+                }
+                /* remove '<' and the filename (if present) from argv */
+                int remove = (a + 1 < argc) ? 2 : 1;
+                for (int j = a; j + remove <= argc; j++)
+                    argv[j] = argv[j + remove];
+                argc -= remove;
+                a--;   /* re-check the slot now holding the next token */
+            }
+        }
+        if (argc == 0)
+            continue;
+
+        /* feed this stage the previous stage's output (or redirected file) */
         state.pipe_in = cur_in;
         state.pipe_in_len = cur_in_len;
 

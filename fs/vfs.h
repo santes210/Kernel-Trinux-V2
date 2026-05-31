@@ -8,7 +8,7 @@
 #define VFS_DEVICE    0x04
 
 #define VFS_NAME_MAX  64
-#define VFS_MAX_CHILDREN 64
+#define VFS_MAX_CHILDREN 256
 
 struct vfs_node;
 

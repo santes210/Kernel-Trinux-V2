@@ -35,33 +35,52 @@
 #define DISKFS_MAGIC    0x53464B4Du   /* "MKFS" */
 #define DISKFS_VERSION  2u   /* v2: per-node flags + disk-backed block lists */
 #define DISKFS_MAX_NODES 16384u
-/* Max size of the serialized FS-metadata snapshot (tree + per-file headers).
- * This is NOT the cap on total file data — file *contents* live in blockfs
- * blocks anywhere on the disk, so the usable disk space scales with the disk
- * size. This cap only limits how big the metadata image at the tail can grow,
- * which in turn limits the total number/size of file entries (not bytes).
- * 256 MiB is plenty for tens of thousands of files. */
-#define DISKFS_MAX_IMAGE (256u * 1024u * 1024u)
+/* ----------------------------------------------------------------------------
+ * On-disk layout (must stay in sync with fs/blockfs.c!):
+ *
+ *   [ 0 .. BOOT_RESERVE )            bootloader / kernel image (16 MiB)
+ *   [ BOOT_RESERVE .. tail_start )   blockfs: bitmap + file-content blocks
+ *   [ tail_start .. end )            diskfs: this metadata snapshot (TAIL)
+ *
+ * diskfs and blockfs MUST agree on the size of the trailing region, or one
+ * clobbers the other. blockfs reserves DISKFS_TAIL_BYTES (64 MiB) at the end
+ * for us, so we place our metadata snapshot in exactly that same region.
+ * (Previously diskfs assumed a 256 MiB tail while blockfs reserved only 64 MiB,
+ * so on disks between ~16 and ~289 MiB the two regions overlapped and `sync`
+ * silently corrupted the saved image — fixed by matching the sizes here.)
+ * -------------------------------------------------------------------------- */
 
-/* The persistence image lives in a reserved region at the END of the disk so
- * it never collides with a bootloader (GRUB) living at the start. This lets a
- * SINGLE bootable image both boot AND save files. The region is 8 MiB
- * (== DISKFS_MAX_IMAGE), i.e. 16384 sectors. */
-#define DISKFS_TAIL_SECTORS  (DISKFS_MAX_IMAGE / ATA_SECTOR_SIZE)
+/* Trailing region reserved for the metadata snapshot. MUST equal
+ * blockfs's DISKFS_TAIL_BYTES. */
+#define DISKFS_TAIL_BYTES    (64u * 1024u * 1024u)
+#define DISKFS_TAIL_SECTORS  (DISKFS_TAIL_BYTES / ATA_SECTOR_SIZE)
 
-/* First LBA of the persistence region. Normally the last 64 MiB of the disk.
- * The bootloader (GRUB + kernel ISO, ~10-16 MiB) lives at the START, so we
- * keep a 16 MiB boot reserve and never write below it. */
+/* Cap on the serialized metadata snapshot. It lives inside the tail, so it can
+ * never exceed it. This bounds the number/size of file entries (not bytes;
+ * file *contents* live in blockfs). */
+#define DISKFS_MAX_IMAGE     DISKFS_TAIL_BYTES
+
+/* The bootloader (GRUB + kernel, ~10-16 MiB) lives at the START, so we keep a
+ * 16 MiB boot reserve and never write below it. MUST equal blockfs's. */
 #define DISKFS_BOOT_RESERVE_SECTORS (16u * 1024u * 1024u / ATA_SECTOR_SIZE)
 
 static uint32_t diskfs_base_lba(void)
 {
     uint32_t total = ata_total_sectors();
-    /* Preferred: the last DISKFS_TAIL_SECTORS of the disk. */
+    /* Preferred: the last DISKFS_TAIL_SECTORS of the disk (where blockfs has
+     * already reserved space for us). Needs room for boot reserve + tail. */
     if (total > DISKFS_TAIL_SECTORS + DISKFS_BOOT_RESERVE_SECTORS)
         return total - DISKFS_TAIL_SECTORS;
-    /* Small disk: place right after the 16 MiB boot reserve (clears GRUB). */
-    return DISKFS_BOOT_RESERVE_SECTORS;
+
+    /* Small disk (< ~80 MiB): the 64 MiB tail won't fit alongside the boot
+     * reserve. blockfs disables itself in this case (files stay in RAM), so
+     * here we only need somewhere in-range for the metadata snapshot. Put it
+     * in the last quarter of the disk; never point past the end of the medium
+     * (that silently broke sync/restore on the default tiny image). */
+    uint32_t base = total - (total / 4);
+    if (base >= total)
+        base = total > 1 ? total - 1 : 0;
+    return base;
 }
 
 

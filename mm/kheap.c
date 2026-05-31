@@ -1,13 +1,18 @@
 /* mm/kheap.c  -  kernel heap allocator (first-fit with coalescing).
  *
- * Uses a static 4 MiB arena in .bss. Each block has a header; free blocks are
+ * Uses a static arena in .bss. Each block has a header; free blocks are
  * coalesced with neighbours on free. Supports aligned allocation, realloc and
  * statistics (used/free/largest-free/fragmentation).
+ *
+ * Note: file *contents* live in blockfs (on disk) when a disk is present, so
+ * the heap only needs room for kernel metadata (VFS tree, process table, etc.)
+ * plus RAM-only file data. 32 MiB is plenty and keeps the RAM requirement low
+ * enough to run on modest machines / USB boots.
  */
 #include "kheap.h"
 #include "../lib/string.h"
 
-#define HEAP_SIZE   (96 * 1024 * 1024)   /* 96 MiB */
+#define HEAP_SIZE   (32 * 1024 * 1024)   /* 32 MiB */
 #define ALIGN       8
 #define MAGIC_USED  0xA110C8ED
 #define MAGIC_FREE  0xF8EE8100

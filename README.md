@@ -173,8 +173,9 @@ movimiento del cursor (←/→, Home/End), backspace, inserción.
 ## 🛠️ Comandos de la shell
 
 **Archivos y navegación:**
-`ls` (`-l`), `cd`, `pwd`, `mkdir`, `rmdir`, `touch`, `rm`, `cat`,
-`echo` (con redirección `>`), `write`, `edit`/`nano`, `cp`, `mv`, `stat`,
+`ls` (`-l`, `-a`, combinables como `-la`; colorea dirs en azul y ejecutables
+en verde), `cd`, `pwd`, `mkdir`, `rmdir`, `touch`, `rm`, `cat`,
+`echo` (con redirección `>` truncar y `>>` añadir), `write`, `edit`/`nano`, `cp`, `mv`, `stat`,
 `tree`, `find`, `head`, `tail`, `wc`
 
 > **`edit <archivo>`** (alias **`nano`**) abre un editor de texto a pantalla
@@ -223,9 +224,27 @@ movimiento del cursor (←/→, Home/End), backspace, inserción.
 **Permisos:**
 `chmod`, `chown`, `umask` (más `ls -l` y `stat` con info de owner, sticky bit)
 
-**Pipes y filtros:**
-`grep` (`-i -v -n -c`), y pipes `|` — `cat /etc/passwd | grep root`,
-`ls / | wc`, `ls -l /etc | grep -n host`
+**Filtros de texto:**
+`sort` (`-r` reverse, `-u` unique, `-n` numeric), `uniq` (`-c` count),
+`cut` (`-d<delim> -f<n>`, `-c<n>`), `tee` (`-a`), `seq`
+
+**Pipes y redirección:**
+`grep` (`-i -v -n -c`), pipes `|`, redirección de salida `>` / `>>` y de
+entrada `<`. Ejemplos:
+`cat /etc/passwd | grep root`, `ls / | wc`, `ls -l /etc | grep -n host`,
+`wc < /etc/motd`, `grep root < /etc/passwd`, `echo hola >> log.txt`,
+`sort archivo | uniq -c`, `cut -d: -f1 /etc/passwd`, `seq 1 5 | tee nums.txt`
+
+**Utilidades de ruta y entorno:**
+`basename`, `dirname`, `which`, `env`, `yes`
+
+**Userspace (ring 3):**
+`usertest` (lanza un programa no privilegiado que habla con el kernel solo por
+syscalls `int 0x80`) y `usertest bad` (demuestra el aislamiento: el programa
+intenta una instrucción privilegiada y el CPU lo bloquea con un #GP)
+
+**Ayuda:**
+`help` (lista en columnas) y `help <comando>` (detalle de un comando)
 
 **Extras:**
 `neofetch`, `calc`, `hexdump`, `color`, `history`, `alias`
@@ -388,8 +407,14 @@ principal es "`make run` → shell funcionando". Para activarlo, haz que un
 proceso llame `schedule()` cooperativamente, o conecta `scheduler_tick()` a
 `schedule()` cuando añadas stacks de kernel por-tarea.
 - **Compila con `-Wall -Wextra` sin warnings.**
-- **El kernel corre en ring 0.** El siguiente gran salto sería userspace en ring 3
-con syscalls.
+- **Userspace en ring 3 + syscalls.** El kernel corre en ring 0, pero ahora
+puede lanzar programas **no privilegiados en ring 3** que solo tocan el sistema
+vía `int 0x80`. Hay TSS (`ss0:esp0`), un gate de syscall con DPL 3, y un
+runner (`usermode_run`) que baja a ring 3 con su propio stack y vuelve al
+kernel cuando el programa llama `SYS_EXIT`. Pruébalo con el comando **`usertest`**
+(demo amable) y **`usertest bad`** (intenta una instrucción privilegiada → el
+CPU lanza un General Protection Fault y el kernel **termina solo el programa**,
+sin caerse). Syscalls: `exit, write, getpid, yield, sleep, getc, uptime`.
 
 ---
 
@@ -401,7 +426,8 @@ Cosas que estaría guay añadir, en orden de "bang for the buck":
 - [ ] Driver FAT12/16 (intercambiar archivos con Linux/Windows real)
 - [ ] Driver de red NE2000 (¡Trinux con internet!)
 - [ ] Modo gráfico VBE (640×480 con colores reales en vez de VGA texto)
-- [ ] Userspace en ring 3 (el salto de "hobby" a "OS de verdad")
+- [x] **Userspace en ring 3 + syscalls** (¡hecho! ver `usertest`)
+- [ ] Cargar binarios ELF de usuario desde el filesystem (en vez de demos enlazadas)
 - [ ] USB real (UHCI + Mass Storage) — proyecto enorme, ~4000 líneas
 - [ ] Procesos preemptivos reales (con interrupción del timer)
 - [ ] Más comandos: `tar`, `zip`, `ping`, `wget`...

@@ -1,8 +1,10 @@
 /* cpu/isr.c  -  CPU exception handlers (ISR 0-31). */
 #include "isr.h"
 #include "idt.h"
+#include "syscall.h"
 #include "../lib/printf.h"
 #include "../drivers/vga.h"
+#include "../drivers/serial.h"
 #include "../include/kernel.h"
 
 extern void isr0(void);  extern void isr1(void);  extern void isr2(void);
@@ -111,6 +113,19 @@ void isr_handler(registers_t *regs)
             exception_messages[regs->int_no & 31], regs->int_no);
     vga_set_color(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
     dump_registers(regs);
+
+    serial_printf("\n*** CPU EXCEPTION *** %s (int %u) err=%x eip=%x cs=%x esp=%x ss=%x\n",
+                  exception_messages[regs->int_no & 31], regs->int_no,
+                  regs->err_code, regs->eip, regs->cs, regs->useresp, regs->ss);
+
+    /* If the fault came from ring 3 (a user program), don't bring down the
+     * whole kernel — terminate the offending program and return to the shell.
+     * (cs RPL == 3 means the faulting code was unprivileged.) */
+    if ((regs->cs & 3) == 3) {
+        kprintf("  (terminating ring-3 program; kernel continues)\n");
+        if (usermode_fault_kill(-(int)regs->int_no))
+            return;   /* unreachable: resumes in the kernel */
+    }
 
     panic("Unhandled CPU exception");
 }

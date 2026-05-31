@@ -7,7 +7,7 @@
 #define USER_NAME_MAX  32
 #define USER_HOME_MAX  64
 #define USER_PASS_MAX  32
-#define MAX_USERS      16
+#define MAX_USERS      32
 
 /* A single account, mirrored from /etc/passwd (+ /etc/shadow password). */
 typedef struct {

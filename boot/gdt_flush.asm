@@ -22,3 +22,11 @@ gdt_flush:
     jmp 0x08:.flush       ; 0x08 = code segment selector; far jump reloads CS
 .flush:
     ret
+
+; void tss_flush(void)  - load the Task Register with the TSS selector.
+; The TSS is GDT entry 5 => selector 0x28. RPL 0.
+global tss_flush
+tss_flush:
+    mov ax, 0x28
+    ltr ax
+    ret

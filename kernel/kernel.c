@@ -8,6 +8,7 @@
 #include "../cpu/idt.h"
 #include "../cpu/isr.h"
 #include "../cpu/irq.h"
+#include "../cpu/syscall.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
 #include "../mm/kheap.h"
@@ -71,9 +72,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     idt_install();           ok("IDT installed");
     isr_install();           ok("CPU exception handlers (ISR 0-31)");
     irq_install();           ok("PIC remapped, IRQ handlers ready");
+    syscall_install();       ok("Syscall gate int 0x80 (ring 3 -> ring 0)");
 
     /* Memory */
-    kheap_init();            ok("Kernel heap (96 MiB arena)");
+    kheap_init();            ok("Kernel heap (32 MiB arena)");
     pmm_init(total_mem);     ok("Physical memory manager");
     vmm_init();              ok("Paging enabled (identity map 256 MiB)");
 

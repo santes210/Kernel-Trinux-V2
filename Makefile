@@ -31,10 +31,11 @@ LDFLAGS := $(LDARCH) -T linker.ld -nostdlib
 
 # ---- Sources ----
 C_SOURCES := $(wildcard boot/*.c kernel/*.c drivers/*.c cpu/*.c mm/*.c \
-                        fs/*.c process/*.c shell/*.c auth/*.c lib/*.c)
+                        fs/*.c process/*.c shell/*.c auth/*.c lib/*.c \
+                        user/*.c)
 ASM_SOURCES := boot/boot.asm boot/kernel_entry.asm boot/gdt_flush.asm \
                cpu/idt_flush.asm cpu/isr_asm.asm cpu/irq_asm.asm \
-               process/switch.asm
+               cpu/syscall_asm.asm process/switch.asm
 
 OBJS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.asm=.o)
 
@@ -58,7 +59,7 @@ $(KERNEL): $(OBJS) linker.ld
 # A raw 16 MiB disk QEMU exposes as the primary IDE master. The kernel's ATA
 # driver reads/writes it; `sync` in the shell saves the filesystem here.
 DISK    := disk.img
-DISKMB  := 16
+DISKMB  := 128
 
 $(DISK):
 	@echo "Creating $(DISKMB) MiB disk image $(DISK)"
