@@ -8,10 +8,13 @@ sistema de archivos en RAM con persistencia en disco, gestión de memoria,
 interrupciones, teclado, timer, dispositivos en `/dev`, `dd` estilo Linux,
 multiusuario, y mucho más.
 
+Funciona tanto en **QEMU** como en **hardware real** (USB bootable) gracias
+a sus drivers IDE *y* AHCI/SATA con detección automática vía PCI.
+
 ```
 user@mykernel:/$ neofetch
       .--.        user@mykernel
-     |o_o |       OS: mykernel 0.1.0
+     |o_o |       OS: mykernel 0.2.0
      |:_/ |       Arch: i686
     //   \ \      Kernel: x86 32-bit protected mode
    (|     | )     Uptime: 2 s
@@ -36,6 +39,23 @@ Luego escribe `help` en el prompt para ver todos los comandos.
 > La compilación usa el `gcc -m32`, `nasm`, `ld` y `qemu-system-i386` de tu
 > sistema. Si tienes una toolchain cruzada `i686-elf` puedes usar:
 > `make USE_CROSS=1` (llamará a `i686-elf-gcc` / `i686-elf-ld`).
+
+### En hardware real (USB bootable) 💾
+
+Genera una imagen bootable y grábala a una USB:
+
+```sh
+./make-usb-image.sh 15360    # genera mykernel-usb.img de 15 GB
+sudo dd if=mykernel-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
+> ⚠️ Cambia `sdX` por tu USB real (verifica con `lsblk` antes — **BORRA TODO**
+> en esa unidad).
+
+Bootea tu PC desde la USB (Legacy/CSM en BIOS). El kernel detecta
+automáticamente si el disco está en un controlador **IDE** o **AHCI/SATA**
+(vía PCI scan) y usa el driver adecuado. Funciona en laptops modernas como
+la HP Stream 14 donde no hay IDE legacy.
 
 ### En Termux (Android) 📱
 
@@ -118,7 +138,8 @@ flechas, F1-F12, Home/End/Del, buffer circular, getchar bloqueante + readline.
 **Fase 5 — Memoria**
 
 - Gestor de memoria física (`mm/pmm.*`): bitmap de frames, detección via multiboot.
-- Paging (`mm/vmm.*`): mapea identidad de 16 MiB, handler de page fault.
+- Paging (`mm/vmm.*`): identity-map de 256 MiB + mapeo dinámico de MMIO para
+regiones altas (AHCI ABAR, etc.) con pool de page tables extra.
 - Heap del kernel (`mm/kheap.*`): first-fit + coalescing, `kmalloc`,
 `kmalloc_aligned`, `kfree`, `krealloc`, `kheap_stats`.
 
@@ -128,12 +149,13 @@ flechas, F1-F12, Home/End/Del, buffer circular, getchar bloqueante + readline.
 - Filesystem RAM (`fs/ramfs.*`) con árbol inicial
 (`/bin /etc /home/user /tmp /var/log /dev /mnt /root`, `/etc/hostname`, `/etc/motd`).
 - Resolución de rutas (`fs/path.*`): normalizar, juntar, basename, dirname, `.`/`..`.
-- **Persistencia en disco** (`drivers/ata.*` + `fs/diskfs.*`): driver ATA PIO de
-LBA28 hablando con el primary IDE master. `fs/diskfs.c` serializa el árbol
-VFS (dirs + files + permisos/owners) como snapshot de metadatos (`MKFS`
-superblock + registros de nodos en preorder) al final del disco y lo
-restaura al boot. Ejecuta `sync` en la shell para guardar; el kernel auto-carga
-al arrancar así que **los archivos sobreviven a reboots/apagados**.
+- **Persistencia en disco** (`drivers/ata.*` + `fs/diskfs.*`): driver de disco
+unificado que soporta **IDE PIO** y **AHCI/SATA** con detección automática
+(ver Fase 10). `fs/diskfs.c` serializa el árbol VFS (dirs + files +
+permisos/owners) como snapshot de metadatos (`MKFS` superblock + registros de
+nodos en preorder) al final del disco y lo restaura al boot. Ejecuta `sync`
+en la shell para guardar; el kernel auto-carga al arrancar así que **los
+archivos sobreviven a reboots/apagados**.
 - **Almacenamiento por bloques** (`fs/blockfs.*`): cuando hay disco presente, el
 *contenido* de los archivos vive en **bloques de 4 KiB en el disco**, leídos y
 escritos bajo demanda en lugar de en el heap del kernel. Un **bitmap** rastrea
@@ -168,6 +190,37 @@ movimiento del cursor (←/→, Home/End), backspace, inserción.
 (`kprintf`/`snprintf` con ancho + padding zero/left), RTC/CMOS
 (`drivers/rtc.*`), serial COM1 debug (`drivers/serial.*`).
 
+**Fase 10 — PCI + AHCI/SATA (hardware real)** 🆕
+
+- **Enumeración PCI** (`drivers/pci.*`): escaneo completo de los 256 buses ×
+32 devices × 8 funciones para encontrar controladores por clase/subclase.
+Acceso a configuración vía mecanismo 1 (puertos `0xCF8`/`0xCFC`). Soporte
+para habilitar bus-mastering (DMA).
+- **Driver AHCI** (`drivers/ahci.*`): inicialización completa del HBA
+(BIOS/OS Handoff, detección de puertos con dispositivos SATA presentes,
+rebase de Command List / FIS / Command Table con buffers DMA alineados),
+IDENTIFY DEVICE para obtener el tamaño del disco, y lectura/escritura de
+sectores vía **READ/WRITE DMA EXT** (48-bit LBA) con polling.
+- **Driver de disco unificado** (`drivers/ata.c`): `ata_init()` intenta
+primero **IDE PIO** en los puertos legacy `0x1F0` (funciona en QEMU y PCs
+antiguos). Si no hay IDE, **escanea PCI** buscando un controlador AHCI
+(clase `01:06:01`) y lo inicializa. La API pública (`ata_read_sectors`,
+`ata_write_sectors`, `ata_present`, `ata_total_sectors`) no cambia — todo
+el resto del kernel (diskfs, blockfs, devfs, `dd`, `sync`) funciona
+idéntico sin importar si el backend es IDE o AHCI.
+- **Mapeo MMIO extendido** (`mm/vmm.c`): el VMM ahora puede mapear páginas
+en cualquier parte del espacio de 4 GiB (no solo los primeros 256 MiB),
+usando un pool estático de page tables extra. Esto es necesario porque los
+registros AHCI (ABAR) típicamente viven en `0xFEBxxxxx`.
+
+> **Resultado**: una USB con Trinux ahora funciona tanto en QEMU (IDE) como
+> en laptops/PCs modernos (AHCI) **sin cambiar nada**. Al bootear verás:
+> ```
+> [ata] no legacy IDE; probing PCI for AHCI...
+> [pci] AHCI found at 0:1f.2  vendor=8086 device=...  ABAR=febf1000
+> [ OK ] Disk detected via AHCI/SATA (15360 MiB)
+> ```
+
 ---
 
 ## 🛠️ Comandos de la shell
@@ -194,8 +247,7 @@ en verde), `cd`, `pwd`, `mkdir`, `rmdir`, `touch`, `rm`, `cat`,
 > Pulsa `r` para refrescar ahora o `q`/`ESC`/`Enter` para salir.
 
 > **`df`** reporta uso de disco (tamaño / usado / disponible), y `neofetch`
-> también muestra una línea **Disk:**. En el boot también se imprime el tamaño
-> del disco (`ATA disk detected (primary master, 1024 MiB)`).
+> también muestra una línea **Disk:**.
 
 > **`sync`** escribe todo el filesystem al disco para que tus archivos persistan
 > entre reboots. `make run` adjunta automáticamente un `disk.img` (creado en
@@ -382,14 +434,15 @@ mykernel/
 ├── linker.ld           # enlaza en 1 MiB, secciones alineadas a página
 ├── boot/               # entry multiboot, GDT, bootloader MBR de referencia
 ├── kernel/             # kernel_main, panic, info multiboot
-├── drivers/            # vga, keyboard, timer, rtc, serial, ata (disco)
-├── cpu/                # idt, isr, irq, ports (inb/outb)
-├── mm/                 # pmm, vmm, kheap
+├── drivers/            # vga, keyboard, timer, rtc, serial, ata, pci, ahci
+├── cpu/                # idt, isr, irq, ports (inb/outb), syscall
+├── mm/                 # pmm, vmm (con MMIO dinámico), kheap
 ├── fs/                 # vfs, ramfs, path, diskfs (persist), blockfs, devfs (/dev)
 ├── process/            # process, scheduler, context switch
 ├── auth/               # users (/etc/passwd, /etc/shadow), login/su
 ├── shell/              # shell (line editor/history) + commands + editor (estilo nano)
 ├── lib/                # string, printf, types
+├── user/               # programas de demostración ring-3 (userprog)
 └── include/            # kernel.h (versión/macros)
 ```
 
@@ -399,6 +452,13 @@ mykernel/
 usa el cargador Multiboot built-in de QEMU. El MBR real-mode hecho a mano
 (`boot/mbr_boot.asm`) se mantiene como referencia educativa y se puede ensamblar
 standalone con `nasm -f bin`.
+- **Detección automática IDE / AHCI.** En QEMU el disco aparece como IDE
+(puertos `0x1F0`) y funciona directo. En hardware real (laptops modernas,
+USB bootable) no hay IDE: el kernel escanea PCI buscando un controlador AHCI
+(clase `01:06:01`), mapea sus registros MMIO con el VMM, y usa DMA para
+leer/escribir. Toda la lógica vive en `drivers/ata.c` (wrapper unificado)
++ `drivers/pci.c` + `drivers/ahci.c`. El resto del kernel ni se entera
+de qué backend está activo.
 - **Scheduler cooperativo.** La API completa del scheduler y una rutina x86 de
 context-switch existen, pero el cambio preemptivo desde la IRQ del timer está
 deshabilitado por defecto; cambiar de tareas bajo una shell interactiva en
@@ -427,9 +487,10 @@ Cosas que estaría guay añadir, en orden de "bang for the buck":
 - [ ] Driver de red NE2000 (¡Trinux con internet!)
 - [ ] Modo gráfico VBE (640×480 con colores reales en vez de VGA texto)
 - [x] **Userspace en ring 3 + syscalls** (¡hecho! ver `usertest`)
+- [x] **PCI + AHCI/SATA** (¡hecho! disco funciona en hardware real)
 - [ ] Cargar binarios ELF de usuario desde el filesystem (en vez de demos enlazadas)
-- [ ] USB real (UHCI + Mass Storage) — proyecto enorme, ~4000 líneas
 - [ ] Procesos preemptivos reales (con interrupción del timer)
+- [ ] NVMe (siguiente generación de almacenamiento después de AHCI)
 - [ ] Más comandos: `tar`, `zip`, `ping`, `wget`...
 
 ## 📜 Licencia

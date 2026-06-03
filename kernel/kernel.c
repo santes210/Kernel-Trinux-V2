@@ -91,9 +91,12 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
      * restore the tree from it (replacing the default ramfs contents). */
     if (ata_init()) {
         uint32_t disk_mb = diskfs_total_bytes() / (1024 * 1024);
-        char dmsg[64];
+        char dmsg[80];
+        /* Show which backend the disk driver is using. */
+        extern bool ahci_present(void);
+        const char *mode = ahci_present() ? "AHCI/SATA" : "IDE PIO";
         snprintf(dmsg, sizeof(dmsg),
-                 "ATA disk detected (primary master, %u MiB)", disk_mb);
+                 "Disk detected via %s (%u MiB)", mode, disk_mb);
         ok(dmsg);
         if (blockfs_init())
             ok("Block storage ready (disk-backed files)");

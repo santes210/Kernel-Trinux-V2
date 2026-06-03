@@ -14,9 +14,18 @@
 #define TABLES_PER_DIR  1024
 #define IDENTITY_TABLES 64              /* 64 tables * 4 MiB = 256 MiB */
 
+/* Extra page tables for on-demand MMIO mappings (AHCI ABAR, etc.).
+ * These cover addresses above the 256 MiB identity-mapped region.
+ * We keep a small pool of 8 tables — enough for mapping a handful of
+ * MMIO regions without needing the heap or the PMM. */
+#define EXTRA_TABLES    8
+
 static uint32_t page_directory[TABLES_PER_DIR] __attribute__((aligned(4096)));
 static uint32_t page_tables[IDENTITY_TABLES][PAGES_PER_TABLE]
     __attribute__((aligned(4096)));
+static uint32_t extra_tables[EXTRA_TABLES][PAGES_PER_TABLE]
+    __attribute__((aligned(4096)));
+static uint32_t extra_used;   /* how many extra tables have been allocated */
 
 
 
@@ -89,23 +98,41 @@ void vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags)
     uint32_t tbl_idx = (virt >> 12) & 0x3FF;
 
     if (dir_idx < IDENTITY_TABLES) {
+        /* Fast path: within the statically identity-mapped region. */
         page_tables[dir_idx][tbl_idx] = (phys & ~0xFFF) | (flags & 0xFFF)
                                         | PAGE_PRESENT;
-        /* flush TLB for this address */
-        __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
+    } else {
+        /* Higher addresses (e.g. MMIO like AHCI ABAR at 0xFEBxxxxx).
+         * Allocate an extra page table from the static pool if needed. */
+        if (!(page_directory[dir_idx] & PAGE_PRESENT)) {
+            if (extra_used >= EXTRA_TABLES)
+                return;   /* out of extra tables */
+            memset(extra_tables[extra_used], 0, sizeof(extra_tables[0]));
+            page_directory[dir_idx] = ((uint32_t)extra_tables[extra_used])
+                                      | PAGE_PRESENT | PAGE_RW;
+            extra_used++;
+        }
+        /* Find the page table for this directory entry. */
+        uint32_t *pt = (uint32_t *)(page_directory[dir_idx] & ~0xFFF);
+        pt[tbl_idx] = (phys & ~0xFFF) | (flags & 0xFFF) | PAGE_PRESENT;
     }
-    /* Higher tables would need dynamic allocation; omitted for the identity
-     * mapped kernel region used here. */
+
+    /* Flush TLB for this address. */
+    __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }
 
 void vmm_unmap_page(uint32_t virt)
 {
     uint32_t dir_idx = virt >> 22;
     uint32_t tbl_idx = (virt >> 12) & 0x3FF;
+
     if (dir_idx < IDENTITY_TABLES) {
         page_tables[dir_idx][tbl_idx] = 0;
-        __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
+    } else if (page_directory[dir_idx] & PAGE_PRESENT) {
+        uint32_t *pt = (uint32_t *)(page_directory[dir_idx] & ~0xFFF);
+        pt[tbl_idx] = 0;
     }
+    __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }
 
 bool vmm_is_enabled(void) { return paging_enabled; }
