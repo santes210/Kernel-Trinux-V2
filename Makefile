@@ -81,7 +81,7 @@ run-curses: $(KERNEL) $(DISK)
 iso: $(KERNEL)
 	mkdir -p iso/boot/grub
 	cp $(KERNEL) iso/boot/$(KERNEL)
-	printf 'set timeout=0\nset default=0\nmenuentry "mykernel" {\n  multiboot /boot/$(KERNEL)\n  boot\n}\n' > iso/boot/grub/grub.cfg
+	printf 'set timeout=3\nset default=0\nmenuentry "Trinux" {\n  multiboot /boot/$(KERNEL)\n  boot\n}\nmenuentry "Trinux (single-user / recovery)" {\n  multiboot /boot/$(KERNEL) single\n  boot\n}\n' > iso/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) iso
 	@echo "Built $(ISO)"
 

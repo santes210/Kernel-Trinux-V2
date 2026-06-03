@@ -426,6 +426,22 @@ int shell_read_password(char *buf, int max)
     }
 }
 
+/* Boot mode: 0=normal (login required), 1=single-user / emergency (root shell
+ * without password, like Linux `init=/bin/bash` or `single`).
+ *
+ * To enter single-user mode on real hardware:
+ *   1. At the GRUB menu, press 'e' to edit the boot entry
+ *   2. Find the line "multiboot /boot/mykernel.bin"
+ *   3. Append:  init=/bin/bash   (or just: single)
+ *   4. Press Ctrl-X or F10 to boot
+ *
+ * This drops you straight into a root shell with no password prompt.
+ * Use 'passwd root' and 'passwd user' to fix your passwords, then 'reboot'.
+ */
+static int boot_mode;   /* 0=normal, 1=single-user */
+
+void shell_set_boot_mode(int mode) { boot_mode = mode; }
+
 /* Interactive login: prompt for username + password until valid. */
 void shell_login_prompt(void)
 {
@@ -676,10 +692,31 @@ void shell_run(void)
         vga_set_color(state.color);
     }
 
-    /* require login before the shell starts */
-    shell_login_prompt();
-    if (current_user())
-        strncpy(state.user, current_user()->name, sizeof(state.user) - 1);
+    /* Single-user mode: skip login, go straight to root shell.
+     * This is triggered by passing init=/bin/bash or single on the
+     * kernel command line (edit the GRUB entry with 'e'). */
+    if (boot_mode == 1) {
+        user_t *root = users_find("root");
+        if (!root)
+            root = users_add("root", "root", 0, 0, "/root");
+        if (root) {
+            set_current_user(root);
+            state.cwd = vfs_resolve(root->home, vfs_get_root());
+            if (!state.cwd)
+                state.cwd = vfs_get_root();
+            strncpy(state.user, root->name, sizeof(state.user) - 1);
+        }
+        vga_set_color(vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
+        kprintf("*** Single-user mode (root shell, no password) ***\n");
+        kprintf("Use 'passwd root' and 'passwd user' to reset passwords.\n");
+        kprintf("Then 'reboot' to boot normally.\n\n");
+        vga_set_color(state.color);
+    } else {
+        /* Normal mode: require login */
+        shell_login_prompt();
+        if (current_user())
+            strncpy(state.user, current_user()->name, sizeof(state.user) - 1);
+    }
 
     while (state.running) {
         print_prompt();

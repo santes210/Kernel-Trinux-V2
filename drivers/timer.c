@@ -8,7 +8,12 @@
 #define PIT_FREQ     1193182
 
 static volatile uint32_t ticks;
+static volatile uint32_t idle_ticks;   /* incremented when CPU was in HLT */
 static uint32_t frequency = 100;
+
+/* snapshot for CPU usage calculation */
+static volatile uint32_t last_ticks;
+static volatile uint32_t last_idle;
 
 /* scheduler hook (weak-ish: defined in scheduler.c) */
 extern void scheduler_tick(void);
@@ -43,8 +48,22 @@ void sleep(uint32_t milliseconds)
     uint32_t target = ticks + (milliseconds * frequency) / 1000;
     /* ensure interrupts are on so ticks advance */
     __asm__ volatile("sti");
-    while (ticks < target)
+    while (ticks < target) {
+        idle_ticks++;
         __asm__ volatile("hlt");
+    }
+}
+
+/* Return approximate CPU usage 0-100 since last call. */
+uint32_t timer_cpu_usage(void)
+{
+    uint32_t dt = ticks - last_ticks;
+    uint32_t di = idle_ticks - last_idle;
+    last_ticks = ticks;
+    last_idle  = idle_ticks;
+    if (dt == 0) return 0;
+    uint32_t idle_pct = (di * 100) / dt;
+    return (idle_pct > 100) ? 0 : (100 - idle_pct);
 }
 
 uint32_t uptime(void)

@@ -12,6 +12,7 @@
  */
 #include "ata.h"
 #include "ahci.h"
+#include "xhci.h"
 #include "../cpu/ports.h"
 #include "../drivers/serial.h"
 
@@ -42,7 +43,7 @@
 #define CMD_IDENTIFY    0xEC
 
 /* Which backend is active? */
-enum disk_backend { DISK_NONE, DISK_IDE, DISK_AHCI };
+enum disk_backend { DISK_NONE, DISK_IDE, DISK_AHCI, DISK_XHCI };
 
 static enum disk_backend backend;
 static uint32_t          total_sectors;
@@ -188,7 +189,7 @@ bool ata_init(void)
         return true;
     }
 
-    /* No IDE — try AHCI (covers modern laptops, USB-booted PCs, etc.). */
+    /* No IDE — try AHCI (covers SATA disks on modern laptops). */
     serial_write("[ata] no legacy IDE; probing PCI for AHCI...\n");
     if (ahci_init()) {
         backend = DISK_AHCI;
@@ -197,7 +198,16 @@ bool ata_init(void)
         return true;
     }
 
-    serial_write("[ata] no disk found (neither IDE nor AHCI)\n");
+    /* No AHCI either — try xHCI (USB 3.0 mass storage, e.g. boot USB). */
+    serial_write("[ata] no AHCI; probing PCI for xHCI (USB)...\n");
+    if (xhci_init()) {
+        backend = DISK_XHCI;
+        total_sectors = xhci_total_sectors();
+        serial_write("[ata] using xHCI USB backend\n");
+        return true;
+    }
+
+    serial_write("[ata] no disk found (tried IDE, AHCI, xHCI)\n");
     return false;
 }
 
@@ -213,11 +223,14 @@ uint32_t ata_total_sectors(void)
 
 int ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
 {
+    uint16_t cnt16 = (count == 0) ? 256 : (uint16_t)count;
     switch (backend) {
     case DISK_IDE:
         return ide_read_sectors(lba, count, buf);
     case DISK_AHCI:
-        return ahci_read_sectors(lba, (uint16_t)(count == 0 ? 256 : count), buf);
+        return ahci_read_sectors(lba, cnt16, buf);
+    case DISK_XHCI:
+        return xhci_read_sectors(lba, cnt16, buf);
     default:
         return -10;
     }
@@ -225,11 +238,14 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
 
 int ata_write_sectors(uint32_t lba, uint8_t count, const void *buf)
 {
+    uint16_t cnt16 = (count == 0) ? 256 : (uint16_t)count;
     switch (backend) {
     case DISK_IDE:
         return ide_write_sectors(lba, count, buf);
     case DISK_AHCI:
-        return ahci_write_sectors(lba, (uint16_t)(count == 0 ? 256 : count), buf);
+        return ahci_write_sectors(lba, cnt16, buf);
+    case DISK_XHCI:
+        return xhci_write_sectors(lba, cnt16, buf);
     default:
         return -10;
     }

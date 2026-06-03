@@ -163,7 +163,18 @@ uint32_t diskfs_total_bytes(void)
 {
     if (!ata_present())
         return 0;
+    /* For disks > 4 GiB this overflows; callers that display sizes should
+     * use diskfs_total_mb() instead. Kept for backward compat with code that
+     * works on small disks (blockfs layout, etc.). */
     return ata_total_sectors() * ATA_SECTOR_SIZE;
+}
+
+uint32_t diskfs_total_mb(void)
+{
+    if (!ata_present())
+        return 0;
+    /* sectors / 2048 = MiB (no overflow for disks up to 2 TiB). */
+    return ata_total_sectors() / 2048;
 }
 
 /* Recursively add up the serialized size of a node and its children, without

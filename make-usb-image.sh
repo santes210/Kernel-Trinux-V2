@@ -31,10 +31,16 @@ echo "[*] Building bootable ISO (GRUB + Multiboot kernel)..."
 mkdir -p iso/boot/grub
 cp "$KERNEL" iso/boot/"$KERNEL"
 cat > iso/boot/grub/grub.cfg <<EOF
-set timeout=0
+set timeout=3
 set default=0
-menuentry "mykernel" {
+
+menuentry "Trinux" {
   multiboot /boot/$KERNEL
+  boot
+}
+
+menuentry "Trinux (single-user / recovery)" {
+  multiboot /boot/$KERNEL single
   boot
 }
 EOF

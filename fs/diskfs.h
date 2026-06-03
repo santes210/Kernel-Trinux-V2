@@ -28,7 +28,8 @@ int diskfs_save(void);
 bool diskfs_available(void);
 
 /* Total size of the attached disk in bytes (0 if no disk). */
-uint32_t diskfs_total_bytes(void);
+uint32_t diskfs_total_bytes(void);    /* NOTE: wraps above 4 GiB; use _mb() */
+uint32_t diskfs_total_mb(void);       /* total disk size in MiB (no overflow) */
 
 /* Size in bytes that the CURRENT in-RAM filesystem tree would occupy on disk
  * (superblock + serialized nodes). Reflects live files, even before `sync`. */

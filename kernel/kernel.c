@@ -24,6 +24,29 @@
 #include "../lib/printf.h"
 #include "../shell/shell.h"
 
+/* Check if a word appears in a space-separated string. */
+static bool cmdline_has(const char *cmdline, const char *word)
+{
+    if (!cmdline || !word) return false;
+    int wlen = 0;
+    while (word[wlen]) wlen++;
+
+    const char *p = cmdline;
+    while (*p) {
+        while (*p == ' ') p++;
+        const char *start = p;
+        while (*p && *p != ' ') p++;
+        int len = (int)(p - start);
+        if (len == wlen) {
+            bool match = true;
+            for (int i = 0; i < wlen; i++)
+                if (start[i] != word[i]) { match = false; break; }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
 static uint32_t detect_memory(uint32_t magic, uint32_t mb_addr)
 {
     if (magic != MULTIBOOT_BOOTLOADER_MAGIC)
@@ -90,11 +113,13 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     /* Disk persistence: probe the ATA disk and, if a saved image exists,
      * restore the tree from it (replacing the default ramfs contents). */
     if (ata_init()) {
-        uint32_t disk_mb = diskfs_total_bytes() / (1024 * 1024);
+        uint32_t disk_mb = diskfs_total_mb();
         char dmsg[80];
         /* Show which backend the disk driver is using. */
         extern bool ahci_present(void);
-        const char *mode = ahci_present() ? "AHCI/SATA" : "IDE PIO";
+        extern bool xhci_present(void);
+        const char *mode = xhci_present() ? "xHCI/USB" :
+                           ahci_present() ? "AHCI/SATA" : "IDE PIO";
         snprintf(dmsg, sizeof(dmsg),
                  "Disk detected via %s (%u MiB)", mode, disk_mb);
         ok(dmsg);
@@ -129,10 +154,40 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     __asm__ volatile("sti");
     ok("Interrupts enabled");
 
-    vga_set_color(vga_entry_color(VGA_WHITE, VGA_BLACK));
-    kprintf("\n  Type 'help' for a list of commands.\n\n");
-    vga_set_color(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+    /* Parse kernel command line from GRUB (multiboot).
+     * Recognized options:
+     *   init=/bin/bash  — drop to root shell without login
+     *   single          — same as init=/bin/bash
+     *   emergency       — same as init=/bin/bash
+     *
+     * To use on real hardware: at the GRUB menu, press 'e', add the
+     * option to the 'multiboot' line, and press Ctrl-X to boot. */
+    const char *cmdline = NULL;
+    if (magic == MULTIBOOT_BOOTLOADER_MAGIC) {
+        multiboot_info_t *mbi = (multiboot_info_t *)mb_info_addr;
+        if ((mbi->flags & (1u << 2)) && mbi->cmdline)
+            cmdline = (const char *)(uintptr_t)mbi->cmdline;
+    }
 
+    int boot_mode = 0;
+    if (cmdline && (cmdline_has(cmdline, "init=/bin/bash") ||
+                    cmdline_has(cmdline, "init=/bin/sh") ||
+                    cmdline_has(cmdline, "single") ||
+                    cmdline_has(cmdline, "emergency"))) {
+        boot_mode = 1;
+        ok("Kernel cmdline: single-user mode requested");
+    }
+
+    extern void shell_set_boot_mode(int mode);
+    shell_set_boot_mode(boot_mode);
+
+    vga_set_color(vga_entry_color(VGA_WHITE, VGA_BLACK));
+    kprintf("\n  Type 'help' for a list of commands.\n");
+    if (boot_mode == 0)
+        kprintf("  (To reset passwords: reboot, press 'e' at GRUB,\n"
+                "   add 'single' to the multiboot line, press Ctrl-X)\n");
+    kprintf("\n");
+    vga_set_color(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
 
     shell_run();
 

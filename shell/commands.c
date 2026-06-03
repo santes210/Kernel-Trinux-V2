@@ -19,6 +19,7 @@
 #include "../include/kernel.h"
 #include "../cpu/syscall.h"
 #include "../user/userprog.h"
+#include "../drivers/acpi_ec.h"
 
 #define READ_BUF 4096
 
@@ -1456,18 +1457,15 @@ static int cmd_df(int argc, char **argv)
         return 0;
     }
 
-    uint32_t total = diskfs_total_bytes();
+    uint32_t total_mb = diskfs_total_mb();
     uint32_t used  = diskfs_used_bytes();
-    if (used > total) used = total;
-    uint32_t avail = total - used;
-    /* permille (0.1%) in 32-bit math, working in KB to avoid overflow and the
-     * 64-bit divide helper. Text files are tiny, so show a tenth-of-percent. */
-    uint32_t total_kb = total / 1024;
-    uint32_t permille = total_kb ? ((used / 1024) * 1000) / total_kb : 0;
+    uint32_t used_mb = used / (1024 * 1024);
+    uint32_t avail_mb = (total_mb > used_mb) ? total_mb - used_mb : 0;
+    uint32_t permille = total_mb ? (used_mb * 1000) / total_mb : 0;
 
     kprintf("Filesystem      Size        Used       Avail   Use%%   Mounted\n");
-    kprintf("mkfs (disk)  %6u KB  %8u B  %6u KB  %u.%u%%   /\n",
-            total / 1024, used, avail / 1024,
+    kprintf("mkfs (disk)  %6u MB  %6u MB  %6u MB  %u.%u%%   /\n",
+            total_mb, used_mb, avail_mb,
             permille / 10, permille % 10);
     return 0;
 }
@@ -1518,10 +1516,15 @@ static void top_render(void)
             secs / 3600, (secs % 3600) / 60, secs % 60,
             timer_get_ticks(), timer_get_freq());
 
+    /* ---- CPU usage ---- */
+    uint32_t cpu = timer_cpu_usage();
+    kprintf("  CPU  ");
+    top_bar(cpu, 30, vga_entry_color(VGA_LIGHT_RED, VGA_BLACK));
+    kprintf("\n");
+
     /* ---- physical memory ---- */
     uint32_t ptot = pmm_get_total_memory();
     uint32_t pused = pmm_get_used_memory();
-    /* 32-bit math (work in KB so *100 doesn't overflow, no 64-bit divide) */
     uint32_t ppct = (ptot/1024) ? ((pused/1024) * 100) / (ptot/1024) : 0;
     kprintf("  Mem  ");
     top_bar(ppct, 30, vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK));
@@ -1538,14 +1541,40 @@ static void top_render(void)
 
     /* ---- disk ---- */
     if (diskfs_available()) {
-        uint32_t dtot = diskfs_total_bytes();
+        uint32_t dtot_mb = diskfs_total_mb();
         uint32_t dused = diskfs_used_bytes();
-        uint32_t dpct = (dtot/1024) ? ((dused/1024) * 100) / (dtot/1024) : 0;
+        uint32_t dused_mb = dused / (1024*1024);
+        uint32_t dpct = dtot_mb ? (dused_mb * 100) / dtot_mb : 0;
         kprintf("  Disk ");
         top_bar(dpct, 30, vga_entry_color(VGA_LIGHT_BLUE, VGA_BLACK));
-        kprintf("  %u KB / %u MB\n", dused/1024, dtot/(1024*1024));
+        kprintf("  %u MB / %u MB\n", dused_mb, dtot_mb);
     } else {
         kprintf("  Disk  (none - RAM only)\n");
+    }
+
+    /* ---- battery ---- */
+    battery_info_t bat;
+    if (acpi_ec_read_battery(&bat)) {
+        uint8_t batcol = bat.percentage <= 15
+            ? vga_entry_color(VGA_LIGHT_RED, VGA_BLACK)
+            : (bat.charging
+                ? vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK)
+                : vga_entry_color(VGA_LIGHT_BROWN, VGA_BLACK));
+        kprintf("  Bat  ");
+        if (bat.percentage != 0xFF) {
+            top_bar(bat.percentage, 30, batcol);
+            kprintf("  %s", bat.charging ? "CHG" :
+                            bat.discharging ? "BAT" :
+                            bat.ac_connected ? "AC" : "?");
+            if (bat.voltage_mv)
+                kprintf("  %u.%uV", bat.voltage_mv / 1000,
+                        (bat.voltage_mv % 1000) / 100);
+        } else {
+            kprintf("  (present but % unknown)");
+        }
+        kprintf("\n");
+    } else {
+        kprintf("  Bat   (none / not detected)\n");
     }
 
     /* ---- process table ---- */
@@ -1557,10 +1586,9 @@ static void top_render(void)
     vga_set_color(shell_get_state()->color);
     kprintf("\n");
 
-    for (uint32_t i = 0; i < n && i < 14; i++) {
+    for (uint32_t i = 0; i < n && i < 12; i++) {
         process_t *p = process_at(i);
         if (!p) continue;
-        /* color the state cell */
         uint8_t sc;
         switch (p->state) {
         case PROC_RUNNING:  sc = vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK); break;
@@ -1667,7 +1695,7 @@ static int cmd_neofetch(int argc, char **argv)
         "  \\___)=(___/   ",
     };
     const char *info[16];
-    static char l0[64], l1[64], l2[64], l3[64], l4[64], l5[64], l6[64], l7[64];
+    static char l0[64], l1[64], l2[64], l3[64], l4[64], l5[64], l6[64], l7[64], l8[64];
     snprintf(l0, sizeof(l0), "%s@%s", s->user, s->hostname);
     snprintf(l1, sizeof(l1), "OS: %s %s", KERNEL_NAME, KERNEL_VERSION);
     snprintf(l2, sizeof(l2), "Arch: %s", KERNEL_ARCH);
@@ -1677,19 +1705,31 @@ static int cmd_neofetch(int argc, char **argv)
              used / (1024*1024), total / (1024*1024));
     /* Disk: show used (current fs image) / total, or RAM-only if no disk. */
     if (diskfs_available()) {
-        uint32_t dtotal = diskfs_total_bytes();
-        uint32_t dused  = diskfs_used_bytes();
-        snprintf(l6, sizeof(l6), "Disk: %u B used / %u MB",
-                 dused, dtotal / (1024*1024));
+        uint32_t dtotal_mb = diskfs_total_mb();
+        uint32_t dused     = diskfs_used_bytes();
+        snprintf(l6, sizeof(l6), "Disk: %u MB used / %u MB",
+                 dused / (1024*1024), dtotal_mb);
     } else {
         snprintf(l6, sizeof(l6), "Disk: none (RAM-only)");
     }
     snprintf(l7, sizeof(l7), "Shell: mysh");
+    /* Battery */
+    battery_info_t neo_bat;
+    if (acpi_ec_read_battery(&neo_bat) && neo_bat.percentage != 0xFF) {
+        snprintf(l8, sizeof(l8), "Battery: %u%% %s",
+                 neo_bat.percentage,
+                 neo_bat.charging ? "(charging)" :
+                 neo_bat.discharging ? "(discharging)" :
+                 neo_bat.ac_connected ? "(AC)" : "");
+    } else {
+        snprintf(l8, sizeof(l8), "Battery: none");
+    }
     info[0]=l0; info[1]=l1; info[2]=l2; info[3]=l3;
     info[4]=l4; info[5]=l5; info[6]=l6; info[7]=l7;
+    info[8]=l8;
 
     int art_lines = (int)ARRAY_LEN(art);
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         /* pad with blanks once we run past the ASCII art so info keeps aligned */
         if (i < art_lines)
             vga_print_color(art[i], vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
@@ -2127,6 +2167,39 @@ static int cmd_usertest(int argc, char **argv)
     return 0;
 }
 
+static int cmd_battery(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    battery_info_t bat;
+    if (!acpi_ec_read_battery(&bat)) {
+        kprintf("No battery detected (desktop PC or EC not accessible).\n");
+        return 1;
+    }
+
+    kprintf("Battery:\n");
+    if (bat.percentage != 0xFF)
+        kprintf("  Level:   %u%%\n", bat.percentage);
+    else
+        kprintf("  Level:   unknown\n");
+
+    kprintf("  Status:  %s\n",
+            bat.charging ? "Charging" :
+            bat.discharging ? "Discharging" :
+            bat.ac_connected ? "AC (full)" : "Unknown");
+    kprintf("  AC:      %s\n", bat.ac_connected ? "Connected" : "Not connected");
+
+    if (bat.voltage_mv)
+        kprintf("  Voltage: %u.%03u V\n", bat.voltage_mv / 1000,
+                bat.voltage_mv % 1000);
+    if (bat.remain_mah)
+        kprintf("  Remain:  %u mAh\n", bat.remain_mah);
+    if (bat.full_mah)
+        kprintf("  Full:    %u mAh\n", bat.full_mah);
+    if (bat.rate_ma)
+        kprintf("  Rate:    %u mA\n", bat.rate_ma);
+    return 0;
+}
+
 static int cmd_help(int argc, char **argv);   /* fwd */
 
 /* ---------- command table ---------- */
@@ -2198,6 +2271,7 @@ static const command_t table[] = {
     {"history",  cmd_history,  "show command history"},
     {"alias",    cmd_alias,    "create command aliases"},
     {"usertest", cmd_usertest, "run a ring-3 userspace program (int 0x80 demo)"},
+    {"battery",  cmd_battery,  "show battery status (laptop only)"},
     {"help",     cmd_help,     "show this help"},
 };
 

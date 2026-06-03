@@ -25,6 +25,7 @@ typedef struct {
 shell_state_t *shell_get_state(void);
 
 void shell_run(void);
+void shell_set_boot_mode(int mode);         /* 0=normal, 1=single/emergency */
 int  shell_read_line(char *buf, int max);   /* line editor with history */
 int  shell_read_password(char *buf, int max); /* masked input (no echo) */
 void shell_login_prompt(void);              /* interactive login loop */
