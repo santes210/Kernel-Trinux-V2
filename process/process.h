@@ -27,6 +27,7 @@ typedef struct process {
     char          cwd[256];
     int           exit_code;
     void        (*entry)(void);
+    void*         kstack;         /* kernel stack for multitasking */
 } process_t;
 
 void        process_init(void);

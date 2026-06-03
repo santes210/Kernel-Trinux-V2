@@ -9,6 +9,7 @@
 #include "printf.h"
 #include "string.h"
 #include "../drivers/vga.h"
+#include "../drivers/serial.h"
 
 struct sink {
     char  *buf;       /* NULL => write to VGA */
@@ -23,6 +24,7 @@ static void sink_putc(struct sink *s, char c)
             s->buf[s->count] = c;
     } else {
         vga_putchar(c);
+        serial_write_char(c);
     }
     s->count++;
 }

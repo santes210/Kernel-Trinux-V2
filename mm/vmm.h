@@ -12,4 +12,10 @@ void vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags);
 void vmm_unmap_page(uint32_t virt);
 bool vmm_is_enabled(void);
 
+uint32_t vmm_create_address_space(void);
+void     vmm_switch_address_space(uint32_t pd_phys);
+void     vmm_free_address_space(uint32_t pd_phys);
+void     vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t flags);
+uint32_t vmm_get_current_dir(void);
+
 #endif /* MM_VMM_H */

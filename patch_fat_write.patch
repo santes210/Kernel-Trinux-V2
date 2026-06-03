@@ -1,0 +1,26 @@
+--- fs/fat.c
++++ fs/fat.c
+@@ -29,6 +29,26 @@
+         } __attribute__((packed)) fat32;
+     } ext;
+ } __attribute__((packed));
+ 
++/* Write a sector to FAT disk */
++static bool fat_write_sector(uint32_t lba, const uint8_t* buf) {
++    return ata_write_sectors(partition_lba + lba, 1, buf) == 0;
++}
++
++/* Find a free cluster and allocate it, or just return an existing one */
++static uint32_t fat_allocate_cluster(void) {
++    // Extremely simplified dummy allocator for demonstration purposes.
++    // Real implementation would scan the FAT table for 0x0000.
++    kprintf("FAT WRITE IS NOT FULLY IMPLEMENTED (MOCK)\n");
++    return 0;
++}
++
++static uint32_t fat_node_write(vfs_node_t *node, uint32_t off, uint32_t size, uint8_t *buf) {
++    kprintf("FAT: write to file %s (off=%d size=%d) not supported yet\n", node->name, off, size);
++    return 0; // return 0 bytes written to gracefully reject
++}
++
+ struct fat_dir_entry {

@@ -18,7 +18,11 @@ static uint32_t page_directory[TABLES_PER_DIR] __attribute__((aligned(4096)));
 static uint32_t page_tables[IDENTITY_TABLES][PAGES_PER_TABLE]
     __attribute__((aligned(4096)));
 
+
+
 static bool paging_enabled;
+
+uint32_t current_page_directory;
 
 static void load_page_directory(uint32_t pd_phys)
 {
@@ -74,6 +78,7 @@ void vmm_init(void)
     isr_register_handler(14, page_fault_handler);
 
     load_page_directory((uint32_t)page_directory);
+    current_page_directory = (uint32_t)page_directory;
     enable_paging();
     paging_enabled = true;
 }
@@ -104,3 +109,66 @@ void vmm_unmap_page(uint32_t virt)
 }
 
 bool vmm_is_enabled(void) { return paging_enabled; }
+
+
+
+uint32_t vmm_get_current_dir(void) {
+    return current_page_directory;
+}
+
+void vmm_switch_address_space(uint32_t pd_phys) {
+    current_page_directory = pd_phys;
+    __asm__ volatile("mov %0, %%cr3" : : "r"(pd_phys));
+}
+
+uint32_t vmm_create_address_space(void) {
+    extern uint32_t pmm_alloc_frame(void);
+    uint32_t pd_phys = pmm_alloc_frame();
+    if (!pd_phys) return 0;
+    
+    uint32_t* pd = (uint32_t*)(pd_phys);
+    /* copy kernel identity mapping (first 256MB) */
+    for (int i = 0; i < 1024; i++) {
+        if (i < IDENTITY_TABLES) {
+            pd[i] = page_directory[i];
+        } else {
+            pd[i] = 0;
+        }
+    }
+    return pd_phys;
+}
+
+void vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t flags) {
+    extern uint32_t pmm_alloc_frame(void);
+    uint32_t* pd = (uint32_t*)pd_phys;
+    uint32_t dir_idx = virt >> 22;
+    uint32_t tbl_idx = (virt >> 12) & 0x3FF;
+
+    if (!(pd[dir_idx] & PAGE_PRESENT)) {
+        uint32_t pt_phys = pmm_alloc_frame();
+        if (!pt_phys) return;
+        uint32_t* pt = (uint32_t*)pt_phys;
+        for (int i = 0; i < 1024; i++) pt[i] = 0;
+        pd[dir_idx] = pt_phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+    }
+
+    uint32_t* pt = (uint32_t*)(pd[dir_idx] & ~0xFFF);
+    pt[tbl_idx] = (phys & ~0xFFF) | (flags & 0xFFF) | PAGE_PRESENT;
+}
+
+void vmm_free_address_space(uint32_t pd_phys) {
+    extern void pmm_free_frame(uint32_t);
+    uint32_t* pd = (uint32_t*)pd_phys;
+    for (int i = IDENTITY_TABLES; i < 1024; i++) {
+        if (pd[i] & PAGE_PRESENT) {
+            uint32_t* pt = (uint32_t*)(pd[i] & ~0xFFF);
+            for (int j = 0; j < 1024; j++) {
+                if (pt[j] & PAGE_PRESENT) {
+                    pmm_free_frame(pt[j] & ~0xFFF);
+                }
+            }
+            pmm_free_frame(pd[i] & ~0xFFF);
+        }
+    }
+    pmm_free_frame(pd_phys);
+}

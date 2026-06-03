@@ -1,0 +1,48 @@
+--- shell/shell.c
++++ shell/shell.c
+@@ -379,32 +379,10 @@
+                     buf[max-1] = 0;
+                     for(int i=0; i<len; i++) vga_putchar(buf[i]);
+                 }
+             }
+-        } else if (key == KEY_RIGHT) {
+-            if (cursor < len) {
+-                vga_putchar(buf[cursor]);
+-                cursor++;
+-            }
+-        } else if (key == KEY_UP) {
+-            if (hist_pos > 0) {
+-                if (hist_pos == history_count) {
+-                    strncpy(saved, buf, SHELL_LINE_MAX - 1);
+-                    saved[len] = '\0';
+-                }
+-                hist_pos--;
+-                const char *h = shell_history_get(hist_pos);
+-                if (h) {
+-                    /* erase current line visually */
+-                    while (cursor < len) { vga_putchar(buf[cursor]); cursor++; }
+-                    while (cursor > 0) { vga_putchar('\b'); vga_putchar(' '); vga_putchar('\b'); cursor--; }
+-                    strncpy(buf, h, max - 1);
+-                    buf[max - 1] = '\0';
+-                    len = (int)strlen(buf);
+-                    for (int i = 0; i < len; i++) vga_putchar(buf[i]);
+-                    cursor = len;
+-                }
+-            }
+-        } else if (key == KEY_DOWN) {
+-            if (hist_pos < history_count) {
+-                hist_pos++;
+-                const char *h = (hist_pos == history_count) ? saved : shell_history_get(hist_pos);
+-                if (h) {
+-                    while (cursor < len) { vga_putchar(buf[cursor]); cursor++; }
+-                    while (cursor > 0) { vga_putchar('\b'); vga_putchar(' '); vga_putchar('\b'); cursor--; }
+-                    strncpy(buf, h, max - 1);
+-                    buf[max - 1] = '\0';
+-                    len = (int)strlen(buf);
+-                    for (int i = 0; i < len; i++) vga_putchar(buf[i]);
+-                    cursor = len;
+-                }
+-            }
+         } else if (key == '\t') {
+             /* Handle tab completion */
+             handle_tab_completion(buf, &len, &cursor, max);

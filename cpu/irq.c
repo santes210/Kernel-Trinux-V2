@@ -76,11 +76,13 @@ void irq_handler(registers_t *regs)
 {
     int irq = regs->int_no - 32;
 
-    if (irq >= 0 && irq < 16 && irq_routines[irq])
-        irq_routines[irq](regs);
-
-    /* Send End-Of-Interrupt: to slave first if IRQ >= 8, then master. */
+    /* Send End-Of-Interrupt: to slave first if IRQ >= 8, then master.
+     * We do this BEFORE the handler so that if the handler does a 
+     * context switch, the new task still receives interrupts! */
     if (irq >= 8)
         outb(PIC2_CMD, PIC_EOI);
     outb(PIC1_CMD, PIC_EOI);
+
+    if (irq >= 0 && irq < 16 && irq_routines[irq])
+        irq_routines[irq](regs);
 }

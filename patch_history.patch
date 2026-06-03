@@ -1,0 +1,42 @@
+--- shell/shell.c
++++ shell/shell.c
+@@ -348,6 +348,39 @@
+             if (cursor > 0) {
+                 cursor--;
+                 vga_putchar('\b');
++            }
++        } else if (key == KEY_RIGHT) {
++            if (cursor < len) {
++                vga_putchar(buf[cursor]);
++                cursor++;
++            }
++        } else if (key == KEY_UP || key == KEY_DOWN) {
++            if (history_count == 0) continue;
++            if (hist_pos == history_count) {
++                /* saving current line */
++                strncpy(saved, buf, len);
++                saved[len] = 0;
++            }
++            
++            int new_pos = hist_pos;
++            if (key == KEY_UP && new_pos > 0) new_pos--;
++            else if (key == KEY_DOWN && new_pos < history_count) new_pos++;
++            
++            if (new_pos != hist_pos) {
++                hist_pos = new_pos;
++                
++                /* clear line */
++                while(cursor > 0) { vga_putchar('\b'); vga_putchar(' '); vga_putchar('\b'); cursor--; }
++                while(len > 0) { len--; }
++                
++                const char* target = (hist_pos == history_count) ? saved : shell_history_get(hist_pos);
++                if (target) {
++                    len = strlen(target);
++                    cursor = len;
++                    strncpy(buf, target, max - 1);
++                    buf[max-1] = 0;
++                    for(int i=0; i<len; i++) vga_putchar(buf[i]);
++                }
+             }
+         } else if (key == '\t') {
+             /* Handle tab completion */

@@ -1,0 +1,74 @@
+--- shell/shell.c
++++ shell/shell.c
+@@ -211,6 +211,15 @@
+     for (int i = 0; i < tail_len; i++)
+         vga_putchar('\b');
+ }
++
++static void redraw_input_line(const char *buf, int len, int cursor)
++{
++    vga_putchar('\r');
++    for (int i=0; i<80; i++) vga_putchar(' ');
++    vga_putchar('\r');
++    print_prompt();
++    for (int i=0; i<len; i++) vga_putchar(buf[i]);
++    for (int i=len; i>cursor; i--) vga_putchar('\b');
++}
+ 
+ /* Re-render "prompt + current line" after we've printed something below.
+@@ -315,6 +324,8 @@
+ int shell_read_line(char *buf, int max)
+ {
+     int len = 0;
+     int cursor = 0;
++    int hist_pos = history_count;
++    char saved[SHELL_LINE_MAX];
++    saved[0] = '\0';
+     buf[0] = '\0';
+ 
+     for (;;) {
+@@ -342,39 +353,24 @@
+                 for (int i = len; i >= cursor; i--)
+                     vga_putchar('\b');
+             }
+         } else if (key == KEY_LEFT) {
+             if (cursor > 0) {
+                 cursor--;
+                 vga_putchar('\b');
+             }
+         } else if (key == KEY_RIGHT) {
+             if (cursor < len) {
+                 vga_putchar(buf[cursor]);
+                 cursor++;
+             }
+-        } else if (key == KEY_UP || key == KEY_DOWN) {
+-            /* TODO: history navigation */
+-            continue;
++        } else if (key == KEY_UP || key == KEY_DOWN) {
++            if (history_count == 0) continue;
++            if (hist_pos == history_count) {
++                strncpy(saved, buf, len);
++                saved[len] = 0;
++            }
++            
++            int new_pos = hist_pos;
++            if (key == KEY_UP && new_pos > 0) new_pos--;
++            else if (key == KEY_DOWN && new_pos < history_count) new_pos++;
++            
++            if (new_pos != hist_pos) {
++                hist_pos = new_pos;
++                while(cursor > 0) { vga_putchar('\b'); vga_putchar(' '); vga_putchar('\b'); cursor--; }
++                while(len > 0) { len--; }
++                
++                const char* target = (hist_pos == history_count) ? saved : shell_history_get(hist_pos);
++                if (target) {
++                    len = strlen(target);
++                    cursor = len;
++                    strncpy(buf, target, max - 1);
++                    buf[max-1] = 0;
++                    for(int i=0; i<len; i++) vga_putchar(buf[i]);
++                }
++            }
+         } else if (key == '\t') {
+             /* Handle tab completion */
+             handle_tab_completion(buf, &len, &cursor, max);

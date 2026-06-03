@@ -1,16 +1,9 @@
-/* process/scheduler.c  -  round-robin scheduler skeleton.
- *
- * The context-switch primitive (context_switch in switch.asm) is implemented
- * and available. By design (boot stability) the scheduler runs cooperatively:
- * scheduler_tick() simply accounts time and the system runs the interactive
- * shell as PID 1. schedule() picks the next READY process round-robin when
- * called explicitly. This keeps the kernel stable while exposing the full
- * scheduling API (init/add/tick/schedule + ASM context switch).
- */
 #include "scheduler.h"
 #include "../lib/types.h"
 
 extern void context_switch(context_t *old, context_t *new);
+extern void process_set_current(process_t* p);
+extern process_t* process_get_current(void);
 
 static process_t *run_queue[MAX_PROCESSES];
 static uint32_t   queue_len;
@@ -30,13 +23,16 @@ void scheduler_add(process_t *proc)
         run_queue[queue_len++] = proc;
 }
 
-/* Called from the timer IRQ at 100 Hz. Cooperative: just count ticks. */
+/* Called from the timer IRQ at 100 Hz. Preemptive scheduler! */
 void scheduler_tick(void)
 {
     tick_count++;
+    if (tick_count % 5 == 0) { // every 50ms (assuming 100Hz)
+        schedule();
+    }
 }
 
-/* Round-robin selection (cooperative). */
+/* Round-robin selection. */
 void schedule(void)
 {
     if (queue_len == 0)
@@ -47,10 +43,22 @@ void schedule(void)
         current_idx = (current_idx + 1) % queue_len;
         process_t *p = run_queue[current_idx];
         if (p && p->state == PROC_READY) {
-            process_t *prev = run_queue[start];
+            process_t *prev = process_get_current();
             p->state = PROC_RUNNING;
             if (prev && prev != p && prev->state == PROC_RUNNING)
                 prev->state = PROC_READY;
+            
+            process_set_current(p);
+            
+            if (prev == p) return;
+            
+            /* If ring 3 is running, update the TSS stack pointer so 
+             * the next interrupt uses this task's kernel stack! */
+            extern void tss_set_kernel_stack(uint32_t esp0);
+            if (p->kstack) {
+                tss_set_kernel_stack((uint32_t)p->kstack + 8192);
+            }
+            
             context_switch(prev ? &prev->context : NULL, &p->context);
             return;
         }

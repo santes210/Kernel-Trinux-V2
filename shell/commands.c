@@ -2115,16 +2115,14 @@ static int cmd_usertest(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "bad") == 0) {
         kprintf("Launching ring-3 program that violates privilege...\n");
-        int rc = usermode_run("badboy", userprog_badboy);
-        kprintf("(returned %d)\n", rc);
+        usermode_run("badboy", userprog_badboy);
         return 0;
     }
     kprintf("Dropping to ring 3 and running a userspace demo program.\n");
     kprintf("It talks to the kernel ONLY through int 0x80 syscalls.\n");
-    int code = usermode_run("usertest", userprog_main);
+    int pid = usermode_run("usertest", userprog_main);
     vga_set_color(vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK));
-    kprintf("\n  [ring0] back in the kernel; user program exited with code %d\n",
-            code);
+    kprintf("\n  [ring0] User program launched as PID %d (runs asynchronously)\n", pid);
     vga_set_color(shell_get_state()->color);
     return 0;
 }

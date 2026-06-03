@@ -112,6 +112,9 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
      * Must come after ata_init() so /dev/sda is created when a disk exists. */
     devfs_init();            ok("Device files in /dev (sda, zero, null, random)");
 
+    extern void fat16_init(void);
+    fat16_init();
+
     /* Users (reads /etc/passwd which may now come from disk) */
     users_init();            ok("User accounts (/etc/passwd, /etc/shadow)");
 
@@ -126,6 +129,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     vga_set_color(vga_entry_color(VGA_WHITE, VGA_BLACK));
     kprintf("\n  Type 'help' for a list of commands.\n\n");
     vga_set_color(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
+
 
     shell_run();
 
