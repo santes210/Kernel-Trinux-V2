@@ -22,6 +22,7 @@
 #include "../drivers/acpi_ec.h"
 #include "../kernel/elf.h"
 #include "tasm.h"
+#include "tcc.h"
 
 #define READ_BUF 4096
 
@@ -2201,6 +2202,35 @@ static int cmd_asm(int argc, char **argv)
     return tasm_assemble(argv[1], out_path);
 }
 
+/* tcc <source.c> [output] — compile C into an ELF binary */
+static int cmd_tcc(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("usage: tcc <source.c> [output]\n\n");
+        kprintf("  Compiles a C program into an ELF32 executable.\n");
+        kprintf("  If no output is given, removes .c extension.\n\n");
+        kprintf("  Built-in functions:\n");
+        kprintf("    print(str)           print_num(n)\n");
+        kprintf("    print_char(c)        getchar()\n");
+        kprintf("    sleep(ms)            uptime()      getpid()\n");
+        kprintf("    exit(code)           vga_clear(color)\n");
+        kprintf("    vga_putchar(x,y,c,color)\n");
+        kprintf("    vga_print(x,y,str,color)\n");
+        return 1;
+    }
+    char out_path[128];
+    if (argc >= 3) {
+        strncpy(out_path, argv[2], sizeof(out_path) - 1);
+    } else {
+        strncpy(out_path, argv[1], sizeof(out_path) - 1);
+        out_path[sizeof(out_path) - 1] = '\0';
+        int l = (int)strlen(out_path);
+        if (l > 2 && strcmp(out_path + l - 2, ".c") == 0)
+            out_path[l - 2] = '\0';
+    }
+    return tcc_compile(argv[1], out_path);
+}
+
 /* exec <file> — load and run an ELF32 binary from the filesystem in ring 3 */
 static int cmd_exec(int argc, char **argv)
 {
@@ -2358,6 +2388,7 @@ static const command_t table[] = {
     {"usertest", cmd_usertest, "run a ring-3 userspace program (int 0x80 demo)"},
     {"exec",     cmd_exec,     "load and run an ELF32 binary from the filesystem"},
     {"asm",      cmd_asm,      "assemble x86 ASM source into ELF binary"},
+    {"tcc",      cmd_tcc,      "compile C source into ELF binary"},
     {"battery",  cmd_battery,  "show battery status (laptop only)"},
     {"help",     cmd_help,     "show this help"},
 };

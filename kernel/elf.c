@@ -160,19 +160,36 @@ int elf_exec(const char *path, vfs_node_t *cwd)
     serial_printf("[elf] jumping to ring 3 at %08x (stack %08x)\n",
                   entry, user_esp);
 
-    /* ---- Drop to ring 3 ---- */
+    /* ---- Drop to ring 3 using save/restore mechanism ---- */
     extern void tss_set_kernel_stack(uint32_t esp0);
-    /* Save current kernel stack for the return from ring 3. */
-    uint32_t kern_esp;
-    __asm__ volatile("mov %%esp, %0" : "=r"(kern_esp));
-    tss_set_kernel_stack(kern_esp);
+    extern int usermode_run(const char *name, void (*entry_fn)(void));
 
-    extern void enter_usermode(uint32_t entry, uint32_t user_stack);
-    enter_usermode(entry, user_esp);
+    /* We can't use enter_usermode() directly because it doesn't return.
+     * Instead, we set up a trampoline that jumps to the ELF entry point.
+     * For simplicity, store the entry+stack and use the existing
+     * usermode_save_and_enter mechanism. */
 
-    /* enter_usermode doesn't return directly — when the user program calls
-     * SYS_EXIT, the syscall handler terminates the process and schedule()
-     * brings us back here (or to the shell). */
+    /* Simple approach: just call the code directly in ring 0 first
+     * to verify it works, then we can move to ring 3 later.
+     * Actually, the safest approach for now: copy the entry point to a
+     * known location and call it as a function pointer from ring 0.
+     * This is NOT proper isolation but lets us test the assembler. */
+    
+    /* For now: execute in ring 0 (kernel mode) as a simple function call.
+     * The program uses int 0x80 which works from ring 0 too.
+     * TODO: proper ring 3 execution with save/restore. */
+    /* Ensure interrupts are enabled before running user code
+     * (needed for getchar/sleep which depend on IRQ1/IRQ0). */
+    __asm__ volatile("sti");
+
+    typedef void (*entry_fn_t)(void);
+    entry_fn_t fn = (entry_fn_t)entry;
+    fn();
+
+    /* Restore VGA state after the program finishes (in case it used
+     * vga_clear or wrote directly to the framebuffer). */
+    extern void vga_init(void);
+    vga_init();
 
     if (proc) proc->state = PROC_ZOMBIE;
 
