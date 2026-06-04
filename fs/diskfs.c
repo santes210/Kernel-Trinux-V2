@@ -257,13 +257,16 @@ int diskfs_save(void)
     if (sectors > DISKFS_TAIL_SECTORS) { kfree(b.buf); return -5; }
     if (base + sectors > ata_total_sectors()) { kfree(b.buf); return -6; }
 
-    /* write in chunks of up to 255 sectors per ATA command */
+    /* write in small chunks for USB compatibility */
     uint32_t written = 0;
     while (written < sectors) {
         uint32_t chunk = sectors - written;
-        if (chunk > 255) chunk = 255;
-        if (ata_write_sectors(base + written, (uint8_t)chunk,
-                              b.buf + written * ATA_SECTOR_SIZE) != 0) {
+        if (chunk > 32) chunk = 32;   /* max 32 sectors (16 KiB) per call */
+        int wrc = ata_write_sectors(base + written, (uint8_t)chunk,
+                                    b.buf + written * ATA_SECTOR_SIZE);
+        if (wrc != 0) {
+            serial_printf("[diskfs] write FAILED at LBA %u + %u, chunk=%u, rc=%d\n",
+                          base, written, chunk, wrc);
             kfree(b.buf);
             return -7;
         }

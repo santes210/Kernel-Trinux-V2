@@ -20,6 +20,8 @@
 #include "../cpu/syscall.h"
 #include "../user/userprog.h"
 #include "../drivers/acpi_ec.h"
+#include "../kernel/elf.h"
+#include "tasm.h"
 
 #define READ_BUF 4096
 
@@ -2167,12 +2169,95 @@ static int cmd_usertest(int argc, char **argv)
     return 0;
 }
 
+/* asm <source.asm> [output] — assemble x86 ASM into an ELF binary */
+static int cmd_asm(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("usage: asm <source.asm> [output]\n\n");
+        kprintf("  Assembles x86 assembly into an ELF32 executable.\n");
+        kprintf("  If no output is given, removes .asm extension.\n\n");
+        kprintf("  Example:\n");
+        kprintf("    edit hello.asm    (write your code)\n");
+        kprintf("    asm hello.asm     (creates 'hello')\n");
+        kprintf("    exec hello        (run it)\n\n");
+        kprintf("  Supported: mov, add, sub, cmp, and, or, xor,\n");
+        kprintf("    push, pop, inc, dec, int, call, jmp, je, jne,\n");
+        kprintf("    ret, nop, hlt, db, labels (name:)\n");
+        return 1;
+    }
+
+    char out_path[128];
+    if (argc >= 3) {
+        strncpy(out_path, argv[2], sizeof(out_path) - 1);
+    } else {
+        /* Remove .asm extension */
+        strncpy(out_path, argv[1], sizeof(out_path) - 1);
+        out_path[sizeof(out_path) - 1] = '\0';
+        int l = (int)strlen(out_path);
+        if (l > 4 && strcmp(out_path + l - 4, ".asm") == 0)
+            out_path[l - 4] = '\0';
+    }
+
+    return tasm_assemble(argv[1], out_path);
+}
+
+/* exec <file> — load and run an ELF32 binary from the filesystem in ring 3 */
+static int cmd_exec(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("usage: exec <elf-binary>\n");
+        kprintf("  Loads an ELF32 i386 executable from the filesystem\n");
+        kprintf("  and runs it in ring 3 (userspace).\n\n");
+        kprintf("  To create a program:\n");
+        kprintf("    1. Write C code using only int 0x80 syscalls\n");
+        kprintf("    2. Compile: i686-elf-gcc -ffreestanding -nostdlib \\\n");
+        kprintf("         -static -Wl,-Ttext=0x08048000 -o app app.c\n");
+        kprintf("    3. Copy to Trinux filesystem (via dd or at build time)\n");
+        kprintf("    4. Run: exec /path/to/app\n");
+        return 1;
+    }
+    shell_state_t *s = shell_get_state();
+    return elf_exec(argv[1], s->cwd);
+}
+
 static int cmd_battery(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    /* battery dump — show all EC registers (diagnostic) */
+    if (argc > 1 && strcmp(argv[1], "dump") == 0) {
+        if (!acpi_ec_available()) {
+            kprintf("EC not accessible.\n");
+            return 1;
+        }
+        kprintf("EC register dump (0x00-0xFF):\n");
+        kprintf("     00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F\n");
+        for (uint32_t row = 0; row < 16; row++) {
+            kprintf("%02x: ", row * 16);
+            for (uint32_t col = 0; col < 16; col++) {
+                int v = acpi_ec_read_register((uint8_t)(row * 16 + col));
+                if (v >= 0)
+                    kprintf("%02x ", v);
+                else
+                    kprintf("?? ");
+            }
+            kprintf("\n");
+        }
+        kprintf("\nLook for your battery percentage (e.g. if battery is ~60%%,\n"
+                "find a register with value 0x3C = 60).\n"
+                "Then tell me which register and I'll fix the driver.\n");
+        return 0;
+    }
+
+    /* battery reset — force re-detection of EC layout */
+    if (argc > 1 && strcmp(argv[1], "reset") == 0) {
+        acpi_ec_reset_layout();
+        kprintf("Battery layout reset. Run 'battery' to re-detect.\n");
+        return 0;
+    }
+
     battery_info_t bat;
     if (!acpi_ec_read_battery(&bat)) {
         kprintf("No battery detected (desktop PC or EC not accessible).\n");
+        kprintf("Try 'battery dump' to see raw EC registers.\n");
         return 1;
     }
 
@@ -2271,6 +2356,8 @@ static const command_t table[] = {
     {"history",  cmd_history,  "show command history"},
     {"alias",    cmd_alias,    "create command aliases"},
     {"usertest", cmd_usertest, "run a ring-3 userspace program (int 0x80 demo)"},
+    {"exec",     cmd_exec,     "load and run an ELF32 binary from the filesystem"},
+    {"asm",      cmd_asm,      "assemble x86 ASM source into ELF binary"},
     {"battery",  cmd_battery,  "show battery status (laptop only)"},
     {"help",     cmd_help,     "show this help"},
 };
@@ -2359,6 +2446,16 @@ int commands_dispatch(int argc, char **argv)
             return rc;
         }
     }
+    /* Not a built-in command.  If it looks like a path (starts with /
+     * or ./), try to execute it as an ELF binary — just like Linux. */
+    if (argv[0][0] == '/' ||
+        (argv[0][0] == '.' && argv[0][1] == '/')) {
+        shell_state_t *s = shell_get_state();
+        int rc = elf_exec(argv[0], s->cwd);
+        if (cmd_proc) cmd_proc->state = PROC_ZOMBIE;
+        return rc;
+    }
+
     if (cmd_proc) cmd_proc->state = PROC_ZOMBIE;
     return -1;   /* unknown */
 }

@@ -155,21 +155,46 @@ void users_save(void)
 
 void users_init(void)
 {
-    /* If /etc/passwd is missing, seed defaults. */
+    /* Seed /etc/passwd and /etc/shadow if missing or empty.
+     * This covers: fresh boot, corrupted disk image, empty files from
+     * a previous sync that went wrong, etc. */
     char buf[64];
-    if (read_file("/etc/passwd", buf, sizeof(buf)) < 0) {
+    int r = read_file("/etc/passwd", buf, sizeof(buf));
+    if (r <= 0 || buf[0] == '\0' || buf[0] == '\n') {
         write_file("/etc/passwd",
             "root:x:0:0:root:/root:/bin/sh\n"
             "user:x:1000:1000:Default User:/home/user:/bin/sh\n");
         write_file("/etc/shadow",
             "root:root\n"
             "user:user\n");
-        /* ensure /root home exists */
-        if (!vfs_resolve("/root", vfs_get_root()))
-            vfs_mkdir("/root", vfs_get_root());
+    }
+
+    /* Also check /etc/shadow separately — passwd can exist without shadow */
+    r = read_file("/etc/shadow", buf, sizeof(buf));
+    if (r <= 0 || buf[0] == '\0' || buf[0] == '\n') {
+        write_file("/etc/shadow",
+            "root:root\n"
+            "user:user\n");
+    }
+
+    /* ensure home directories exist */
+    if (!vfs_resolve("/root", vfs_get_root()))
+        vfs_mkdir("/root", vfs_get_root());
+    if (!vfs_resolve("/home/user", vfs_get_root())) {
+        if (!vfs_resolve("/home", vfs_get_root()))
+            vfs_mkdir("/home", vfs_get_root());
+        vfs_mkdir("/home/user", vfs_get_root());
     }
 
     users_load();
+
+    /* Safety net: if after loading there's still no root or user account,
+     * force-create them. This handles the case where /etc/passwd existed
+     * on disk but contained garbage that users_load() couldn't parse. */
+    if (!users_find("root"))
+        users_add("root", "root", 0, 0, "/root");
+    if (!users_find("user"))
+        users_add("user", "user", 1000, 1000, "/home/user");
 
     /* default session: the regular user */
     cur_user = users_find("user");

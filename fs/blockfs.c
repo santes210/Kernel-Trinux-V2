@@ -158,7 +158,7 @@ int blockfs_flush_bitmap(void)
     uint32_t done = 0;
     while (done < bitmap_sectors) {
         uint32_t chunk = bitmap_sectors - done;
-        if (chunk > 255) chunk = 255;
+        if (chunk > 32) chunk = 32;   /* smaller chunks for USB compat */
         if (ata_write_sectors(BITMAP_LBA + done, (uint8_t)chunk,
                               secbuf + done * 512) != 0) { rc = -3; break; }
         done += chunk;

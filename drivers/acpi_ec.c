@@ -109,15 +109,17 @@ typedef struct {
 } ec_layout_t;
 
 static const ec_layout_t layouts[] = {
-    /* HP Stream / HP laptops (common layout) */
+    /* HP Stream 14 (Bay Trail/Cherry Trail) — confirmed by EC dump */
+    { 0x92, 0x40, 0x58, 0x59, 0x04, 0x05, 0xA8, 0xA9, 0xFF, 0xFF, "HP-Stream" },
+    /* HP laptops common layout A */
     { 0xA4, 0xA0, 0xA6, 0xA7, 0xA2, 0xA3, 0xA8, 0xA9, 0xAA, 0xAB, "HP-A" },
-    /* HP alternate layout */
+    /* HP alternate layout B */
     { 0xB0, 0xA0, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, "HP-B" },
     /* Lenovo ThinkPad */
     { 0xB9, 0x38, 0xAA, 0xAB, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, "Lenovo" },
     /* Dell */
     { 0xA6, 0xA5, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF, "Dell" },
-    /* Generic: just try a few common percentage-only registers */
+    /* Generic: try common percentage-only registers */
     { 0x2C, 0x20, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, "generic-2C" },
     { 0xB0, 0xB1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, "generic-B0" },
 };
@@ -125,11 +127,24 @@ static const ec_layout_t layouts[] = {
 
 static int best_layout = -1;
 
-static uint16_t read16(uint8_t lo, uint8_t hi)
+int acpi_ec_read_register(uint8_t reg)
 {
-    if (lo == 0xFF || hi == 0xFF) return 0;
-    int l = ec_read_reg(lo);
-    int h = ec_read_reg(hi);
+    if (!acpi_ec_available()) return -1;
+    return ec_read_reg(reg);
+}
+
+void acpi_ec_reset_layout(void)
+{
+    best_layout = -1;
+}
+
+/* Read a 16-bit value from two EC registers.
+ * HP Stream stores values big-endian (first reg = high byte). */
+static uint16_t read16_be(uint8_t hi_reg, uint8_t lo_reg)
+{
+    if (hi_reg == 0xFF || lo_reg == 0xFF) return 0;
+    int h = ec_read_reg(hi_reg);
+    int l = ec_read_reg(lo_reg);
     if (l < 0 || h < 0) return 0;
     return (uint16_t)((h << 8) | l);
 }
@@ -191,18 +206,26 @@ bool acpi_ec_read_battery(battery_info_t *info)
 
     int sts = ec_read_reg(lay->sts);
     if (sts >= 0) {
-        /* Common bit patterns (vary by vendor, but these are typical): */
-        info->ac_connected = (sts & 0x10) != 0;
-        info->charging     = (sts & 0x02) != 0;
-        info->discharging  = (sts & 0x01) != 0;
-        if (!info->charging && !info->discharging && info->ac_connected)
-            info->charging = (pct < 100);
+        if (best_layout == 0) {
+            /* HP Stream 14: reg 0x40 — bit0=AC, bit1=discharging,
+             * bit2=? . Confirmed by EC dump: 0x02 = discharging on bat. */
+            info->ac_connected = (sts & 0x01) != 0;
+            info->discharging  = (sts & 0x02) != 0;
+            info->charging     = info->ac_connected && !info->discharging;
+        } else {
+            /* Generic bit patterns for other vendors: */
+            info->ac_connected = (sts & 0x10) != 0;
+            info->charging     = (sts & 0x02) != 0;
+            info->discharging  = (sts & 0x01) != 0;
+            if (!info->charging && !info->discharging && info->ac_connected)
+                info->charging = (pct < 100);
+        }
     }
 
-    info->voltage_mv = read16(lay->volt_lo, lay->volt_hi);
-    info->remain_mah = read16(lay->rem_lo, lay->rem_hi);
-    info->full_mah   = read16(lay->full_lo, lay->full_hi);
-    info->rate_ma    = read16(lay->rate_lo, lay->rate_hi);
+    info->voltage_mv = read16_be(lay->volt_lo, lay->volt_hi);
+    info->remain_mah = read16_be(lay->rem_lo, lay->rem_hi);
+    info->full_mah   = read16_be(lay->full_lo, lay->full_hi);
+    info->rate_ma    = read16_be(lay->rate_lo, lay->rate_hi);
 
     return true;
 }

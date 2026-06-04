@@ -23,6 +23,42 @@
 #include "../process/scheduler.h"
 #include "../lib/printf.h"
 #include "../shell/shell.h"
+#include "hello_elf.h"
+#include "vgademo_elf.h"
+#include "snake_elf.h"
+
+/* Install built-in ELF binaries into /bin if they don't already exist.
+ * Called AFTER diskfs_load() so they survive regardless of disk state. */
+static void install_builtin_apps(void)
+{
+    static const struct {
+        const char *name;
+        const unsigned char *data;
+        unsigned int size;
+    } apps[] = {
+        { "hello",   hello_elf,   hello_elf_size },
+        { "vgademo", vgademo_elf, vgademo_elf_size },
+        { "snake",   snake_elf,   snake_elf_size },
+    };
+
+    /* ensure /bin exists */
+    vfs_node_t *bin = vfs_resolve("/bin", vfs_get_root());
+    if (!bin)
+        bin = vfs_mkdir("/bin", vfs_get_root());
+    if (!bin) return;
+
+    for (unsigned i = 0; i < sizeof(apps)/sizeof(apps[0]); i++) {
+        if (vfs_finddir(bin, apps[i].name))
+            continue;   /* already exists (from disk restore) */
+        char path[64];
+        snprintf(path, sizeof(path), "/bin/%s", apps[i].name);
+        vfs_node_t *f = vfs_create(path, vfs_get_root());
+        if (f) {
+            f->permissions = 0755;
+            vfs_write(f, 0, apps[i].size, (uint8_t *)apps[i].data);
+        }
+    }
+}
 
 /* Check if a word appears in a space-separated string. */
 static bool cmdline_has(const char *cmdline, const char *word)
@@ -139,6 +175,8 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     /* Populate /dev with character devices (/dev/sda, zero, null, random).
      * Must come after ata_init() so /dev/sda is created when a disk exists. */
     devfs_init();            ok("Device files in /dev (sda, zero, null, random)");
+
+    install_builtin_apps();  ok("Built-in apps installed in /bin");
 
     extern void fat16_init(void);
     fat16_init();

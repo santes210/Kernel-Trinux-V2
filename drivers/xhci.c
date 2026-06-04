@@ -88,6 +88,16 @@ static uint16_t bulk_out_max_packet;
 /* Mass storage tag counter */
 static uint32_t msd_tag = 1;
 
+/* Static DMA bounce buffer for sector I/O — allocated once in xhci_init().
+ * Reads use 16-sector chunks (8 KiB) for speed.
+ * Writes use 4-sector chunks (2 KiB) for maximum USB stick compatibility —
+ * many cheap sticks fail on larger single SCSI WRITE(10) transfers. */
+#define XHCI_READ_CHUNK    16
+#define XHCI_WRITE_CHUNK   4
+#define XHCI_CHUNK_SECTORS 16   /* buffer size = max(READ,WRITE) */
+#define XHCI_CHUNK_BYTES   (XHCI_CHUNK_SECTORS * 512)
+static uint8_t *xhci_dma_buf;
+
 /* ---- MMIO read/write helpers ---- */
 static uint32_t rd32(volatile uint8_t *base, uint32_t off)
 { return *(volatile uint32_t *)(base + off); }
@@ -201,7 +211,7 @@ static int xhci_command(xhci_trb_t *trb, xhci_trb_t *evt_out)
     ring_doorbell(0, 0);   /* host controller doorbell, target=0 */
 
     xhci_trb_t evt;
-    if (!poll_event(&evt, 5000)) {
+    if (!poll_event(&evt, 30000)) {
         serial_write("[xhci] command timeout\n");
         return -1;
     }
@@ -268,7 +278,7 @@ static int xhci_control_transfer(uint8_t bmRequestType, uint8_t bRequest,
     /* Wait for transfer events (we might get one per stage). */
     xhci_trb_t evt;
     for (int i = 0; i < 3; i++) {
-        if (!poll_event(&evt, 3000)) break;
+        if (!poll_event(&evt, 30000)) break;
         uint32_t cc = (evt.status >> 24) & 0xFF;
         if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT) {
             serial_printf("[xhci] control xfer cc=%u\n", cc);
@@ -298,9 +308,12 @@ static int xhci_bulk_transfer(bool dir_in, void *data, uint32_t length)
     ring_enqueue(ring, XFER_RING_SIZE, enq, cyc, &trb);
     ring_doorbell(slot_id, dci);
 
+    /* USB 2.0 flash drives can be VERY slow on writes (NAND erase latency).
+     * Use a generous timeout: 30000 = ~3-5 seconds depending on CPU speed. */
     xhci_trb_t evt;
-    if (!poll_event(&evt, 5000)) {
-        serial_printf("[xhci] bulk %s timeout\n", dir_in ? "IN" : "OUT");
+    if (!poll_event(&evt, 30000)) {
+        serial_printf("[xhci] bulk %s timeout (len=%u)\n",
+                      dir_in ? "IN" : "OUT", length);
         return -1;
     }
     uint32_t cc = (evt.status >> 24) & 0xFF;
@@ -315,49 +328,91 @@ static int xhci_bulk_transfer(bool dir_in, void *data, uint32_t length)
  *  USB Mass Storage Bulk-Only Transport
  * ============================================================================ */
 
+/* Static DMA-safe buffers for CBW/CSW — allocated once to avoid heap churn. */
+static usb_cbw_t *static_cbw;
+static usb_csw_t *static_csw;
+
 static int msd_command(uint8_t *scsi_cmd, uint8_t cmd_len,
                        void *data, uint32_t data_len, bool dir_in)
 {
-    /* Allocate DMA-safe buffers */
-    usb_cbw_t *cbw = (usb_cbw_t *)kmalloc_aligned(sizeof(usb_cbw_t));
-    usb_csw_t *csw = (usb_csw_t *)kmalloc_aligned(sizeof(usb_csw_t));
-    if (!cbw || !csw) { kfree(cbw); kfree(csw); return -1; }
+    if (!static_cbw || !static_csw) return -1;
 
-    /* Build CBW */
-    memset(cbw, 0, sizeof(*cbw));
-    cbw->signature   = CBW_SIGNATURE;
-    cbw->tag         = msd_tag++;
-    cbw->data_length = data_len;
-    cbw->flags       = dir_in ? 0x80 : 0x00;
-    cbw->lun         = 0;
-    cbw->cb_length   = cmd_len;
-    memcpy(cbw->cb, scsi_cmd, cmd_len);
+    /* Retry loop: some USB sticks need a couple of attempts, especially
+     * for writes after a period of inactivity. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        /* Delay between retries and before writes.  USB 2.0 flash drives
+         * (like Kingston DataTraveler) have slow NAND controllers that need
+         * time to process the previous write before accepting a new one. */
+        if (attempt > 0)
+            xhci_delay(50);    /* 50ms between retries */
+        else if (!dir_in)
+            xhci_delay(2);     /* 2ms before writes */
 
-    /* Send CBW via Bulk OUT */
-    int rc = xhci_bulk_transfer(false, cbw, 31);
-    if (rc != 0) { kfree(cbw); kfree(csw); return rc; }
+        /* Build CBW */
+        memset(static_cbw, 0, sizeof(*static_cbw));
+        static_cbw->signature   = CBW_SIGNATURE;
+        static_cbw->tag         = msd_tag++;
+        static_cbw->data_length = data_len;
+        static_cbw->flags       = dir_in ? 0x80 : 0x00;
+        static_cbw->lun         = 0;
+        static_cbw->cb_length   = cmd_len;
+        memcpy(static_cbw->cb, scsi_cmd, cmd_len);
 
-    /* Data phase (if any) */
-    if (data_len > 0 && data) {
-        rc = xhci_bulk_transfer(dir_in, data, data_len);
-        if (rc != 0) { kfree(cbw); kfree(csw); return rc; }
+        /* Send CBW via Bulk OUT */
+        int rc = xhci_bulk_transfer(false, static_cbw, 31);
+        if (rc != 0) {
+            serial_printf("[xhci-msd] CBW failed (attempt %d, rc=%d)\n",
+                          attempt, rc);
+            continue;
+        }
+
+        /* Data phase (if any) */
+        if (data_len > 0 && data) {
+            rc = xhci_bulk_transfer(dir_in, data, data_len);
+            if (rc != 0) {
+                serial_printf("[xhci-msd] data %s failed (attempt %d, rc=%d)\n",
+                              dir_in ? "IN" : "OUT", attempt, rc);
+                /* Try to recover: read CSW anyway to clear the pipe */
+                memset(static_csw, 0, sizeof(*static_csw));
+                xhci_bulk_transfer(true, static_csw, 13);
+                continue;
+            }
+        }
+
+        /* Receive CSW via Bulk IN */
+        memset(static_csw, 0, sizeof(*static_csw));
+        rc = xhci_bulk_transfer(true, static_csw, 13);
+        if (rc != 0) {
+            serial_printf("[xhci-msd] CSW failed (attempt %d, rc=%d)\n",
+                          attempt, rc);
+            continue;
+        }
+
+        if (static_csw->signature != CSW_SIGNATURE ||
+            static_csw->tag != static_cbw->tag) {
+            serial_printf("[xhci-msd] CSW mismatch sig=%08x tag=%u/%u\n",
+                          static_csw->signature, static_csw->tag,
+                          static_cbw->tag);
+            continue;
+        }
+
+        if (static_csw->status != 0) {
+            serial_printf("[xhci-msd] SCSI error status=%u (attempt %d)\n",
+                          static_csw->status, attempt);
+            /* REQUEST SENSE to clear the error */
+            if (scsi_cmd[0] != SCSI_REQUEST_SENSE) {
+                uint8_t *sense = (uint8_t *)xhci_dma_buf;  /* reuse bounce buf */
+                uint8_t rs[6] = { SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0 };
+                msd_command(rs, 6, sense, 18, true);
+            }
+            continue;
+        }
+
+        return 0;   /* success */
     }
 
-    /* Receive CSW via Bulk IN */
-    memset(csw, 0, sizeof(*csw));
-    rc = xhci_bulk_transfer(true, csw, 13);
-    if (rc != 0) { kfree(cbw); kfree(csw); return rc; }
-
-    if (csw->signature != CSW_SIGNATURE || csw->tag != cbw->tag) {
-        serial_write("[xhci-msd] CSW signature/tag mismatch\n");
-        kfree(cbw); kfree(csw);
-        return -3;
-    }
-
-    rc = (csw->status == 0) ? 0 : -4;
-    kfree(cbw);
-    kfree(csw);
-    return rc;
+    serial_write("[xhci-msd] command failed after 3 attempts\n");
+    return -4;
 }
 
 static uint32_t msd_read_capacity(void)
@@ -675,10 +730,10 @@ bool xhci_init(void)
     uint32_t *ep0_ctx = (uint32_t *)(input_ctx + 2 * ctx_size);
     uint32_t max_packet_ep0;
     switch (speed) {
-        case 1: max_packet_ep0 = 8;   break;  /* Low Speed */
-        case 2: max_packet_ep0 = 8;   break;  /* Full Speed */
-        case 3: max_packet_ep0 = 64;  break;  /* High Speed */
-        case 4: max_packet_ep0 = 512; break;  /* SuperSpeed */
+        case 1: max_packet_ep0 = 8;   break;  /* Low Speed (1.5 Mbps) */
+        case 2: max_packet_ep0 = 64;  break;  /* Full Speed (12 Mbps) */
+        case 3: max_packet_ep0 = 64;  break;  /* High Speed (480 Mbps) */
+        case 4: max_packet_ep0 = 512; break;  /* SuperSpeed (5 Gbps) */
         default: max_packet_ep0 = 64; break;
     }
     ep0_ctx[0] = 0;
@@ -856,6 +911,20 @@ bool xhci_init(void)
     }
     serial_write("[xhci] endpoints configured\n");
 
+    /* Allocate persistent DMA buffers BEFORE msd_init_device, because
+     * msd_command() uses static_cbw/static_csw internally. */
+    static_cbw = (usb_cbw_t *)kmalloc_aligned(sizeof(usb_cbw_t));
+    static_csw = (usb_csw_t *)kmalloc_aligned(sizeof(usb_csw_t));
+    if (!static_cbw || !static_csw) {
+        serial_write("[xhci] failed to allocate CBW/CSW buffers\n");
+        return false;
+    }
+    xhci_dma_buf = (uint8_t *)kmalloc_aligned(XHCI_CHUNK_BYTES);
+    if (!xhci_dma_buf) {
+        serial_write("[xhci] failed to allocate DMA bounce buffer\n");
+        return false;
+    }
+
     /* ---- Initialize Mass Storage device ---- */
     if (!msd_init_device()) {
         serial_write("[xhci] mass storage init failed\n");
@@ -878,19 +947,18 @@ uint32_t xhci_total_sectors(void) { return total_sects; }
 int xhci_read_sectors(uint32_t lba, uint16_t count, void *buf)
 {
     if (!have_xhci || count == 0) return -10;
+    if (!xhci_dma_buf) return -12;
 
-    /* SCSI READ(10): max 128 sectors per command to keep DMA buffer small */
     uint8_t *out = (uint8_t *)buf;
     uint16_t remaining = count;
     uint32_t cur_lba = lba;
 
     while (remaining > 0) {
-        uint16_t chunk = remaining > 128 ? 128 : remaining;
+        uint16_t chunk = remaining > XHCI_READ_CHUNK
+                       ? XHCI_READ_CHUNK : remaining;
         uint32_t bytes = (uint32_t)chunk * 512;
 
-        uint8_t *dma_buf = (uint8_t *)kmalloc_aligned(bytes);
-        if (!dma_buf) return -12;
-        memset(dma_buf, 0, bytes);
+        memset(xhci_dma_buf, 0, bytes);
 
         uint8_t cmd[10] = {0};
         cmd[0] = SCSI_READ_10;
@@ -901,11 +969,10 @@ int xhci_read_sectors(uint32_t lba, uint16_t count, void *buf)
         cmd[7] = (chunk >> 8) & 0xFF;
         cmd[8] = chunk & 0xFF;
 
-        int rc = msd_command(cmd, 10, dma_buf, bytes, true);
-        if (rc != 0) { kfree(dma_buf); return rc; }
+        int rc = msd_command(cmd, 10, xhci_dma_buf, bytes, true);
+        if (rc != 0) return rc;
 
-        memcpy(out, dma_buf, bytes);
-        kfree(dma_buf);
+        memcpy(out, xhci_dma_buf, bytes);
 
         out += bytes;
         cur_lba += chunk;
@@ -917,18 +984,18 @@ int xhci_read_sectors(uint32_t lba, uint16_t count, void *buf)
 int xhci_write_sectors(uint32_t lba, uint16_t count, const void *buf)
 {
     if (!have_xhci || count == 0) return -10;
+    if (!xhci_dma_buf) return -12;
 
     const uint8_t *in = (const uint8_t *)buf;
     uint16_t remaining = count;
     uint32_t cur_lba = lba;
 
     while (remaining > 0) {
-        uint16_t chunk = remaining > 128 ? 128 : remaining;
+        uint16_t chunk = remaining > XHCI_WRITE_CHUNK
+                       ? XHCI_WRITE_CHUNK : remaining;
         uint32_t bytes = (uint32_t)chunk * 512;
 
-        uint8_t *dma_buf = (uint8_t *)kmalloc_aligned(bytes);
-        if (!dma_buf) return -12;
-        memcpy(dma_buf, in, bytes);
+        memcpy(xhci_dma_buf, in, bytes);
 
         uint8_t cmd[10] = {0};
         cmd[0] = SCSI_WRITE_10;
@@ -939,8 +1006,7 @@ int xhci_write_sectors(uint32_t lba, uint16_t count, const void *buf)
         cmd[7] = (chunk >> 8) & 0xFF;
         cmd[8] = chunk & 0xFF;
 
-        int rc = msd_command(cmd, 10, dma_buf, bytes, false);
-        kfree(dma_buf);
+        int rc = msd_command(cmd, 10, xhci_dma_buf, bytes, false);
         if (rc != 0) return rc;
 
         in += bytes;
