@@ -1574,6 +1574,270 @@ Kernel-Trinux-V2/
 - [ ] Soporte para más de 256 MiB de RAM
 - [ ] Más comandos: `tar`, `ping`, `wget`, `ssh`...
 
+
+## 📋 Tabla completa de Syscalls
+
+Trinux implementa **10 syscalls** accesibles vía `int 0x80` (DPL=3,
+invocables desde ring 3):
+
+| # | Nombre | Regs | Args | Descripción |
+|---|---|---|---|---|
+| 1 | `SYS_EXIT` | `ebx=code` | exit_code | Termina el proceso. Hace `longjmp` de vuelta a `elf_exec()` o llama al scheduler. |
+| 2 | `SYS_WRITE` | `ebx=fd, ecx=buf, edx=len` | buffer, longitud | Escribe al VGA y al puerto serial COM1 simultáneamente. |
+| 3 | `SYS_GETPID` | — | — | Retorna el PID del proceso actual. |
+| 4 | `SYS_YIELD` | — | — | Cede el CPU cooperativamente al scheduler. |
+| 5 | `SYS_SLEEP` | `ebx=ms` | milisegundos | Duerme el proceso. Usa `sleep()` del driver PIT (busy-HLT). |
+| 6 | `SYS_GETC` | — | — | Lee un carácter del teclado (bloqueante). |
+| 7 | `SYS_UPTIME` | — | — | Segundos transcurridos desde el boot. |
+| 8 | `SYS_READFILE` | `ebx=path, ecx=buf, edx=max` | ruta, buffer, máximo | Lee archivo del VFS. Retorna bytes leídos o -1. |
+| 9 | `SYS_WRITEFILE` | `ebx=path, ecx=buf, edx=len` | ruta, buffer, longitud | Crea/trunca y escribe archivo en el VFS. Retorna bytes o -1. |
+| 10 | `SYS_GETLINE` | `ebx=buf, ecx=max` | buffer, máximo | Lee línea del teclado con echo + backspace. |
+
+> **Convención**: `eax` = número syscall, args en `ebx/ecx/edx`, resultado en `eax`.
+
+---
+
+## 🎮 Aplicaciones integradas
+
+Al boot, el kernel instala automáticamente las siguientes aplicaciones
+embebidas en `/bin` (si no existen ya en disco):
+
+| App | Fuente embebida | Descripción |
+|---|---|---|
+| `hello` | `kernel/hello_elf.h` | Demo de "Hello World" usando syscalls para imprimir al VGA. |
+| `vgademo` | `kernel/vgademo_elf.h` | Demo gráfico que pinta patrones de colores directo en 0xB8000. |
+| `snake` | `kernel/snake_elf.h` | Juego de la serpiente implementado con VGA directa y `SYS_GETC`. |
+
+Además, el kernel empaqueta **fuentes C** en `/root` para que puedas
+compilarlos y modificarlos:
+
+| Fuente | Descripción |
+|---|---|
+| `tce.c` | Editor de texto compilable con TCC. Demuestra que el compilador produce programas no triviales. |
+| `mini_test.c` | Suite de tests de 6 líneas que valida `print_num`, `print_char` y `print`. |
+| `slow.c` | Programa CPU-bound para probar el scheduler MLFQ con `nice`. |
+
+```sh
+cd /root
+tcc tce.c && exec tce          # compila y ejecuta el editor
+tcc mini_test.c && exec mini_test  # ejecuta los tests
+nice +10 exec slow              # prueba el scheduler con baja prioridad
+```
+
+---
+
+## 🔧 TASM — Instrucciones soportadas
+
+El ensamblador integrado (`asm`) soporta las siguientes instrucciones x86:
+
+| Categoría | Instrucciones |
+|---|---|
+| Movimiento | `mov reg,imm` · `mov reg,reg` · `mov [reg],imm` · `mov reg,[reg]` |
+| Aritmética | `add` · `sub` · `inc` · `dec` · `mul` · `div` |
+| Lógica | `and` · `or` · `xor` |
+| Comparación | `cmp` |
+| Stack | `push` · `pop` |
+| Control | `call` · `jmp` · `ret` · `nop` · `hlt` |
+| Interrupciones | `int imm` |
+| Datos | `db` (define byte) |
+| Labels | `nombre:` (resueltos en pass 2) |
+
+### Ejemplo
+
+```asm
+section .text
+global _start
+
+_start:
+    mov eax, 2          ; SYS_WRITE
+    mov ecx, msg
+    mov edx, msglen
+    int 0x80
+
+    mov eax, 1          ; SYS_EXIT
+    mov ebx, 0
+    int 0x80
+
+section .data
+msg:    db "Hola desde TASM!", 10, 0
+msglen: equ $ - msg
+```
+
+---
+
+## ⚙️ ELF Loader: arquitectura y restricciones
+
+### Memory layout
+
+| Región | Dirección | Propósito |
+|---|---|---|
+| Código/Datos | Según ELF (típicamente `0x08048000`) | Segmentos PT_LOAD del ELF |
+| Stack de usuario | `0x0F000000 - 16 KiB` | Stack temporal para ELFs |
+| Límite | 256 MiB (`0x10000000`) | No se pueden mapear segmentos más allá |
+
+### Restricciones actuales
+
+- Los ELFs deben ser **ELF32 i386 little-endian** de tipo `ET_EXEC`.
+- Los segmentos no pueden exceder los **256 MiB** identity-mapped.
+- No hay **ASLR** — las direcciones del ELF se cargan tal cual.
+- No hay **aislamiento de memoria** — el ELF comparte el espacio del kernel.
+- El ELF corre en **ring 0** (kernel mode), no ring 3.
+- La terminación usa `setjmp/longjmp` para volver al flujo del shell.
+
+### Mecanismo de salida (`elf_arm_exit_jmp`)
+
+Los ELFs compilados por TCC se ejecutan como llamada de función dentro
+del flujo del shell. Para poder salir limpiamente:
+
+```
+  shell_run()
+    └→ commands_dispatch()
+         └→ elf_exec(path, cwd)
+              ├→ elf_arm_exit_jmp()     /* registra landing pad */
+              ├→ entry_fn()             /* ejecuta el ELF */
+              │    └→ int 0x80 SYS_EXIT
+              │         └→ elf_jmp_longjmp()  /* vuelve aquí */
+              ├→ elf_disarm_exit_jmp()
+              └→ return exit_code
+```
+
+> 🚧 **Ver sección "Migración a ring 3"** para el plan de ejecutar ELFs
+> en ring 3 con aislamiento de memoria real.
+
+---
+
+## 🗂️ Configuración del sistema
+
+### Archivos de configuración
+
+| Archivo | Propósito |
+|---|---|
+| `/etc/passwd` | Cuentas de usuario (formato: `nombre:pass:uid:gid:home`) |
+| `/etc/shadow` | Contraseñas en plaintext (educativo) |
+| `/etc/hostname` | Nombre del host (se lee al boot, aparece en el prompt) |
+| `/etc/motd` | "Message of the Day" (se muestra tras el login) |
+
+### Cuentas por defecto
+
+| Usuario | UID | Home | Password |
+|---|---|---|---|
+| `root` | 0 | `/root` | `root` |
+| `user` | 1000 | `/home/user` | `user` |
+
+### Hostname y MOTD
+
+```sh
+# Cambiar el hostname
+echo "mi-pc" > /etc/hostname
+sync
+
+# Cambiar el mensaje de bienvenida
+echo "Bienvenido a Trinux!" > /etc/motd
+sync
+```
+
+El hostname aparece en el prompt: `user@mi-pc:~$`
+El MOTD se muestra en cyan antes del primer prompt.
+
+---
+
+## 🐛 Troubleshooting
+
+### Problemas comunes
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| `"command not found"` | Comando inexistente o mal escrito | Usa `help` para ver los 70+ comandos disponibles |
+| Archivos no persisten | Falta ejecutar `sync` antes de apagar | `sync` guarda todo al disco |
+| QEMU se congela | QEMU esperando input | `Ctrl-C` en la terminal o `Ctrl-Alt-2` → `quit` en QEMU |
+| Teclado no responde | QEMU no captura el input | Haz clic en la ventana de QEMU; `Ctrl-Alt` para liberar |
+| Paste roto en Termux | Scancodes PS/2 se pierden | Usa `-display none -serial mon:stdio` |
+| `"No ATA disk"` | QEMU sin parámetro `-drive` | Usa `make run` en vez de `make` |
+| `exec` falla con ELF | Formato inválido o no ELF32 | Verifica con `stat` que sea ELF32 válido |
+| CapsLock pegado | Scancode fantasma tras paste | El editor llama `keyboard_reset_all()` al cerrar |
+
+### Logs de debug
+
+El kernel envía logs al puerto serial COM1 (115200 8N1):
+
+```sh
+make run              # logs en stderr de QEMU
+qemu-system-i386 -kernel mykernel.bin -serial stdio  # logs en terminal
+```
+
+El serial también **acepta input** (Fase 16) — puedes ejecutar comandos
+desde una terminal externa sin ventana gráfica:
+
+```sh
+qemu-system-i386 -kernel mykernel.bin -display none -serial stdio
+```
+
+(`Ctrl-A C` alterna entre la consola del kernel y el monitor de QEMU;
+`Ctrl-A X` sale.)
+
+---
+
+## 🤝 Contribuir
+
+### Cómo hacer un fork
+
+```sh
+# 1. Haz fork del repositorio en GitHub
+# 2. Clona
+git clone https://github.com/TU_USUARIO/Kernel-Trinux-V2.git
+cd Kernel-Trinux-V2
+
+# 3. Crea una branch
+git checkout -b feature/mi-feature
+
+# 4. Compila y prueba
+make clean && make && make run
+
+# 5. Commit y push
+git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feature
+
+# 6. Abre un Pull Request
+```
+
+### Convenciones de código
+
+- **C**: Estilo K&R, 4 espacios, `snake_case` para funciones y variables.
+- **ASM**: Sintaxis NASM, indentación con tabs.
+- **Headers**: Guards `#ifndef` con nombre de directorio + archivo.
+- **Comentarios**: Inglés para código, español para README.
+
+### Áreas donde se necesita ayuda
+
+- [ ] Más comandos (`tar`, `ping`, `wget`, `ssh`)
+- [ ] Driver de red (NE2000 / virtio-net)
+- [ ] Modo gráfico VBE (640×480+)
+- [ ] Soporte para más de 256 MiB de RAM
+- [ ] Filesystem real (ext2, FAT32)
+- [ ] SMP / multinúcleo
+- [ ] CFS-like fair scheduling
+- [ ] NVMe support
+- [ ] USB keyboard/mouse (HID)
+- [ ] Mejorar TCC (más features C)
+- [ ] **Ring 3 real para ELFs** (ver plan Fase C1-C7)
+- [ ] Tickless idle
+
+---
+
+## 📊 Estadísticas del proyecto
+
+| Métrica | Valor |
+|---|---|
+| **Líneas de código** | ~12,000 (C + ASM) |
+| **Comandos de shell** | 70+ |
+| **Syscalls** | 10 |
+| **Drivers** | 11 (VGA, teclado, timer, RTC, serial, PCI, ATA, AHCI, xHCI, ACPI EC) |
+| **Sistemas de archivos** | 6 (VFS, RAMFS, DISKFS, BLOCKFS, DEVFS, FAT16) |
+| **Fases implementadas** | 18+ |
+| **Tamaño del kernel** | ~120 KB (mykernel.bin) |
+| **Memoria mínima** | 16 MiB |
+| **Arquitectura** | i686 (32-bit x86 protected mode) |
+
+---
 ## 📜 Licencia
 
 Por definir (sugerencia: MIT o GPL-2.0).
