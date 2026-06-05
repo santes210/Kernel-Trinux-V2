@@ -29,5 +29,6 @@ void keyboard_init(void);
 int  keyboard_getchar(void);                       /* blocking; returns key */
 int  keyboard_trygetchar(void);                    /* non-blocking; -1 if none */
 int  keyboard_readline(char *buffer, int max_len); /* returns length */
+void keyboard_reset_modifiers(void);               /* force-reset shift/ctrl/alt */
 
 #endif /* DRIVERS_KEYBOARD_H */

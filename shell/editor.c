@@ -17,8 +17,8 @@
 #include "../lib/string.h"
 #include "../lib/printf.h"
 
-#define ED_MAX_LINES 1024
-#define ED_MAX_COLS  256
+#define ED_MAX_LINES 2048
+#define ED_MAX_COLS  512
 #define TEXT_ROWS    22          /* visible text rows (1..22) */
 #define TEXT_TOP     1           /* first screen row used for text */
 
@@ -279,25 +279,37 @@ int editor_run(const char *path)
     vfs_node_t *node = vfs_resolve(path, s->cwd);
     load_file(node);
 
+    /* Status message to show after next render */
+    const char *status_msg = NULL;
+    uint8_t    status_col;
+
     for (;;) {
         render(path);
-        int k = keyboard_getchar();
+        if (status_msg) {
+            draw_str(0, 23, status_msg, status_col);
+            status_msg = NULL;
+        }
 
+        /* ---- Read ONE key (blocking) ---- */
+        int k = keyboard_getchar();
+        int dirty_batch = 0;
+
+        /* ---- Process first key ---- */
         if (k == 19 || k == 15) {            /* Ctrl-S / Ctrl-O = save */
             if (save_file(path) == 0) {
-                clear_row(23, vga_entry_color(VGA_BLACK, VGA_LIGHT_GREEN));
-                draw_str(0, 23, "  Saved.", vga_entry_color(VGA_BLACK, VGA_LIGHT_GREEN));
+                status_msg = "  Saved.";
+                status_col = vga_entry_color(VGA_BLACK, VGA_LIGHT_GREEN);
             } else {
-                clear_row(23, vga_entry_color(VGA_WHITE, VGA_RED));
-                draw_str(0, 23, "  Save failed!", vga_entry_color(VGA_WHITE, VGA_RED));
+                status_msg = "  Save failed!";
+                status_col = vga_entry_color(VGA_WHITE, VGA_RED);
             }
-            keyboard_getchar();   /* pause so the message is visible */
+            /* Do NOT block here — just render on next iteration */
         } else if (k == 24) {                /* Ctrl-X = exit */
             if (modified && prompt_yes("  Save modified buffer? (y/n)"))
                 save_file(path);
             break;
         } else if (k == 11) {                /* Ctrl-K = cut line */
-            cut_line();
+            cut_line(); dirty_batch = 1;
         } else if (k == KEY_UP) {
             if (cy > 0) { cy--; if (cx > (int)line_len[cy]) cx = (int)line_len[cy]; }
         } else if (k == KEY_DOWN) {
@@ -313,15 +325,37 @@ int editor_run(const char *path)
         } else if (k == KEY_END) {
             cx = (int)line_len[cy];
         } else if (k == '\n') {
-            insert_newline();
+            insert_newline(); dirty_batch = 1;
         } else if (k == '\b') {
-            delete_back();
+            delete_back(); dirty_batch = 1;
         } else if (k == '\t') {
-            insert_char(' '); insert_char(' ');   /* tab = 2 spaces */
+            insert_char(' '); insert_char(' '); dirty_batch = 1;
         } else if (k >= 32 && k < 127) {
-            insert_char((char)k);
+            insert_char((char)k); dirty_batch = 1;
         }
+
+        /* ---- Batch: drain ALL pending keys.
+         * ONLY process text characters (printable + newline + backspace).
+         * Skip ALL control characters (Ctrl-S, Ctrl-X, etc.) to avoid
+         * blocking or triggering commands during paste. ---- */
+        {
+            int batch = 0;
+            for (;;) {
+                k = keyboard_trygetchar();
+                if (k < 0) break;
+                batch++;
+
+                if (k == '\n')        { insert_newline(); dirty_batch = 1; }
+                else if (k == '\b')   { delete_back();    dirty_batch = 1; }
+                else if (k == '\t')   { insert_char(' '); insert_char(' '); dirty_batch = 1; }
+                else if (k >= 32 && k < 127) { insert_char((char)k); dirty_batch = 1; }
+                /* Ignore ALL other keys during paste (arrows, ctrl-*, etc.) */
+            }
+            if (batch > 5) keyboard_reset_modifiers();
+        }
+        /* Loop back → render() shows everything at once */
     }
+ed_exit:
 
     /* restore a clean screen for the shell */
     vga_set_color(s->color);

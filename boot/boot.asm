@@ -25,11 +25,11 @@ align 4
     dd MBFLAGS
     dd CHECKSUM
 
-; ---- Kernel stack (16 KiB) ----
+; ---- Kernel stack (512 KiB — needs room for TCC programs' local arrays) ----
 section .bss
 align 16
 stack_bottom:
-    resb 16384
+    resb 524288
 stack_top:
 
 ; ---- Entry point ----

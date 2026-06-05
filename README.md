@@ -448,9 +448,112 @@ de almacenamiento accesible desde el kernel es el xHCI (USB 3.0).
   - Nuevo comando `battery` para ver el estado detallado de la batería
     (porcentaje, AC, voltaje, capacidad, tasa).
 
+### Fase 15 — TCC / TASM: Compilador C y Ensamblador integrados 🆕
+
+Trinux incluye **dos herramientas de desarrollo integradas** en la propia
+shell — no necesitas ningún toolchain externo.  Escribes el código con
+`edit`, lo compilas/ensamblas con `tcc` o `asm`, y lo ejecutas con `exec`.
+
+#### TCC — Trinux C Compiler (`shell/tcc.c`)
+
+Un **compilador C completo** integrado en el kernel.  Arquitectura
+single-pass recursive-descent que compila un subset de C directamente a
+código máquina x86 (32-bit) y lo empaqueta en un ELF32 ejecutable.
+
+```sh
+edit hola.c           # escribe tu programa C
+tcc hola.c            # compila → crea 'hola' ELF32
+exec hola             # ejecuta en ring 3
+```
+
+**Lenguaje soportado:**
+
+| Feature | Ejemplo |
+|---|---|
+| Tipos `int`, `char` | `int x = 42;` |
+| Variables locales + arrays | `int arr[10]; arr[0] = 5;` |
+| Funciones con forward refs | `int foo(int a, int b) { return a + b; }` |
+| `if` / `else` | `if (x > 0) { ... } else { ... }` |
+| `while` / `do-while` / `for` | `for (i = 0; i < 10; i++) { ... }` |
+| `break` / `continue` | `if (x == 5) break;` |
+| `return` | `return x * 2;` |
+| Operadores aritméticos | `+ - * / %` |
+| Operadores de comparación | `== != < > <= >=` |
+| Operadores lógicos | `&& \|\| !` |
+| Asignación compuesta | `x += 5; count *= 2;` |
+| Incremento / decremento | `i++; --j;` (prefijo y postfijo) |
+| Address-of / deref | `int *p = &x; *p = 10;` |
+| Strings | `print("hola\\n");` |
+| Declaraciones múltiples | `int x, y, z;` |
+| Comentarios `//` y `/* */` | |
+
+**Funciones built-in (syscall):**
+
+| Función | Descripción |
+|---|---|
+| `print(str)` | Imprime string |
+| `print_num(n)` | Imprime entero (soporta negativos) |
+| `print_char(c)` | Imprime un carácter |
+| `getchar()` | Lee una tecla (bloqueante) |
+| `getline(buf, max)` | Lee una línea con echo + backspace |
+| `sleep(ms)` | Duerme milisegundos |
+| `uptime()` | Segundos desde boot |
+| `getpid()` | PID del proceso |
+| `exit(code)` | Termina el programa |
+| `strlen(str)` | Longitud de string |
+| `strcmp(a, b)` | Compara strings |
+| `strncmp(a, b, n)` | Compara hasta n chars |
+| `strcpy(dst, src)` | Copia string |
+| `itoa(n, buf)` | Entero → string |
+| `vga_clear(color)` | Limpia pantalla |
+| `vga_putchar(x,y,ch,c)` | Dibuja carácter en posición |
+| `vga_print(x,y,str,c)` | Dibuja string en posición |
+
+**Ejemplo completo** — un programa interactivo:
+
+```c
+int main() {
+    char buf[64];
+    int i;
+
+    print("=== Contador interactivo ===\n");
+    print("Cuantas veces quieres contar? ");
+
+    getline(buf, 64);
+
+    int n = 0;
+    for (i = 0; buf[i] >= '0' && buf[i] <= '9'; i++) {
+        n = n * 10 + (buf[i] - '0');
+    }
+
+    for (i = 1; i <= n; i++) {
+        print_num(i);
+        print(" ");
+    }
+    print("\nListo!\n");
+    return 0;
+}
+```
+
+#### TASM — Trinux Assembler (`shell/tasm.c`)
+
+Un **ensamblador x86** que convierte código ASM en ELF32 ejecutable.
+Ideal para experiments de bajo nivel o para escribir programas más
+eficientes que los que genera el TCC.
+
+```sh
+edit hola.asm
+asm hola.asm          # ensambla → crea 'hola' ELF32
+exec hola
+```
+
+**Instrucciones soportadas:** `mov`, `add`, `sub`, `cmp`, `and`, `or`,
+`xor`, `push`, `pop`, `inc`, `dec`, `int`, `call`, `jmp`, `je`, `jne`,
+`ret`, `nop`, `hlt`, `db`, y labels (`nombre:`).
+
 ---
 
-## 🛠️ Comandos de la shell (66+)
+## 🛠️ Comandos de la shell (70+)
 
 ### Archivos y navegación
 
@@ -560,6 +663,9 @@ echo hola >> log.txt                 # append
 | `env` | Variables de entorno |
 | `yes` | Repetir cadena (limitado a 100 líneas) |
 | `usertest` | Demo de programa en ring 3 (syscalls) |
+| `tcc` | Compilar C → ELF32 (`tcc prog.c`) |
+| `asm` | Ensamblar x86 → ELF32 (`asm prog.asm`) |
+| `exec` | Ejecutar ELF32 desde filesystem (`exec prog`) |
 
 ---
 
@@ -650,8 +756,10 @@ Kernel-Trinux-V2/
 │   └── users.c/h             # cuentas, /etc/passwd, /etc/shadow, login/su
 ├── shell/
 │   ├── shell.c/h             # shell principal: prompt, editor, historial, pipes
-│   ├── commands.c/h          # 66+ comandos integrados
-│   └── editor.c/h            # editor nano a pantalla completa
+│   ├── commands.c/h          # 70+ comandos integrados
+│   ├── editor.c/h            # editor nano a pantalla completa
+│   ├── tcc.c/h               # compilador C → ELF32 (single-pass)
+│   └── tasm.c/h              # ensamblador x86 → ELF32
 ├── lib/
 │   ├── string.c/h            # funciones de cadena/memoria/ctype
 │   ├── printf.c/h            # kprintf / snprintf
@@ -716,7 +824,7 @@ Kernel-Trinux-V2/
 - [x] Batería (ACPI EC) + CPU usage en tiempo real
 - [x] Boot UEFI (via GRUB EFI 32-bit)
 - [x] Single-user mode / recovery (estilo Linux)
-- [ ] Cargar binarios ELF desde el filesystem
+- [x] Cargar binarios ELF desde el filesystem (TCC + TASM + exec)
 - [ ] Driver de red (NE2000 / virtio-net)
 - [ ] Modo gráfico VBE (640×480 o mayor)
 - [ ] Procesos preemptivos reales

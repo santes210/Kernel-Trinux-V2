@@ -186,10 +186,13 @@ int elf_exec(const char *path, vfs_node_t *cwd)
     entry_fn_t fn = (entry_fn_t)entry;
     fn();
 
-    /* Restore VGA state after the program finishes (in case it used
-     * vga_clear or wrote directly to the framebuffer). */
-    extern void vga_init(void);
-    vga_init();
+    /* ---- Restore cursor position so the shell prompt appears correctly ---- */
+    /* Don't call vga_init() here — it clears the screen and erases the
+     * program's output.  Programs that use print() / print_num() go through
+     * SYS_WRITE → vga_putchar(), which already maintains correct VGA state.
+     * Only programs that write directly to 0xB8000 (vga_clear, vga_putchar
+     * builtins) might leave the cursor in a weird spot, but even then the
+     * shell's print_prompt() will fix it on the next iteration. */
 
     if (proc) proc->state = PROC_ZOMBIE;
 
