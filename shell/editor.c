@@ -351,7 +351,12 @@ int editor_run(const char *path)
                 else if (k >= 32 && k < 127) { insert_char((char)k); dirty_batch = 1; }
                 /* Ignore ALL other keys during paste (arrows, ctrl-*, etc.) */
             }
-            if (batch > 5) keyboard_reset_modifiers();
+            /* After a paste burst, modifier scancodes may have been lost and
+             * CapsLock may have been toggled by a stray 0x3A.  Wipe ALL ghost
+             * state (including caps) so the editor / shell don't keep typing
+             * in MAYÚSCULAS once we return.  Threshold kept low because
+             * Android paste tends to dump tens of bytes per IRQ. */
+            if (batch > 3) keyboard_reset_all();
         }
         /* Loop back → render() shows everything at once */
     }
@@ -361,5 +366,10 @@ ed_exit:
     vga_set_color(s->color);
     vga_clear();
     vga_set_cursor(0, 0);
+
+    /* Always leave with a pristine modifier state — fixes the "everything is
+     * UPPERCASE after closing the editor" bug on Android when a stray Caps
+     * / Shift scancode arrived mid-paste and never got its release byte. */
+    keyboard_reset_all();
     return 0;
 }

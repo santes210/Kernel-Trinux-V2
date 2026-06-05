@@ -154,15 +154,37 @@ int elf_exec(const char *path, vfs_node_t *cwd)
     strncpy(name, slash, sizeof(name) - 1);
     name[sizeof(name) - 1] = '\0';
 
+    /* Create the process entry BEFORE swapping `current`, so the new task
+     * exists in the run queue while it runs.  Mark it RUNNING and stash
+     * the shell's current so we can restore it when the program returns
+     * (or exits via SYS_EXIT — see process_exit() handling below). */
     process_t *proc = process_create(name, NULL);
-    if (proc) proc->state = PROC_RUNNING;
+    process_t *prev_current = process_get_current();
+    if (proc) {
+        proc->state = PROC_RUNNING;
+        /* Make this proc the current task while it runs.  This is what
+         * makes `int 0x80 / SYS_EXIT` mark the RIGHT task as a zombie
+         * (previously SYS_EXIT killed the shell because `current` still
+         * pointed at it — the user-visible symptom was that `top` kept
+         * showing terminated ELFs as "RUN" forever). */
+        process_set_current(proc);
+    }
 
     serial_printf("[elf] jumping to ring 3 at %08x (stack %08x)\n",
                   entry, user_esp);
 
     /* ---- Drop to ring 3 using save/restore mechanism ---- */
     extern void tss_set_kernel_stack(uint32_t esp0);
-    extern int usermode_run(const char *name, void (*entry_fn)(void));
+    extern int  usermode_run(const char *name, void (*entry_fn)(void));
+    extern void elf_arm_exit_jmp(void);
+    extern void elf_disarm_exit_jmp(void);
+    extern int  elf_get_exit_code(void);
+
+    /* Arm the SYS_EXIT longjmp landing pad: when the program calls
+     * SYS_EXIT (or page-faults), control unwinds here right after the
+     * `fn()` call below — without ever executing the bogus `ret` that
+     * the user-stack would otherwise dispatch to. */
+    elf_arm_exit_jmp();
 
     /* We can't use enter_usermode() directly because it doesn't return.
      * Instead, we set up a trampoline that jumps to the ELF entry point.
@@ -194,7 +216,22 @@ int elf_exec(const char *path, vfs_node_t *cwd)
      * builtins) might leave the cursor in a weird spot, but even then the
      * shell's print_prompt() will fix it on the next iteration. */
 
-    if (proc) proc->state = PROC_ZOMBIE;
+    /* If we got here either:
+     *   (a) the program ran to completion and returned from fn() (rare
+     *       — tcc's stub always does SYS_EXIT before any real ret), or
+     *   (b) SYS_EXIT / a fatal exception longjmp'd back to elf_exec
+     *       through the elf_arm_exit_jmp() pad — which is the common
+     *       path.
+     * Either way, mark the proc zombie, drop the exit jmp so a later
+     * unrelated fault doesn't accidentally land here, and restore the
+     * shell as `current` so its prompt comes back. */
+    int exit_code = elf_get_exit_code();
+    elf_disarm_exit_jmp();
+    if (proc) {
+        proc->state     = PROC_ZOMBIE;
+        proc->exit_code = exit_code;
+    }
+    if (prev_current) process_set_current(prev_current);
 
-    return 0;
+    return exit_code;
 }

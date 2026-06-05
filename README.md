@@ -114,8 +114,20 @@ Si quieres correr Trinux en tu teléfono Android, mira **[TERMUX_QUICKSTART.md](
 
 ```sh
 pkg install qemu-system-i386-headless
+
+# Modo "clásico" — pantalla VGA emulada en curses
 qemu-system-i386 -drive file=trinux.img,format=raw,if=ide -m 512M -display curses
+
+# 🆕 Modo recomendado para pegar texto largo desde el portapapeles
+qemu-system-i386 -drive file=trinux.img,format=raw,if=ide -m 512M \
+                 -display none -serial mon:stdio
 ```
+
+> 💡 El **modo serial** evita el cuello de botella de `-display curses`
+> al inyectar scancodes PS/2 (la cola interna de QEMU descarta bytes en
+> pastes muy grandes y deja Shift/CapsLock pegado).  Con `-serial
+> mon:stdio` los bytes del clipboard van directamente al UART del guest,
+> sin traducción a scancodes y sin pérdidas.  Ver Fase 16 más abajo.
 
 ---
 
@@ -472,6 +484,8 @@ exec hola             # ejecuta en ring 3
 |---|---|
 | Tipos `int`, `char` | `int x = 42;` |
 | Variables locales + arrays | `int arr[10]; arr[0] = 5;` |
+| Arrays de bytes (`char buf[N]`) 🆕 | `char buf[256]; buf[0] = 65;` |
+| **Variables globales** (`.bss`) 🆕 | `int counter; char log[4096];` |
 | Funciones con forward refs | `int foo(int a, int b) { return a + b; }` |
 | `if` / `else` | `if (x > 0) { ... } else { ... }` |
 | `while` / `do-while` / `for` | `for (i = 0; i < 10; i++) { ... }` |
@@ -483,9 +497,16 @@ exec hola             # ejecuta en ring 3
 | Asignación compuesta | `x += 5; count *= 2;` |
 | Incremento / decremento | `i++; --j;` (prefijo y postfijo) |
 | Address-of / deref | `int *p = &x; *p = 10;` |
+| **Escritura de arrays como LHS** 🆕 | `arr[i] = expr; buf[pos] = c;` |
 | Strings | `print("hola\\n");` |
 | Declaraciones múltiples | `int x, y, z;` |
 | Comentarios `//` y `/* */` | |
+
+> 🆕 **Globales en `.bss`**: declarados a nivel de fichero (`int buf[32768];`),
+> viven en una sección BSS que el loader ELF inicializa a cero
+> automáticamente.  Antes los arrays grandes desbordaban el stack del
+> proceso (~8 KB) y crasheaban; ahora puedes reservar buffers de decenas
+> de KB sin problema.
 
 **Funciones built-in (syscall):**
 
@@ -496,6 +517,9 @@ exec hola             # ejecuta en ring 3
 | `print_char(c)` | Imprime un carácter |
 | `getchar()` | Lee una tecla (bloqueante) |
 | `getline(buf, max)` | Lee una línea con echo + backspace |
+| `read_line(buf, max)` 🆕 | Igual que `getline` (alias estándar) |
+| `read_file(path, buf, max)` 🆕 | Lee un fichero entero; devuelve bytes o `-1` |
+| `write_file(path, buf, len)` 🆕 | Escribe un fichero (crea/trunca); devuelve bytes o `-1` |
 | `sleep(ms)` | Duerme milisegundos |
 | `uptime()` | Segundos desde boot |
 | `getpid()` | PID del proceso |
@@ -508,6 +532,11 @@ exec hola             # ejecuta en ring 3
 | `vga_clear(color)` | Limpia pantalla |
 | `vga_putchar(x,y,ch,c)` | Dibuja carácter en posición |
 | `vga_print(x,y,str,c)` | Dibuja string en posición |
+
+> Los tres nuevos builtins (`read_file`, `write_file`, `read_line`) usan
+> los syscalls `SYS_READFILE` (8), `SYS_WRITEFILE` (9) y `SYS_GETLINE` (10)
+> añadidos en `cpu/syscall.{h,c}`.  Esto permite escribir aplicaciones
+> reales (editores, viewers, configuradores) directamente desde `tcc`.
 
 **Ejemplo completo** — un programa interactivo:
 
@@ -550,6 +579,703 @@ exec hola
 **Instrucciones soportadas:** `mov`, `add`, `sub`, `cmp`, `and`, `or`,
 `xor`, `push`, `pop`, `inc`, `dec`, `int`, `call`, `jmp`, `je`, `jne`,
 `ret`, `nop`, `hlt`, `db`, y labels (`nombre:`).
+
+---
+
+### Fase 16 — Robustecimiento del compilador y editor `tce` 🆕
+
+Una ronda completa de bug-hunting en el subsistema TCC más un editor
+nuevo escrito en el propio dialecto del compilador, todo encadenado en
+una sola actualización.
+
+#### 🐛 Bugs cazados en `shell/tcc.c`
+
+| # | Bug | Síntoma observable | Fix |
+|---|-----|--------------------|-----|
+| 1 | Lexer leía `char` con signo → bytes UTF-8 dentro de comentarios `/* … */` rompían `skip_ws()` | Errores fantasma como `tcc:8: & requires variable name` en líneas que sólo contenían texto del comentario | Helper `peek_byte()` que devuelve `unsigned char` |
+| 2 | El compilador escribía el ELF aunque hubiera errores | `tcc: compiled … bytes` con éxito aparente → al `exec` el programa crasheaba sin output | Contador `err_count` y abort antes de emitir el ELF |
+| 3 | El stub `_start` hacía `ret` después de `call main`, pero el user-stack no tiene una dirección de retorno válida | Page fault al volver de `main()`, EIP en zona aleatoria | Reemplazado por `mov ebx, eax; mov eax, SYS_EXIT; int 0x80` |
+| 4 | Todos los syscalls usaban números viejos (`SYS_WRITE=1` cuando la nueva ABI ya tiene `SYS_EXIT=1`, `SYS_WRITE=2`, …) | Cualquier `print*` invocaba accidentalmente `SYS_EXIT(1)` → kernel panic | Sustituidos por las macros simbólicas de `cpu/syscall.h` |
+| 5 | Los builtins void (`print`, `print_num`, `print_char`, `sleep`, `vga_*`) no empujaban valor de retorno, pero el `parse_expr` del llamador siempre hace `add esp, 4` | Stack drift: cada llamada movía ESP 4 bytes hacia memoria desconocida, `ret` eventualmente a basura | Helper `e_push0()` al final de cada builtin void |
+| 6 | `print_num` emitía saltos cortos con distancias **hardcoded** (`jns +0x16`, `jnz +0x0B`, etc.) que estaban mal calculadas — el `jns` caía 11 bytes corto, en mitad del operando de un `mov edx, 1` | Page fault reproducible con `addr=0xF9760CC8`, EIP dentro del programa, output truncado | Saltos calculados a partir del `cp` real y *patcheados* después de emitir el destino |
+
+#### ✨ Nuevas capacidades de TCC
+
+- **Variables globales** (`int x;`, `int arr[N];`, `char buf[N];`) con
+  almacenamiento en `.bss` (zero-fill via `p_memsz > p_filesz`).
+- **`char arr[N]` real**: 1 byte por elemento, indexado por bytes, con
+  zero-extend al leer (`movzx eax, byte [edx]`).  Antes los `char[]` se
+  trataban como `int[]` y consumían 4× la memoria.
+- **Asignación a array como LHS**: `arr[i] = expr;` y `buf[pos] = c;`
+  ahora generan el `mov [edx], eax` / `mov [edx], al` correcto.
+- **Tres syscalls nuevos** expuestos como builtins: `read_file`,
+  `write_file`, `read_line` — el mínimo absoluto para escribir un editor
+  de texto real desde un programa compilado por TCC.
+
+#### 📝 `tce` — editor de texto compilado por TCC
+
+```sh
+cd /root
+tcc tce.c           # compila usando el propio compilador del kernel
+exec tce            # te pregunta el nombre del fichero a editar
+```
+
+El editor `tce` está **escrito en el dialecto C que TCC entiende** —
+sin structs, sin preprocessor, sin char literals — y demuestra que el
+compilador ya es capaz de producir programas no triviales.  Features:
+
+- Buffer de 32 KB en `.bss` (`char buf[32768]`)
+- Movimiento con flechas, `Home`, `End`, `Backspace`, `Enter`, `Tab`
+- Carga del fichero con `read_file()`, guardado con Ctrl-S
+  (`write_file()`), salida con Ctrl-X (pregunta si hay cambios)
+- Barra de título + barra de estado (línea, columna, bytes)
+- Pinta directo en VGA con `vga_putchar()`
+
+> El fuente original (`/root/tce.c`) se instala automáticamente al
+> primer boot, junto con `/root/mini_test.c` (un *sanity-check* de 6
+> líneas que verifica `print_num`, `print_char` y `print` en un solo
+> exec).
+
+#### ⚡ Mejoras del input — pegar texto largo desde Android
+
+El otro frente que se atacó en esta ronda fue el flujo de **input por
+PS/2 y por serie**.  Pegar 700 líneas desde el portapapeles de Android
+hacía que el editor se trabara en la línea 5 y que al salir todo el
+shell quedara en MAYÚSCULAS para siempre.  Causas y arreglos:
+
+| Subsistema | Problema | Fix |
+|---|---|---|
+| `drivers/keyboard.c` | El handler de IRQ1 leía **un solo byte por interrupción** — los scancodes apilados por un paste rápido se perdían silenciosamente | Drenado completo del 8042 mientras `(STATUS & 0x21) == 0x01`, con guard de 64 |
+| `drivers/keyboard.c` | `BUF_SIZE = 16384` era insuficiente para pastes de cientos de líneas | Subido a `65536` |
+| `drivers/keyboard.{c,h}` | Tras un paste, un scancode `0x3A` fantasma podía dejar **CapsLock pegado**, y `keyboard_reset_modifiers()` explícitamente NO lo tocaba | Nueva función `keyboard_reset_all()` que también limpia `caps_lock`, llamada al salir del editor y tras cada batch de paste |
+| `cpu/irq.{c,h}` | BIOS/GRUB dejaba IRQ4 (COM1) **enmascarada** en el PIC — los bytes llegaban al UART pero nunca disparaban interrupción | Funciones públicas `irq_clear_mask()` / `irq_set_mask()`; `serial_enable_input()` desenmascara IRQ4, `keyboard_init()` desenmascara IRQ1 por defensiva |
+| `drivers/serial.c` | El driver era TX-only (sólo logs); no había forma de meter input por el puerto serie | Reescrito con FIFO 14-byte, IRQ4, **decodificador de secuencias ANSI** (flechas, Home/End, Del, F1-F12, ESC) que inyecta directo en el buffer del teclado vía `keyboard_inject_char()` |
+
+El resultado es que ahora puedes lanzar QEMU **sin pantalla gráfica**,
+pegar miles de líneas desde el portapapeles de Termux, y los caracteres
+fluyen por el UART (115200 8N1) sin que se pierda un solo byte ni se
+quede Shift/Caps colgado:
+
+```sh
+qemu-system-i386 \
+  -drive file=mykernel-usb.img,format=raw,if=ide \
+  -m 512M \
+  -display none \
+  -serial mon:stdio
+```
+
+(`Ctrl-A C` alterna entre la consola del kernel y el monitor de QEMU;
+`Ctrl-A X` sale.)
+
+---
+
+### Fase 17 — Scheduler con prioridades + `idle` task + contabilidad por proceso 🆕
+
+Hasta ahora el scheduler era **round-robin puro**: cada 50 ms saltaba al
+siguiente proceso de la cola, sin importar si estaba haciendo algo útil
+o no.  Y cuando "no había nada que hacer" seguía dando vueltas sobre los
+procesos placeholder a 100% de CPU — el portátil se calentaba sin
+motivo.
+
+Esta fase reemplaza el scheduler por uno **basado en prioridades estilo
+Unix `nice`**, con contabilidad de CPU por proceso y un **idle task
+real** que apaga el CPU cuando no hay trabajo.
+
+#### 🎯 Modelo de prioridades
+
+```
+   -20  ────────  más prioridad (gets the CPU first, can starve others)
+     0  ────────  default
+   +19  ────────  menos prioridad (sólo corre cuando nadie quiere CPU)
+   idl  ────────  PRIO_IDLE (interno) — el `idle` task vive aquí
+```
+
+`schedule()` recorre la run queue y selecciona el READY con **el número
+de prioridad más bajo**.  En caso de empate, hace round-robin entre los
+tasks de la misma prioridad usando un índice giratorio
+(`last_picked_idx`), así que dos procesos con la misma `nice` comparten
+el CPU equitativamente.
+
+#### ⏱️ Quantum variable por prioridad
+
+El quantum (cuánto tiempo se le permite a un task seguir ejecutando
+antes de considerar preempción) ahora **depende de la prioridad**:
+
+| Prioridad | Quantum | Razón |
+|---|---|---|
+| `-20` (max) | 20 ms | Tarea interactiva, queremos baja latencia |
+| `0` (default) | 50 ms | Igual al comportamiento anterior |
+| `+19` (min) | 120 ms | CPU-bound, menos overhead de switching |
+| `idle` | 10 ms | Cede CPU lo antes posible si llega trabajo |
+
+#### 🧊 Idle task — el CPU se enfría de verdad
+
+Un proceso nuevo (PID 4, `idle`) cuya entrada es literalmente
+`for(;;) { sti; hlt; }`.  Vive en `PRIO_IDLE`, así que sólo se ejecuta
+cuando **nadie más** está READY.  El `hlt` pone físicamente el CPU en
+estado de bajo consumo hasta el siguiente IRQ (timer, teclado, serial).
+
+> Verificación medible: en `top`, justo después de boot el CPU global
+> aparece a 100% (todavía estaba acumulando ticks desde el arranque),
+> pero en el siguiente refresh — con el sistema idle — baja a **~1%**.
+> El delta son los HLTs reales.
+
+#### 📊 Contabilidad por proceso
+
+Tres campos nuevos en `process_t`:
+
+```c
+uint32_t cpu_ticks;       /* ticks totales en RUNNING (vida del proceso) */
+uint32_t ticks_window;    /* ticks en la ventana actual de %CPU (≈2 s)   */
+uint32_t start_tick;      /* timer_get_ticks() al crearse                */
+```
+
+`scheduler_tick()` (que corre 100 veces por segundo desde IRQ0)
+incrementa **`cpu_ticks` y `ticks_window`** del proceso actualmente
+RUNNING.  `top_render()` calcula `%CPU = ticks_window × 100 / total` y
+resetea las ventanas para el siguiente intervalo.
+
+#### 🛠️ Comandos nuevos
+
+| Comando | Qué hace |
+|---|---|
+| `nice <prio> <cmd> [args...]` | Lanza `cmd` con prioridad inicial `<prio>`.  Internamente almacena un hint global que el siguiente `process_create()` consume. |
+| `renice <prio> <pid>` | Cambia la prioridad de un proceso ya en ejecución.  Valida que `<prio>` esté en `[-20..+19]`. |
+
+#### 👀 Salida de `ps` y `top`
+
+```
+$ ps
+  PID  PRI  STATE     TIME+      NAME
+  1    idl  running   0:03.05    init
+  2    idl  sleeping  0:00.00    kthreadd
+  3    idl  ready     0:00.00    mysh
+  4    idl  ready     0:00.00    idle
+  5      0  running   0:00.00    ps
+```
+
+```
+$ top
+  PID  PRI  STATE  %CPU   TIME+      NAME
+  2    idl  SLP     0%   0:00.00    kthreadd
+  3    idl  RDY     0%   0:00.00    mysh
+  4    idl  RDY    98%   0:00.20    idle      ← absorbe el tiempo idle
+  5      0  RUN     1%   0:00.01    top
+```
+
+#### 🔧 API kernel-side
+
+```c
+/* process.h */
+int  process_set_priority(uint32_t pid, int prio);
+void process_set_next_priority(int prio);  /* hint para próximo create() */
+#define PRIO_MIN     (-20)
+#define PRIO_MAX     ( 19)
+#define PRIO_DEFAULT (  0)
+#define PRIO_IDLE    (100)
+
+/* scheduler.h */
+void scheduler_kick(void);   /* fuerza reschedule al siguiente IRQ */
+```
+
+#### 🚧 Lo que falta para una "Fase B"
+
+- **MLFQ** (multilevel feedback queue): procesos que ceden CPU pronto
+  suben de prioridad automáticamente; los que la consumen entera bajan.
+- **Tickless idle**: parar el PIT cuando no hay sleepers para que el CPU
+  duerma más profundo (más ahorro de batería).
+- **Wakeup paths**: que un IRQ de teclado o disco que despierta a un
+  sleeper llame a `scheduler_kick()` y la preempción sea instantánea.
+- **`cpu_ticks` por modo** (user vs kernel) para mostrar la diferencia
+  estilo `top` de Linux.
+
+---
+
+### Fase 18 — Fase B del scheduler: MLFQ, sleepers, wakeups y CPU honesta 🆕
+
+Esta fase cierra los huecos que la Fase A dejó abiertos.  El scheduler
+ahora se comporta como cualquier kernel "de verdad" en sus aspectos más
+importantes, y sobre el camino se cazaron un par de bugs estructurales
+que llevaban tiempo sin notarse.
+
+#### 🐛 Bugs estructurales arreglados antes de empezar
+
+| # | Bug | Síntoma | Fix |
+|---|-----|---------|-----|
+| 1 | `scheduler_init()` se llamaba DESPUÉS de `process_init()`, así que reseteaba `queue_len=0` borrando el registro del idle task | El scheduler nunca encontraba nada que correr cuando llegaba un quantum | `kernel_main` invierte el orden y lo documenta como dependencia |
+| 2 | El SYS_EXIT del syscall handler llamaba a `schedule()`, pero los ELF compilados por tcc corren como llamada de función dentro del flujo del shell — un context-switch ahí mataba al shell | `top` mostraba el proceso ELF en `RUN` para siempre, y a veces dejaba de responder el shell | Mecanismo `setjmp`/`longjmp` (`cpu/elf_jmp.asm`) que devuelve el control directamente a `elf_exec()` sin pasar por el scheduler |
+| 3 | `process_create()` solo reciclaba slots ZOMBIE cuando la tabla estaba llena → tras unos cuantos `exec` la tabla crecía sin parar | `ps` mostraba 7+ tareas en vez de 5, con `mt`s zombi acumulados | Ahora prefiere SIEMPRE un slot ZOMBIE antes de gastar uno nuevo |
+| 4 | Los ticks del kernel ocioso se contaban a `init` porque `current` seguía siendo init mientras el shell hacía HLT | `top` mostraba `init` a **100% CPU** aunque el sistema estaba dormido | `looks_like_idle_period()` redirige el billing al `idle` task cuando `current` está en `PRIO_IDLE` |
+
+Después del fix 4, `top` muestra finalmente la verdad: el CPU global
+baja a **0%** en idle, y todo el tiempo se atribuye al `idle` task como
+debería.
+
+#### 🔄 MLFQ (Multilevel Feedback Queue)
+
+Cada proceso tiene ahora **dos** componentes de prioridad:
+
+```
+  efectiva = priority (estática, set por `nice`)  +  dyn_boost (dinámica)
+```
+
+Reglas del `dyn_boost`:
+
+- **Crédito interactivo**: cuando un proceso cede el CPU ANTES de
+  agotar su quantum (típicamente bloqueado en `getchar`, `sleep`,
+  `read_file`), recibe `-1` en `dyn_boost` (= más prioridad).  Hasta
+  `MLFQ_BOOST_MIN = -4`.
+- **Castigo CPU-bound**: cuando agota su quantum entero
+  `MLFQ_DEMOTE_AFTER = 2` veces seguidas, recibe `+1`
+  (= menos prioridad).  Hasta `MLFQ_BOOST_MAX = +4`.
+- **Decay**: cada `MLFQ_DECAY_TICKS = 500` ticks (5 s @ 100 Hz) todos
+  los `dyn_boost` se halvan hacia 0, así que un proceso que *solía*
+  ser interactivo pero ahora hace trabajo CPU-bound pierde su boost.
+
+El resultado es que editores, shells y programas interactivos suben de
+prioridad por sí solos, mientras que loops infinitos bajan al fondo y
+dejan respirar al resto.
+
+#### 💤 Procesos `SLEEPING` con wakeups reales
+
+Antes `sleep(ms)` era un busy-HLT.  Ahora hay `sleep_block(ms)`:
+
+```c
+void scheduler_sleep_current(uint32_t until_tick);
+```
+
+Marca al proceso actual como `PROC_SLEEPING` con un `sleep_until`,
+llama a `schedule()` y deja correr al siguiente READY.  El IRQ del PIT
+ejecuta `scheduler_wakeup_check()` cada tick: cualquier sleeper cuyo
+deadline ha pasado vuelve a READY y se llama a `scheduler_kick()`.
+
+#### 🚀 Wakeup paths
+
+Cuando un IRQ deposita algo "interesante" en una cola — un byte en el
+buffer del teclado vía `buf_push()`, un sleeper que cumple su deadline,
+en el futuro un paquete de red — llama a `scheduler_kick()`.  El flag
+hace que el siguiente `scheduler_tick()` fuerce una reschedule incluso
+si la tarea actual no ha agotado su quantum.
+
+Resultado práctico: cuando estás editando con `tce` y tecleas, la
+respuesta es inmediata aunque haya un loop CPU-bound al lado.
+
+#### ⏱️ Contabilidad CPU en ring 3 vs ring 0
+
+Tres campos nuevos en `process_t`:
+
+```c
+uint32_t cpu_ticks;       /* total (igual que Fase A) */
+uint32_t cpu_ticks_user;  /* de cpu_ticks, los gastados en ring 3 */
+uint32_t cpu_ticks_sys;   /* de cpu_ticks, los gastados en ring 0 */
+```
+
+El `timer_callback` mira el `CS` guardado al entrar al IRQ: si
+`(cs & 3) == 3` el proceso estaba en user-mode, si no, en kernel.  El
+scheduler factura el tick a la cubeta adecuada.
+
+`top` muestra esto como una columna extra **`US%`** (porcentaje del
+TIME+ del proceso que fue user-mode):
+
+```
+  PID  PRI  STATE  %CPU   US%   TIME+      NAME
+  1    idl  RUN     0%    0%   0:00.00    init
+  2    idl  SLP     0%    0%   0:00.00    kthreadd
+  3    idl  RDY     0%    0%   0:00.00    mysh
+  4    idl  RDY   100%    0%   0:02.06    idle
+  13     0  RUN     0%    0%   0:00.00    top
+```
+
+> Por ahora `US%` siempre es 0 porque `elf_exec()` corre los ELFs en
+> ring 0 como llamada de función (es un TODO viejo del kernel).  Cuando
+> se implemente la transición real a ring 3 — la infraestructura ya
+> existe en `cpu/syscall_asm.asm` — esta columna empezará a llenarse
+> automáticamente sin tocar nada más.
+
+#### 🧠 API kernel-side añadida en esta fase
+
+```c
+/* scheduler.h */
+void scheduler_sleep_current(uint32_t until_tick);  /* block + reschedule */
+void scheduler_set_last_user(int was_user);         /* used by timer IRQ */
+
+/* timer.h */
+void sleep_block(uint32_t milliseconds);            /* blocks current task */
+
+/* process.h */
+void process_set_current(process_t *p);             /* expuesto para elf_exec */
+
+/* cpu/syscall.c → cpu/elf_jmp.asm */
+extern int  elf_jmp_setjmp (elf_jmp_t *dst);        /* tipo setjmp/longjmp */
+extern void elf_jmp_longjmp(elf_jmp_t *src);        /* usado por SYS_EXIT  */
+```
+
+#### 🔧 Tuning knobs
+
+Todos en `process/scheduler.c`:
+
+```c
+#define MLFQ_BOOST_MAX        4    /* max -dyn_boost (boost máx)     */
+#define MLFQ_BOOST_MIN      (-4)   /* max +dyn_boost (democión máx)  */
+#define MLFQ_DEMOTE_AFTER     2    /* quantums seguidos para democión */
+#define MLFQ_DECAY_TICKS    500    /* periodo de halving del boost   */
+```
+
+Y los quantums por prioridad efectiva (en `quantum_for()`):
+
+| Prioridad efectiva | Quantum |
+|---|---|
+| `-20` (max) | 20 ms |
+| `0` (default) | 50 ms |
+| `+19` (min) | 120 ms |
+| `idle` | 10 ms |
+
+#### 🧹 Pulido tras la Fase B (issues que aparecieron al integrar todo)
+
+Estas mejoras se aplicaron justo después de declarar la Fase B
+completa, para que `nice`, `top` y `ps` se vean bien y se comporten
+como uno esperaría:
+
+| Fix | Problema | Solución |
+|---|---|---|
+| **`nice` se "comía" en el placeholder del shell** | `commands_dispatch()` crea un slot transitorio por cada built-in (incluido el propio `nice` y `exec`).  Ese slot consumía el hint de prioridad antes de que llegara al ELF real, así que `nice -5 exec /bin/foo` no surtía efecto | Nueva función `process_create_tracking(name)` que crea el slot cosmético SIN tocar `next_priority_hint`.  El shell usa esta variante; solo los procesos "de verdad" (idle, ELFs) consumen el hint |
+| **Columna `STATE` en blanco en pantalla** | `vga_print_color()` escribía directo a la VRAM sin avanzar el cursor lógico — el siguiente `kprintf` sobrescribía esos bytes con espacios y el campo se veía vacío en el monitor (en serial sí salía porque usábamos `serial_printf` aparte) | Se cambió a `vga_set_color(sc); kprintf("%s", st); vga_set_color(saved);` — un solo emisor que actualiza ambos sinks correctamente |
+| **`idle` mostrado como `RDY` con 100% CPU** | Honesto pero confuso: el idle nunca recibe un context-switch (a propósito), así que su estado sigue siendo READY.  Pero como acumula todos los HLT-ticks, verlo como `RDY @ 100%` despistaba | En `top` lo mostramos como `RUN` cuando su `priority >= PRIO_IDLE && cpu_ticks > 0`.  Su estado interno sigue siendo `READY`; solo cambia la presentación |
+| **`%CPU` podía mostrar 101 / 114 por redondeo** | `pcpu = ticks_window * 100 / window_total` puede acabar 1-2 puntos por encima cuando los billing y el reseteo de la ventana se desincronizan | Clamp `if (pcpu > 100) pcpu = 100;` |
+| **Roadmap desactualizado** | El bullet `[ ] MLFQ + quantum adaptativo + tickless (Fase B)` seguía sin marcar | Marcado, y añadidas 8 entradas nuevas describiendo lo que sí se hizo |
+
+#### 🚧 Lo que falta para una "Fase C"
+
+- **Tickless idle real**: parar el PIT cuando el único READY es el
+  idle task.  En el modelo actual de Trinux esto requiere antes
+  reescribir el shell como proceso real (no como flujo del kernel).
+- **Ring 3 real para ELFs**: hoy `elf_exec` ejecuta el ELF como
+  función en ring 0 con un setjmp/longjmp para gestionar la salida.
+  Habría que pasar al `iret` a ring 3 con TSS y manejar correctamente
+  el caso de page fault.  Cuando esto se haga, la columna `US%` de
+  `top` empezará a llenarse automáticamente (la infraestructura ya
+  está conectada al `cs` del frame de IRQ).
+- **`sleep_block()` real**: añadida en Fase B pero todavía sin
+  callers — el `sleep()` clásico sigue siendo busy-HLT.  Para
+  habilitarla hay que reescribir `keyboard_getchar()` y el builtin
+  `sleep` de TCC para que bloqueen via scheduler en vez de HLT.
+- **`looks_like_idle_period()` por identidad en vez de por prio**:
+  si alguien hace `renice 0 1` el truco de billing se rompe (init
+  empezaría a recibir los HLT-ticks).  Mejor comparar contra el
+  puntero del idle task cacheado.
+- **`SY%` complementaria a `US%`** en `top`: el campo `cpu_ticks_sys`
+  ya se rellena, falta mostrarlo.
+- **Smp / multinúcleo**: el run queue es global; con SMP haría falta
+  una cola por CPU + load balancing.
+- **CFS-like fair scheduling**: en vez de MLFQ, un árbol rojo-negro
+  ordenado por vruntime (lo que usa Linux desde 2007).
+
+---
+
+## 🛡️ Migración a ring 3 — qué hay hecho y qué falta
+
+Hoy Trinux corre **casi todo en ring 0** (kernel mode) por simplicidad
+histórica: el shell es una llamada de función dentro del bucle del
+kernel, los built-ins (`ls`, `cat`, `top`...) son funciones C dentro
+del propio binario `mykernel.bin`, y los ELFs lanzados por `exec`
+también se ejecutan en ring 0 — con un `setjmp/longjmp` para que
+`SYS_EXIT` pueda desenrollar la pila.
+
+Esto es **didácticamente útil pero peligroso**: un bug en cualquier
+sitio puede tumbar el sistema entero, y la "protección de anillos"
+del CPU no se está usando.  Esta sección es la hoja de ruta para
+llevar Trinux al modelo Unix de verdad — shell y apps en ring 3,
+kernel aislado y protegido — sin romper lo que ya funciona.
+
+### 📊 Qué tiene Trinux YA listo para ring 3
+
+| Pieza | Estado | Archivo |
+|---|---|---|
+| GDT con descriptores de ring 3 (CS 0x1B, DS 0x23) | ✅ | `boot/gdt.c` |
+| TSS con `ss0`/`esp0` para el switch ring-3 → ring-0 | ✅ | `boot/gdt.c` + `tss_set_kernel_stack()` |
+| Gate `int 0x80` con DPL=3 (invocable desde ring 3) | ✅ | `cpu/syscall.c:syscall_install()` |
+| `enter_usermode(eip, esp)` que hace `iret` a ring 3 | ✅ | `cpu/syscall_asm.asm` |
+| Stub `usermode_run()` que crea proceso + entra a ring 3 | ✅ | `cpu/syscall.c` |
+| Page fault y GPF redirigen a `usermode_fault_kill` en vez de panic | ✅ | `cpu/isr.c` |
+| Pila kernel separada por proceso (`p->kstack`, 8 KB) | ✅ | `process/process.c` |
+| Stack de usuario en `USER_STACK_TOP - USER_STACK_SIZE` | ✅ | `kernel/elf.c` |
+| `process_t` con campo `priority`, scheduling MLFQ | ✅ | `process/*.c` |
+| Contabilidad user vs kernel (`cpu_ticks_user`, `cpu_ticks_sys`) | ✅ | `process/scheduler.c` |
+| Decodificador del frame IRQ que detecta `(cs & 3) == 3` | ✅ | `drivers/timer.c` |
+| 10 syscalls definidos (`SYS_EXIT`, `SYS_WRITE`, ...) | ✅ | `cpu/syscall.{h,c}` |
+| ELFs compilados por TCC con BSS, globales, char[] | ✅ | `shell/tcc.c` |
+| `setjmp/longjmp` para que SYS_EXIT desenrolle limpio | ✅ | `cpu/elf_jmp.asm` |
+
+**Conclusión**: la infraestructura de ring 3 está, lo que falta es
+*conectarla* y *abrir la API*.
+
+### ❌ Qué bloquea hoy que el shell pase a ring 3
+
+#### 1. `elf_exec()` ejecuta los ELFs como llamada de función en ring 0
+
+```c
+/* kernel/elf.c — el código actual: */
+typedef void (*entry_fn_t)(void);
+entry_fn_t fn = (entry_fn_t)entry;
+fn();                              /* ← se ejecuta en ring 0, NO ring 3 */
+```
+
+Debería en cambio invocar `enter_usermode(entry, user_esp)` que ya
+existe en `cpu/syscall_asm.asm`.  Riesgo: `enter_usermode` no
+retorna (hace `iret`), así que el flujo del `elf_exec` cambia
+completamente.  Hay que aplicar la pareja con `elf_arm_exit_jmp` que
+ya añadimos: `SYS_EXIT` longjmp-ea de vuelta, y eso es el punto de
+salida del programa.
+
+#### 2. El shell hace 464 llamadas directas a funciones del kernel
+
+`vfs_resolve`, `kprintf`, `vga_putchar`, `kmalloc`, `process_at`,
+`users_login`...  Todas son llamadas C normales que solo funcionan
+en ring 0.  En ring 3 cada una debe pasar por un syscall.
+
+#### 3. Solo hay 10 syscalls; faltan ~30
+
+Lo que el shell necesita y NO tiene como syscall:
+
+| Categoría | Syscalls que faltan |
+|---|---|
+| Directorios | `SYS_OPENDIR`, `SYS_READDIR`, `SYS_CLOSEDIR`, `SYS_CHDIR`, `SYS_GETCWD` |
+| Ficheros | `SYS_STAT`, `SYS_UNLINK`, `SYS_MKDIR`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_CHMOD`, `SYS_CHOWN` |
+| Procesos | `SYS_FORK`, `SYS_EXECVE`, `SYS_WAIT`, `SYS_KILL`, `SYS_PS_AT`, `SYS_PS_COUNT` |
+| Usuarios | `SYS_GETUID`, `SYS_SETUID`, `SYS_GETPWENT`, `SYS_USERADD`, `SYS_PASSWD` |
+| Memoria | `SYS_BRK`, `SYS_MMAP`, `SYS_MUNMAP` |
+| Terminal | `SYS_TCGETATTR`, `SYS_TCSETATTR`, `SYS_IOCTL` |
+| Pipes/redir | `SYS_PIPE`, `SYS_DUP2`, `SYS_CLOSE` |
+
+#### 4. No hay aislamiento de memoria por proceso
+
+`vmm_init()` activa paging pero hace **identity map** de los primeros
+256 MiB, sin distinguir páginas user/supervisor.  Ring 3 puede leer
+`/etc/shadow` directamente desde memoria si conoce el offset.
+
+Lo que hace falta:
+- Una `page_directory_t` por proceso (campo `p->page_dir` ya existe
+  pero no se usa).
+- Marcar las páginas del kernel como `supervisor only` (bit U/S = 0)
+  en todas las page directories.
+- Mapear solo las páginas del proceso como user-accessible.
+- Cambiar `cr3` en cada `context_switch()`.
+
+#### 5. No hay `fork()` ni `execve()`
+
+En Unix el shell hace:
+```
+fork() → en el hijo: execve("/bin/ls", argv, envp)
+                      el padre: waitpid(pid) → exit_code
+```
+
+Trinux **no implementa nada de esto**.  Cada comando es una función
+C del binario del kernel.  Para hacer un shell ring-3 de verdad:
+
+- `fork()` debe duplicar el espacio de direcciones del padre
+  (copy-on-write idealmente, en su defecto copia completa de páginas).
+- `execve(path, argv, envp)` debe leer el ELF de disco, mapear sus
+  segmentos en el espacio del proceso actual (reemplazándolo) y
+  saltar al entry point en ring 3.
+- `waitpid(pid)` debe bloquear al padre hasta que el hijo muera y
+  recoger su `exit_code`.
+
+#### 6. La heurística `looks_like_idle_period()` se rompe
+
+El truco de Fase B asume que cuando el shell hace HLT, `current` es
+`init` (PRIO_IDLE).  Si el shell fuera proceso ring 3 con prioridad
+0, esa heurística billarìa los HLT-ticks al shell y `top` mentiría.
+Habría que comparar contra el puntero del idle task cacheado.
+
+#### 7. Validación de punteros desde userland
+
+Si el shell ring 3 hace `read_file(path_ptr, buf_ptr, len)`, el
+kernel debe verificar que `path_ptr` y `buf_ptr` apunten a memoria
+del proceso (no a una página del kernel) **antes** de leer/escribir.
+Hace falta `copy_from_user()` y `copy_to_user()` que capturen page
+faults y devuelvan -EFAULT en vez de tumbar el kernel.
+
+#### 8. Los built-ins del shell deben convertirse en binarios separados
+
+Si `ls`, `cat`, `ps`, `top` siguen siendo funciones C dentro del
+kernel, el shell ring-3 no podría ejecutarlas directamente.  Hay
+dos caminos:
+
+- **A**: cada built-in se compila como ELF separado en `/bin/` (más
+  Unix-like pero requiere reimplementar TODO con syscalls).
+- **B**: el shell sigue siendo el único programa "especial" que
+  ejecuta los built-ins via syscall `SYS_RUNBUILTIN(name, argc, argv)`
+  (transición temporal, pragmática).
+
+### 🗺️ Plan de migración por fases incrementales
+
+Cada fase deja el sistema funcional al final.  Se pueden hacer en
+orden, y cada una se puede mergear independientemente.
+
+#### Fase C1 — ELFs en ring 3 de verdad (1-2 días)
+
+**Objetivo**: que `exec /root/mt` (un programa TCC) corra en ring 3
+sin romper nada de lo actual.
+
+- [ ] En `kernel/elf.c`, sustituir `fn()` por `enter_usermode(entry,
+  user_esp)`.  Mantener el `elf_arm_exit_jmp()`/`longjmp` como punto
+  de salida.
+- [ ] Verificar con `top` que la columna `US%` deja de ser 0 — ahora
+  los programas TCC realmente consumen CPU en ring 3.
+- [ ] Confirmar que SYS_EXIT y page fault siguen unwindeando bien al
+  shell vía longjmp.
+- [ ] Suite de tests existente: `tcc mini_test.c && exec mini_test`,
+  `tcc tce.c && exec tce`, deben seguir funcionando.
+
+**Riesgo bajo**: la infraestructura está, solo es cambiar 3 líneas y
+probar.
+
+#### Fase C2 — Syscalls esenciales de filesystem (1 semana)
+
+**Objetivo**: que un programa ring-3 pueda hacer `ls`, `cat`, `cd`.
+
+- [ ] Añadir `SYS_OPENDIR` (11), `SYS_READDIR` (12), `SYS_CLOSEDIR`
+  (13), `SYS_STAT` (14), `SYS_CHDIR` (15), `SYS_GETCWD` (16),
+  `SYS_UNLINK` (17), `SYS_MKDIR` (18), `SYS_RMDIR` (19),
+  `SYS_RENAME` (20), `SYS_CHMOD` (21), `SYS_CHOWN` (22).
+- [ ] Añadir helpers `copy_from_user(dst, user_src, n)` y
+  `copy_to_user(user_dst, src, n)` que validen el puntero está en
+  el rango user (`< KERNEL_BASE` o equivalente).
+- [ ] Exponer los syscalls como builtins en TCC: `opendir`,
+  `readdir`, `stat`, `unlink`, etc.
+- [ ] Programa de prueba: un `ls` en ~80 líneas de TCC.
+
+**Riesgo medio**: cada syscall hay que validarlo bien.
+
+#### Fase C3 — Aislamiento de memoria por proceso (2-3 semanas)
+
+**Objetivo**: que un crash del programa ring-3 NO pueda tumbar el
+kernel ni acceder a `/etc/shadow` raw.
+
+- [ ] Reescribir `vmm.c` para dar a cada proceso su propia
+  `page_directory_t`.
+- [ ] Marcar todas las páginas del kernel como `bit U/S = 0`.
+- [ ] Mapear el ELF cargado solo en el espacio del proceso.
+- [ ] `context_switch()` carga `cr3` del proceso entrante.
+- [ ] Implementar `SYS_BRK` para que `kmalloc` userland (futuro
+  malloc.c en TCC) funcione.
+
+**Riesgo alto**: el VMM es el corazón del sistema; un bug aquí es un
+triple fault al boot.
+
+#### Fase C4 — `fork()`, `execve()`, `waitpid()` (1-2 semanas)
+
+**Objetivo**: poder hacer `fork+exec` desde un programa ring 3.
+
+- [ ] `SYS_FORK` (23): duplicar `process_t`, copiar page directory
+  (copy-on-write si C3 ya está, copia plena si no).
+- [ ] `SYS_EXECVE` (24): leer ELF de disco, descartar el espacio
+  actual del proceso, mapear el nuevo y saltar al entry point.
+- [ ] `SYS_WAITPID` (25): bloquear hasta que el PID hijo termine.
+- [ ] El shell ring-3 (Fase C6) usará esto en cada comando.
+
+**Riesgo alto**: COW es delicado; sin COW, fork es lento pero
+funciona.
+
+#### Fase C5 — Convertir built-ins en ELFs separados (1-3 semanas)
+
+**Objetivo**: `/bin/ls`, `/bin/cat`, `/bin/ps`, `/bin/top` como
+programas standalone.  El shell ya no los tiene como funciones C.
+
+- [ ] Reescribir cada built-in como `.c` de TCC.
+- [ ] Embeber los binarios compilados en el kernel image (igual que
+  ya hacemos con `hello_elf`, `snake_elf`, `vgademo_elf`).
+- [ ] `install_builtin_apps()` los pone en `/bin/` al boot.
+- [ ] El shell ring-3 los invoca via `fork+exec`.
+
+**Estimación de qué reescribir** (en líneas TCC, optimista):
+
+| Programa | Lineas estimadas | Syscalls necesarios |
+|---|---|---|
+| `ls` | 80 | opendir/readdir/stat |
+| `cat` | 30 | open/read |
+| `pwd` | 10 | getcwd |
+| `cd` | (built-in del shell, no programa) | chdir |
+| `mkdir`/`rmdir`/`rm` | 20 c/u | mkdir/rmdir/unlink |
+| `ps` | 60 | ps_count/ps_at |
+| `top` | 200 | ps + timer + vga |
+| `kill` | 15 | kill |
+| `chmod`/`chown` | 25 c/u | chmod/chown |
+| `cp`/`mv` | 60 c/u | open/read/write/unlink |
+| `echo` | 10 | write |
+
+**Riesgo medio**: mucho código pero mecánico.
+
+#### Fase C6 — Shell como proceso ring 3 (1-2 semanas)
+
+**Objetivo**: el shell deja de ser parte del kernel y se convierte
+en `/bin/mysh`, el PID 1 que arranca el sistema.
+
+- [ ] Reescribir `shell/shell.c` y `shell/commands.c` como un
+  programa TCC standalone.  Es ~5000 líneas; algunas porciones
+  (parser, history, line editor, dispatch) se pueden mantener casi
+  como están — solo cambian las llamadas internas por syscalls.
+- [ ] `kernel_main()` al final ejecuta `execve("/bin/mysh", ...)`
+  en lugar de llamar a `shell_run()`.
+- [ ] Si `/bin/mysh` muere, el kernel relanza (igual que `init` en
+  Linux).
+- [ ] Arreglar `looks_like_idle_period()` para que use el puntero
+  del idle cacheado en vez de mirar la prioridad.
+
+**Riesgo alto**: es el cambio que más toca, pero también el que
+verifica que TODO lo anterior funciona.
+
+#### Fase C7 — Limpieza y pulido
+
+- [ ] Eliminar `setjmp/longjmp` de `cpu/elf_jmp.asm`: ya no hace
+  falta porque los ELFs corren en ring 3 con su propia stack.
+- [ ] Eliminar los kthreads placeholder `init`/`kthreadd`/`mysh` de
+  `process_init()` ahora que el PID 1 es el shell real.
+- [ ] Documentar el modelo nuevo (un proceso = una page directory =
+  una user stack = un kstack) en el README.
+
+### 📈 Estimación total
+
+| Aspecto | Estimación |
+|---|---|
+| Tiempo total | 2-4 meses de trabajo dedicado |
+| Líneas de código nuevas (kernel) | ~3000 |
+| Líneas reescritas (built-ins en TCC) | ~2000 |
+| Syscalls totales tras la migración | ~35-40 |
+| Tamaño del kernel resultante | ~150 KB (más pequeño: built-ins fuera) |
+| Tamaño de `/bin/` resultante | ~30-50 KB de ELFs |
+
+### 🎯 Beneficios al terminar
+
+1. **Aislamiento real**: un bug en el shell o en `cat` no tumba el
+   kernel.  Pages faults se reportan al proceso, no al sistema.
+2. **`top` mostrará `US%` y `SY%` realistas** por proceso —
+   exactamente como htop en Linux.
+3. **Multi-tasking real**: dos shells corriendo en consolas
+   distintas (necesita pseudo-terminales).
+4. **Seguridad básica**: `/etc/shadow` deja de ser legible desde
+   ring 3 aunque el proceso conozca la dirección.
+5. **Camino abierto** hacia `fork`+`exec`, pipes reales, signal
+   handling, threads de usuario, etc.
+6. **Modelo mental coherente** con cualquier libro de OS — el código
+   se vuelve mucho más enseñable.
+
+### 🚨 Riesgos y cosas que se romperán por el camino
+
+- **Persistencia del filesystem**: si el shell cambia, `sync` /
+  `diskfs_save` siguen siendo del kernel — está bien, pero hay que
+  exponerlo como syscall.
+- **TCC y TASM** son del shell hoy.  Tras la migración serían
+  `/bin/tcc` y `/bin/tasm`, programas ring-3 que leen ficheros, los
+  compilan a memoria y escriben el ELF resultante.  Pueden seguir
+  funcionando con los syscalls de FS añadidos en C2.
+- **El editor `edit`** (no `tce`, el de `shell/editor.c`) también
+  necesita reescritura como `/bin/edit` ELF — o eliminarlo en favor
+  de `tce` que ya es ring-3-compatible.
+- **El monitor `top`** depende de muchas estadísticas internas; hay
+  que exponerlas todas via syscalls (`SYS_PMM_STATS`, `SYS_HEAP_STATS`,
+  `SYS_DISK_STATS`, `SYS_BATTERY`, etc.) o agrupar en un syscall
+  genérico `SYS_SYSINFO(struct sysinfo *)`.
 
 ---
 
@@ -825,9 +1551,25 @@ Kernel-Trinux-V2/
 - [x] Boot UEFI (via GRUB EFI 32-bit)
 - [x] Single-user mode / recovery (estilo Linux)
 - [x] Cargar binarios ELF desde el filesystem (TCC + TASM + exec)
+- [x] **TCC: variables globales (`.bss`), `char[]` real, array-write LHS** 🆕
+- [x] **Syscalls de I/O de ficheros (`read_file` / `write_file` / `read_line`)** 🆕
+- [x] **Editor `tce` escrito y compilado por el propio TCC** 🆕
+- [x] **Input por COM1 con IRQ4 + decodificador ANSI (pegar desde Android sin perder bytes)** 🆕
+- [x] **Scheduler por prioridades (nice -20..+19) + idle task con HLT real** 🆕
+- [x] **Contabilidad de CPU por proceso (%CPU, TIME+) visible en `top` y `ps`** 🆕
+- [x] **MLFQ con boost/demote dinámico + decay periódico** 🆕
+- [x] **`scheduler_kick()` desde IRQs (teclado/serial) para wakeup inmediato** 🆕
+- [x] **Sleepers reales (`PROC_SLEEPING` + `sleep_until` + `scheduler_wakeup_check`)** 🆕
+- [x] **Reciclado automático de slots ZOMBIE en `process_create`** 🆕
+- [x] **`SYS_EXIT` con `setjmp`/`longjmp` para no romper el flujo del shell** 🆕
+- [x] **Billing de CPU honesto: HLT-ticks van al `idle`, no a `init`** 🆕
+- [x] **Contabilidad user/kernel por proceso (campo `cpu_ticks_user`, columna `US%`)** 🆕
+- [ ] Tickless idle real (Fase C — requiere shell como proceso real)
+- [ ] Ring 3 real para ELFs (hoy corren en ring 0 con setjmp/longjmp)
+- [ ] SMP / multinúcleo + colas por CPU
+- [ ] CFS-like fair scheduling (alternativa al MLFQ actual)
 - [ ] Driver de red (NE2000 / virtio-net)
 - [ ] Modo gráfico VBE (640×480 o mayor)
-- [ ] Procesos preemptivos reales
 - [ ] NVMe (almacenamiento de siguiente generación)
 - [ ] Soporte para más de 256 MiB de RAM
 - [ ] Más comandos: `tar`, `ping`, `wget`, `ssh`...

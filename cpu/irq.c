@@ -72,6 +72,34 @@ void irq_unregister_handler(uint8_t irq)
         irq_routines[irq] = 0;
 }
 
+/* Disable (mask) one IRQ line.  Setting the bit in the PIC IMR blocks the
+ * line from raising an interrupt. */
+void irq_set_mask(uint8_t irq)
+{
+    uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
+    uint8_t  bit  = (irq < 8) ? irq : (uint8_t)(irq - 8);
+    uint8_t  m    = inb(port);
+    outb(port, (uint8_t)(m | (1u << bit)));
+}
+
+/* Enable (unmask) one IRQ line.  Clearing the bit in the PIC IMR lets the
+ * line raise interrupts again.  Must be called for every IRQ a driver
+ * wants to actually receive, because BIOS/GRUB normally leave most lines
+ * masked (notably IRQ4 = COM1, IRQ3 = COM2). */
+void irq_clear_mask(uint8_t irq)
+{
+    uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
+    uint8_t  bit  = (irq < 8) ? irq : (uint8_t)(irq - 8);
+    uint8_t  m    = inb(port);
+    outb(port, (uint8_t)(m & ~(1u << bit)));
+    /* If unmasking a slave-PIC line, make sure the cascade (IRQ2) on the
+     * master is also unmasked, otherwise nothing comes through. */
+    if (irq >= 8) {
+        uint8_t mm = inb(PIC1_DATA);
+        outb(PIC1_DATA, (uint8_t)(mm & ~(1u << 2)));
+    }
+}
+
 void irq_handler(registers_t *regs)
 {
     int irq = regs->int_no - 32;

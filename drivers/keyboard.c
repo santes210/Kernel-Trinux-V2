@@ -3,10 +3,14 @@
 #include "../cpu/irq.h"
 #include "../cpu/ports.h"
 #include "../drivers/vga.h"
+#include "../process/scheduler.h"
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
-#define BUF_SIZE   16384
+/* Big enough to absorb a full Android-clipboard paste (hundreds of lines)
+ * without the circular buffer dropping bytes — the previous 16 KiB was the
+ * second reason a ~700-line paste appeared to "freeze" at line 5. */
+#define BUF_SIZE   65536
 
 /* Circular buffer of decoded key codes. */
 static volatile int kbuf[BUF_SIZE];
@@ -53,7 +57,22 @@ static void buf_push(int key)
     if (next != ktail) {       /* drop on overflow */
         kbuf[khead] = key;
         khead = next;
+        /* A byte just landed in the input queue, which most likely means
+         * SOMETHING is waiting in keyboard_getchar() / SYS_GETC.  Force
+         * the scheduler to re-evaluate on the next timer tick so the
+         * waiting task doesn't sit blocked for a whole quantum. */
+        scheduler_kick();
     }
+}
+
+/* Public: inject a fully-decoded key code (ASCII or KEY_*) into the same
+ * input queue the PS/2 driver feeds.  Used by the serial driver so that
+ * input pasted into the QEMU serial console reaches the shell / editor
+ * exactly as if it had been typed on the PS/2 keyboard — no scancode
+ * translation, no Shift/Caps state machine to lose bytes on. */
+void keyboard_inject_char(int key)
+{
+    buf_push(key);
 }
 
 static int buf_pop(void)
@@ -159,8 +178,26 @@ static void handle_scancode(uint8_t sc)
 static void keyboard_callback(registers_t *regs)
 {
     (void)regs;
-    uint8_t sc = inb(KBD_DATA);
-    handle_scancode(sc);
+    /* Drain ALL pending bytes from the 8042 output buffer.
+     *
+     * A single IRQ1 can correspond to several scancodes when the host is
+     * pumping the controller faster than we are reading it — exactly what
+     * happens when QEMU (or a virtual PS/2 layer used by Android emulators
+     * / Termux) translates a clipboard paste into scancodes: shift-make /
+     * key-make / key-break / shift-break ... arrive back-to-back and only
+     * the first one raises the IRQ before more bytes pile up. If we only
+     * read once per IRQ we silently lose bytes and the editor "freezes" or
+     * desyncs after a handful of lines, and modifiers like Shift / CapsLock
+     * end up stuck because their release scancode was the one we dropped.
+     *
+     * Loop while the Output Buffer Full bit (bit 0 of status port 0x64) is
+     * set AND the byte belongs to the keyboard (bit 5 set = mouse/aux). */
+    int guard = 0;
+    while ((inb(KBD_STATUS) & 0x21) == 0x01) {
+        uint8_t sc = inb(KBD_DATA);
+        handle_scancode(sc);
+        if (++guard > 64) break;   /* safety: never spin forever in an IRQ */
+    }
 }
 
 void keyboard_init(void)
@@ -169,6 +206,9 @@ void keyboard_init(void)
     shift_down = ctrl_down = alt_down = caps_lock = extended = false;
     shift_age = ctrl_age = alt_age = 0;
     irq_register_handler(1, keyboard_callback);
+    /* Make sure IRQ1 is unmasked in the PIC (BIOS/GRUB usually leave it
+     * unmasked, but be defensive — this is what makes the keyboard work). */
+    irq_clear_mask(1);
     /* drain any pending byte */
     if (inb(KBD_STATUS) & 1)
         (void)inb(KBD_DATA);
@@ -181,8 +221,24 @@ void keyboard_reset_modifiers(void)
     shift_down = false;
     ctrl_down = false;
     alt_down = false;
+    extended = false;
     shift_age = ctrl_age = alt_age = 0;
     /* Don't reset caps_lock — user may have intentionally toggled it. */
+}
+
+/* Full reset, INCLUDING caps_lock.  Used by callers that finish a long
+ * burst of injected scancodes (e.g. the editor returning from a paste):
+ * during such bursts a stray 0x3A scancode may toggle CapsLock without
+ * the user pressing it, leaving the shell typing in ALL CAPS until you
+ * press Caps again.  This wipes that ghost state. */
+void keyboard_reset_all(void)
+{
+    shift_down = false;
+    ctrl_down = false;
+    alt_down = false;
+    caps_lock = false;
+    extended = false;
+    shift_age = ctrl_age = alt_age = 0;
 }
 
 int keyboard_trygetchar(void)

@@ -27,6 +27,7 @@
 #include "../mm/kheap.h"
 #include "../lib/string.h"
 #include "../lib/printf.h"
+#include "../cpu/syscall.h"
 
 #define MAX_CODE    32768
 #define MAX_DATA    8192
@@ -61,26 +62,38 @@ static int         tok_num;
 static char        tok_str[256];
 static char        tok_ident[64];
 static int         line_num;
+/* Number of errors seen during this compilation.  Used to refuse writing
+ * an ELF when the parser produced garbage (otherwise tcc would emit a
+ * "valid" but corrupt binary that crashes silently on exec). */
+static int         err_count;
+
+/* Read the current source byte as UNSIGNED — `char` may be signed on
+ * gcc i386, and bytes >= 0x80 (e.g. UTF-8 em-dash 0xE2 0x80 0x94 in a
+ * comment) would otherwise compare as negative and bypass every
+ * `c == '...'` check, corrupting the lexer state. */
+static int peek_byte(int off) {
+    return (int)(unsigned char)src[src_pos + off];
+}
 
 static int next_char(void) {
-    char c = src[src_pos];
+    int c = peek_byte(0);
     if (c) { if (c == '\n') line_num++; src_pos++; }
     return c;
 }
 
 static void skip_ws(void) {
-    while (src[src_pos]) {
-        char c = src[src_pos];
+    while (peek_byte(0)) {
+        int c = peek_byte(0);
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { next_char(); continue; }
-        if (c == '/' && src[src_pos+1] == '/') {
-            while (src[src_pos] && src[src_pos] != '\n') src_pos++;
+        if (c == '/' && peek_byte(1) == '/') {
+            while (peek_byte(0) && peek_byte(0) != '\n') src_pos++;
             continue;
         }
-        if (c == '/' && src[src_pos+1] == '*') {
+        if (c == '/' && peek_byte(1) == '*') {
             src_pos += 2;
-            while (src[src_pos] && !(src[src_pos]=='*' && src[src_pos+1]=='/'))
-                { if (src[src_pos]=='\n') line_num++; src_pos++; }
-            if (src[src_pos]) src_pos += 2;
+            while (peek_byte(0) && !(peek_byte(0)=='*' && peek_byte(1)=='/'))
+                { if (peek_byte(0)=='\n') line_num++; src_pos++; }
+            if (peek_byte(0)) src_pos += 2;
             continue;
         }
         break;
@@ -216,6 +229,8 @@ static int next_token(void) {
 static void expect(int tok) {
     if (cur_token != tok) {
         kprintf("tcc:%d: expected token %d, got %d\n", line_num, tok, cur_token);
+        err_count++;
+        err_count++;
     }
     next_token();
 }
@@ -249,10 +264,78 @@ static uint32_t store_string(const char *s) {
  *  Symbol table (local variables on stack)
  * ================================================================ */
 
-typedef struct { char name[32]; int offset; /* ebp-relative */ } local_t;
+/* `elem_size`: byte width when the variable is indexed with [].
+ *   - 4 = declared as `int x` or `int arr[N]` (default)
+ *   - 1 = declared as `char arr[N]`, or used as a parameter that is then
+ *         indexed (we treat parameters as `char *` for indexing purposes).
+ * `is_array`: 1 when the symbol owns the storage (`int arr[N]` / `char arr[N]`).
+ *   - For locals, this means the array sits inline at  ebp+offset.
+ *   - For globals, the array sits inline in .bss at bss_base + bss_off.
+ *   - For a plain `int x` (or a parameter), is_array = 0 and the variable
+ *     itself holds a pointer when used with `[]`. */
+typedef struct {
+    char name[32];
+    int  offset;       /* ebp-relative */
+    int  elem_size;    /* 1 or 4 */
+    int  is_array;     /* 1 if storage is inline at offset, 0 if it's a pointer */
+} local_t;
 static local_t locals[MAX_VARS];
 static int     nlocals;
 static int     stack_offset;  /* next free stack slot */
+
+/* ---- Global variables (.bss) ----
+ * Declared at file scope as `int name;` or `int name[N];` (no initializer).
+ * They live in a zero-initialized BSS region that the ELF loader allocates
+ * right after the .data section.  We track their byte-offsets relative to
+ * the BSS base and patch the absolute addresses into the code at link time,
+ * exactly like we already do for string literals. */
+#define MAX_GLOBALS 128
+typedef struct {
+    char     name[32];
+    uint32_t bss_off;
+    uint32_t size;
+    int      elem_size;   /* 1 (char[]) or 4 (int / int[])      */
+    int      is_array;    /* 1 if storage is inline at bss_off  */
+} global_t;
+static global_t globals[MAX_GLOBALS];
+static int      nglobals;
+static uint32_t bss_size;       /* total bytes reserved in .bss            */
+static uint32_t bss_base_addr;  /* runtime base address of .bss            */
+
+/* Code positions that reference a global by absolute address; patched at
+ * the end of compilation once bss_base_addr is known. */
+typedef struct { uint32_t code_off; uint32_t bss_off; } glob_fixup_t;
+static glob_fixup_t glob_fixups[512];
+static int          nglob_fixups;
+
+static void add_glob_fixup(uint32_t code_off, uint32_t bss_off) {
+    if (nglob_fixups < 512) {
+        glob_fixups[nglob_fixups].code_off = code_off;
+        glob_fixups[nglob_fixups].bss_off  = bss_off;
+        nglob_fixups++;
+    }
+}
+
+static int find_global(const char *name) {
+    for (int i = 0; i < nglobals; i++)
+        if (strcmp(globals[i].name, name) == 0) return i;
+    return -1;
+}
+
+static int add_global(const char *name, uint32_t size,
+                      int elem_size, int is_array) {
+    if (nglobals >= MAX_GLOBALS) return -1;
+    strncpy(globals[nglobals].name, name, 31);
+    globals[nglobals].name[31]  = 0;
+    globals[nglobals].bss_off   = bss_size;
+    globals[nglobals].size      = size;
+    globals[nglobals].elem_size = elem_size;
+    globals[nglobals].is_array  = is_array;
+    bss_size += size;
+    /* 4-byte align next allocation */
+    if (bss_size & 3) bss_size = (bss_size + 3) & ~3u;
+    return nglobals++;
+}
 
 typedef struct { char name[32]; uint32_t code_offset; } func_t;
 static func_t funcs[MAX_FUNCS];
@@ -274,11 +357,19 @@ static int find_local(const char *name) {
     return 0x7FFFFFFF;
 }
 
+static int find_local_idx(const char *name) {
+    for (int i = nlocals-1; i >= 0; i--)
+        if (strcmp(locals[i].name, name) == 0) return i;
+    return -1;
+}
+
 static int add_local(const char *name) {
     stack_offset -= 4;
     if (nlocals < MAX_VARS) {
         strncpy(locals[nlocals].name, name, 31);
-        locals[nlocals].offset = stack_offset;
+        locals[nlocals].offset    = stack_offset;
+        locals[nlocals].elem_size = 4;
+        locals[nlocals].is_array  = 0;
         nlocals++;
     }
     return stack_offset;
@@ -324,7 +415,7 @@ static void loop_patch_continues(uint32_t target) {
 
 static void emit_break(void) {
     if (loop_depth <= 0 || loop_depth > MAX_LOOP_DEPTH) {
-        kprintf("tcc:%d: break outside loop\n", line_num); return;
+        kprintf("tcc:%d: break outside loop\n", line_num); err_count++; return;
     }
     e8(0xE9);  /* jmp rel32 */
     loop_ctx_t *ctx = &loop_stack[loop_depth - 1];
@@ -335,7 +426,7 @@ static void emit_break(void) {
 
 static void emit_continue(void) {
     if (loop_depth <= 0 || loop_depth > MAX_LOOP_DEPTH) {
-        kprintf("tcc:%d: continue outside loop\n", line_num); return;
+        kprintf("tcc:%d: continue outside loop\n", line_num); err_count++; return;
     }
     e8(0xE9);  /* jmp rel32 */
     loop_ctx_t *ctx = &loop_stack[loop_depth - 1];
@@ -350,6 +441,17 @@ static uint32_t data_base_addr;
 /* ================================================================
  *  Built-in function emitter
  * ================================================================ */
+
+/* Helper used at the end of every builtin: push a 0 onto the stack so that
+ * the caller's "discard result" (add esp, 4) doesn't blow away an unrelated
+ * stack slot.  Every value-producing expression in this compiler is expected
+ * to leave its result on the stack, and the caller's `parse_expr; add esp,4`
+ * pops that result.  Builtins that don't compute anything still need to push
+ * a placeholder so the bookkeeping stays balanced — otherwise we silently
+ * drift esp upward on every call and eventually `ret` to garbage. */
+static void e_push0(void) {
+    e8(0x6A); e8(0x00);    /* push byte 0 (sign-extended to 32 bits) */
+}
 
 static int emit_builtin(const char *name, int argc) {
 
@@ -367,10 +469,11 @@ static int emit_builtin(const char *name, int argc) {
         e8(0xEB); e8(0xF7);   /* jmp .loop (back 9 bytes) */
         /* .done: */
         e8(0x59);             /* pop ecx (buf) */
-        e8(0xB8); e32(1);    /* mov eax, 1 (SYS_WRITE) */
+        e8(0xB8); e32(SYS_WRITE);    /* mov eax, SYS_WRITE */
         e8(0xBB); e32(1);    /* mov ebx, 1 */
         /* edx=len, ecx=buf */
         e8(0xCD); e8(0x80);  /* int 0x80 */
+        e_push0();           /* dummy return value */
         return 1;
     }
 
@@ -379,11 +482,20 @@ static int emit_builtin(const char *name, int argc) {
         e8(0x58);             /* pop eax = number */
         /* handle negative */
         e8(0x85); e8(0xC0);  /* test eax, eax */
-        e8(0x79); e8(0x16);  /* jns .positive (skip 22 bytes) */
+        /* The "skip negative path" branch is computed from the actual code
+         * we emit below (counting the bytes is what bites you: the previous
+         * hard-coded 0x16 was the leftover from an even older version, and
+         * it dropped the jump 11 bytes short — straight into the middle of
+         * the next `mov edx, 1` operand. The CPU then executed garbage and
+         * eventually faulted with EIP looking sane.  Patch it after the
+         * fact with the real distance.) */
+        uint32_t pn_jns = cp;
+        e8(0x79); e8(0x00);   /* jns .positive (patched below) */
+        uint32_t pn_neg_start = cp;
         /* print '-' */
         e8(0x50);             /* save eax */
         e8(0x68); e32('-');   /* push '-' as dword */
-        e8(0xB8); e32(1);    /* mov eax, SYS_WRITE */
+        e8(0xB8); e32(SYS_WRITE);    /* mov eax, SYS_WRITE */
         e8(0xBB); e32(1);    /* mov ebx, 1 */
         e8(0x89); e8(0xE1);  /* mov ecx, esp */
         e8(0xBA); e32(1);    /* mov edx, 1 */
@@ -391,39 +503,63 @@ static int emit_builtin(const char *name, int argc) {
         e8(0x83); e8(0xC4); e8(4);  /* add esp, 4 */
         e8(0x58);             /* restore eax */
         e8(0xF7); e8(0xD8);  /* neg eax */
-        /* .positive: */
-        /* Push digits right-to-left onto stack */
+        /* .positive: patch the jns to skip exactly the bytes between
+         * pn_neg_start and here. */
+        {
+            uint32_t skip = cp - pn_neg_start;
+            /* short jump (8-bit signed displacement) — bail if it overflows */
+            code[pn_jns + 1] = (uint8_t)skip;
+        }
+        /* Push digits right-to-left onto stack. All control-flow offsets
+         * below are patched after-the-fact from real positions, instead of
+         * the broken hard-coded short-jump distances the original code
+         * shipped with. */
         e8(0x31); e8(0xC9);  /* xor ecx, ecx (digit count) */
         e8(0xBB); e32(10);   /* mov ebx, 10 */
         /* handle zero specially */
         e8(0x85); e8(0xC0);  /* test eax, eax */
-        e8(0x75); e8(0x0B);  /* jnz .div_loop */
+        uint32_t pn_jnz_to_div = cp;
+        e8(0x75); e8(0x00);  /* jnz .div_loop (patched) */
+
         /* number is 0: push '0' */
         e8(0x68); e32('0');  /* push '0' */
         e8(0x41);             /* inc ecx */
-        e8(0xEB); e8(0x12);  /* jmp .print */
+        uint32_t pn_jmp_to_print = cp;
+        e8(0xEB); e8(0x00);  /* jmp .print (patched) */
+
         /* .div_loop: */
+        uint32_t pn_div_loop = cp;
+        code[pn_jnz_to_div + 1] = (uint8_t)(pn_div_loop - (pn_jnz_to_div + 2));
         e8(0x31); e8(0xD2);  /* xor edx, edx */
         e8(0xF7); e8(0xF3);  /* div ebx */
         e8(0x83); e8(0xC2); e8(0x30);  /* add edx, '0' */
         e8(0x52);             /* push edx */
         e8(0x41);             /* inc ecx */
         e8(0x85); e8(0xC0);  /* test eax, eax */
-        e8(0x75); e8(0xF3);  /* jnz .div_loop */
-        /* .print: ecx=digit count, digits on stack */
+        e8(0x75); e8((uint8_t)(pn_div_loop - (cp + 1)));  /* jnz .div_loop (back) */
+
+        /* .print: */
+        uint32_t pn_print = cp;
+        code[pn_jmp_to_print + 1] = (uint8_t)(pn_print - (pn_jmp_to_print + 2));
         e8(0x89); e8(0xCE);  /* mov esi, ecx (save count) */
+
         /* .print_loop: */
+        uint32_t pn_print_loop = cp;
         e8(0x85); e8(0xF6);  /* test esi, esi */
-        e8(0x74); e8(0x19);  /* jz .print_done (skip 25) */
-        e8(0xB8); e32(1);    /* mov eax, SYS_WRITE */
+        uint32_t pn_jz_to_done = cp;
+        e8(0x74); e8(0x00);  /* jz .print_done (patched) */
+        e8(0xB8); e32(SYS_WRITE);    /* mov eax, SYS_WRITE */
         e8(0xBB); e32(1);    /* mov ebx, 1 */
         e8(0x89); e8(0xE1);  /* mov ecx, esp */
         e8(0xBA); e32(1);    /* mov edx, 1 */
         e8(0xCD); e8(0x80);  /* int 0x80 */
         e8(0x83); e8(0xC4); e8(4);  /* add esp, 4 */
         e8(0x4E);             /* dec esi */
-        e8(0xEB); e8(0xE3);  /* jmp .print_loop (back 29) */
+        e8(0xEB); e8((uint8_t)(pn_print_loop - (cp + 1)));  /* jmp .print_loop */
+
         /* .print_done: */
+        code[pn_jz_to_done + 1] = (uint8_t)(cp - (pn_jz_to_done + 2));
+        e_push0();
         return 1;
     }
 
@@ -431,19 +567,20 @@ static int emit_builtin(const char *name, int argc) {
     if (strcmp(name, "print_char") == 0 && argc == 1) {
         e8(0x58);             /* pop eax */
         e8(0x50);             /* push eax */
-        e8(0xB8); e32(1);    /* mov eax, SYS_WRITE */
+        e8(0xB8); e32(SYS_WRITE);    /* mov eax, SYS_WRITE */
         e8(0xBB); e32(1);    /* mov ebx, 1 */
         e8(0x89); e8(0xE1);  /* mov ecx, esp */
         e8(0xBA); e32(1);    /* mov edx, 1 */
         e8(0xCD); e8(0x80);
         e8(0x83); e8(0xC4); e8(4);
+        e_push0();
         return 1;
     }
 
     /* ---- getchar() ---- */
     if (strcmp(name, "getchar") == 0) {
         e8(0xFB);             /* sti */
-        e8(0xB8); e32(5);    /* mov eax, SYS_GETC */
+        e8(0xB8); e32(SYS_GETC);    /* mov eax, SYS_GETC */
         e8(0xCD); e8(0x80);
         e8(0x50);             /* push eax */
         return 1;
@@ -459,7 +596,7 @@ static int emit_builtin(const char *name, int argc) {
         /* .loop: (all jumps use rel32 to avoid reach issues) */
         uint32_t gl_loop = cp;
         e8(0xFB);             /* sti */
-        e8(0xB8); e32(5);    /* mov eax, SYS_GETC */
+        e8(0xB8); e32(SYS_GETC);    /* mov eax, SYS_GETC */
         e8(0xCD); e8(0x80);  /* int 0x80 → char in al */
         e8(0x3C); e8(0x0A);  /* cmp al, 0x0A (newline) */
         e8(0x0F); e8(0x84); uint32_t gl_done = cp; e32(0);  /* je .done */
@@ -475,7 +612,7 @@ static int emit_builtin(const char *name, int argc) {
         e8(0x52);             /* push edx (save max) */
         e8(0x57);             /* push edi (save buf) */
         e8(0x56);             /* push esi (char for write) */
-        e8(0xB8); e32(1);    /* mov eax, SYS_WRITE */
+        e8(0xB8); e32(SYS_WRITE);    /* mov eax, SYS_WRITE */
         e8(0xBB); e32(1);    /* mov ebx, 1 */
         e8(0x89); e8(0xE1);  /* mov ecx, esp */
         e8(0xBA); e32(1);    /* mov edx, 1 */
@@ -498,17 +635,17 @@ static int emit_builtin(const char *name, int argc) {
         e8(0x51); e8(0x52); e8(0x57);  /* push ecx,edx,edi */
         /* backspace */
         e8(0x68); e32(0x08);  /* push 8 */
-        e8(0xB8); e32(1); e8(0xBB); e32(1);
+        e8(0xB8); e32(SYS_WRITE); e8(0xBB); e32(1);
         e8(0x89); e8(0xE1); e8(0xBA); e32(1);
         e8(0xCD); e8(0x80);
         /* space */
         e8(0xC7); e8(0x04); e8(0x24); e32(0x20);
-        e8(0xB8); e32(1); e8(0xBB); e32(1);
+        e8(0xB8); e32(SYS_WRITE); e8(0xBB); e32(1);
         e8(0x89); e8(0xE1); e8(0xBA); e32(1);
         e8(0xCD); e8(0x80);
         /* backspace again */
         e8(0xC7); e8(0x04); e8(0x24); e32(0x08);
-        e8(0xB8); e32(1); e8(0xBB); e32(1);
+        e8(0xB8); e32(SYS_WRITE); e8(0xBB); e32(1);
         e8(0x89); e8(0xE1); e8(0xBA); e32(1);
         e8(0xCD); e8(0x80);
         e8(0x83); e8(0xC4); e8(4);  /* pop char */
@@ -518,7 +655,7 @@ static int emit_builtin(const char *name, int argc) {
         patch32(gl_done, cp - gl_done - 4);
         /* echo newline */
         e8(0x68); e32(0x0A);  /* push '\n' */
-        e8(0xB8); e32(1); e8(0xBB); e32(1);
+        e8(0xB8); e32(SYS_WRITE); e8(0xBB); e32(1);
         e8(0x89); e8(0xE1); e8(0xBA); e32(1);
         e8(0xCD); e8(0x80);
         e8(0x83); e8(0xC4); e8(4);
@@ -531,14 +668,15 @@ static int emit_builtin(const char *name, int argc) {
     /* ---- sleep(ms) ---- */
     if (strcmp(name, "sleep") == 0 && argc == 1) {
         e8(0x5B);             /* pop ebx = ms */
-        e8(0xB8); e32(4);    /* mov eax, SYS_SLEEP */
+        e8(0xB8); e32(SYS_SLEEP);    /* mov eax, SYS_SLEEP */
         e8(0xCD); e8(0x80);
+        e_push0();
         return 1;
     }
 
     /* ---- uptime() ---- */
     if (strcmp(name, "uptime") == 0) {
-        e8(0xB8); e32(7);    /* mov eax, SYS_UPTIME */
+        e8(0xB8); e32(SYS_UPTIME);    /* mov eax, SYS_UPTIME */
         e8(0xCD); e8(0x80);
         e8(0x50);             /* push result */
         return 1;
@@ -693,6 +831,7 @@ static int emit_builtin(const char *name, int argc) {
         e8(0x83); e8(0xC1); e8(2);
         e8(0x4A);
         e8(0x75); e8(0xF7);  /* jnz .loop (back 9) */
+        e_push0();
         return 1;
     }
 
@@ -707,6 +846,39 @@ static int emit_builtin(const char *name, int argc) {
         e8(0xD1); e8(0xE1);          /* shl ecx, 1 */
         e8(0x88); e8(0x99); e32(0xB8000);  /* mov [0xB8000+ecx], bl */
         e8(0x88); e8(0x81); e32(0xB8001);  /* mov [0xB8001+ecx], al */
+        e_push0();
+        return 1;
+    }
+
+    /* ---- read_file(path, buf, max) -> bytes (or -1 on error) ---- */
+    if (strcmp(name, "read_file") == 0 && argc == 3) {
+        e8(0x5A);                            /* pop edx = max     */
+        e8(0x59);                            /* pop ecx = buf     */
+        e8(0x5B);                            /* pop ebx = path    */
+        e8(0xB8); e32(SYS_READFILE);         /* mov eax, 8        */
+        e8(0xCD); e8(0x80);                  /* int 0x80          */
+        e8(0x50);                            /* push eax (result) */
+        return 1;
+    }
+
+    /* ---- write_file(path, buf, len) -> bytes (or -1 on error) ---- */
+    if (strcmp(name, "write_file") == 0 && argc == 3) {
+        e8(0x5A);                            /* pop edx = len     */
+        e8(0x59);                            /* pop ecx = buf     */
+        e8(0x5B);                            /* pop ebx = path    */
+        e8(0xB8); e32(SYS_WRITEFILE);        /* mov eax, 9        */
+        e8(0xCD); e8(0x80);                  /* int 0x80          */
+        e8(0x50);
+        return 1;
+    }
+
+    /* ---- read_line(buf, max) -> length ---- */
+    if (strcmp(name, "read_line") == 0 && argc == 2) {
+        e8(0x59);                            /* pop ecx = max     */
+        e8(0x5B);                            /* pop ebx = buf     */
+        e8(0xB8); e32(SYS_GETLINE);          /* mov eax, 10       */
+        e8(0xCD); e8(0x80);
+        e8(0x50);
         return 1;
     }
 
@@ -730,6 +902,7 @@ static int emit_builtin(const char *name, int argc) {
         e8(0x83); e8(0xC1); e8(2);
         e8(0xEB); e8(0xEF);  /* jmp .loop (back 17) */
         /* .done: */
+        e_push0();
         return 1;
     }
 
@@ -794,10 +967,16 @@ static void parse_primary(void) {
             next_token();
             parse_expr();
             int off = find_local(name);
-            if (off == 0x7FFFFFFF) off = add_local(name);
+            int gi  = (off == 0x7FFFFFFF) ? find_global(name) : -1;
+            if (off == 0x7FFFFFFF && gi < 0) off = add_local(name);
             e8(0x58);  /* pop eax */
-            e8(0x89); e8(0x85); e32((uint32_t)off);
-            e8(0x50);  /* push eax */
+            if (gi >= 0) {
+                /* mov [abs32], eax  → store to global */
+                e8(0xA3); add_glob_fixup(cp, globals[gi].bss_off); e32(0);
+            } else {
+                e8(0x89); e8(0x85); e32((uint32_t)off);
+            }
+            e8(0x50);  /* push eax (assignment returns the value) */
         } else if (cur_token == T_PLUS_EQ || cur_token == T_MINUS_EQ ||
                    cur_token == T_STAR_EQ || cur_token == T_SLASH_EQ ||
                    cur_token == T_PERCENT_EQ) {
@@ -805,71 +984,158 @@ static void parse_primary(void) {
             int op = cur_token;
             next_token();
             int off = find_local(name);
-            if (off == 0x7FFFFFFF) {
+            int gi  = (off == 0x7FFFFFFF) ? find_global(name) : -1;
+            if (off == 0x7FFFFFFF && gi < 0) {
                 kprintf("tcc:%d: undefined variable '%s'\n", line_num, name);
+                err_count++;
                 parse_expr();
                 e8(0x83); e8(0xC4); e8(4);
                 e8(0x68); e32(0);
                 return;
             }
             /* load current value */
-            e8(0x8B); e8(0x85); e32((uint32_t)off);  /* mov eax, [ebp+off] */
+            if (gi >= 0) {
+                e8(0xA1); add_glob_fixup(cp, globals[gi].bss_off); e32(0); /* mov eax, [abs] */
+            } else {
+                e8(0x8B); e8(0x85); e32((uint32_t)off);
+            }
             e8(0x50);  /* push eax */
             parse_expr();
             /* apply operator */
             e8(0x5B);  /* pop ebx = new expr */
             e8(0x58);  /* pop eax = old value */
-            if (op == T_PLUS_EQ)    { e8(0x01); e8(0xD8); }  /* add eax, ebx */
-            if (op == T_MINUS_EQ)   { e8(0x29); e8(0xD8); }  /* sub eax, ebx */
-            if (op == T_STAR_EQ)    { e8(0x0F); e8(0xAF); e8(0xC3); }  /* imul eax, ebx */
-            if (op == T_SLASH_EQ)   { e8(0x99); e8(0xF7); e8(0xFB); }  /* cdq; idiv ebx */
+            if (op == T_PLUS_EQ)    { e8(0x01); e8(0xD8); }
+            if (op == T_MINUS_EQ)   { e8(0x29); e8(0xD8); }
+            if (op == T_STAR_EQ)    { e8(0x0F); e8(0xAF); e8(0xC3); }
+            if (op == T_SLASH_EQ)   { e8(0x99); e8(0xF7); e8(0xFB); }
             if (op == T_PERCENT_EQ) { e8(0x99); e8(0xF7); e8(0xFB); e8(0x89); e8(0xD0); }
             /* store and push result */
-            e8(0x89); e8(0x85); e32((uint32_t)off);  /* mov [ebp+off], eax */
-            e8(0x50);  /* push eax */
+            if (gi >= 0) {
+                e8(0xA3); add_glob_fixup(cp, globals[gi].bss_off); e32(0);
+            } else {
+                e8(0x89); e8(0x85); e32((uint32_t)off);
+            }
+            e8(0x50);
         } else if (cur_token == T_PLUS_PLUS || cur_token == T_MINUS_MINUS) {
             /* Postfix ++ / -- */
             int op = cur_token;
             next_token();
             int off = find_local(name);
-            if (off == 0x7FFFFFFF) {
+            int gi  = (off == 0x7FFFFFFF) ? find_global(name) : -1;
+            if (off == 0x7FFFFFFF && gi < 0) {
                 kprintf("tcc:%d: undefined variable '%s'\n", line_num, name);
+                err_count++;
                 e8(0x68); e32(0);
                 return;
             }
             /* push old value */
-            e8(0x8B); e8(0x85); e32((uint32_t)off);  /* mov eax, [ebp+off] */
-            e8(0x50);  /* push eax (old value for expression result) */
-            /* increment/decrement in memory */
-            if (op == T_PLUS_PLUS) {
-                e8(0xFF); e8(0x85); e32((uint32_t)off);  /* inc dword [ebp+off] */
+            if (gi >= 0) {
+                e8(0xA1); add_glob_fixup(cp, globals[gi].bss_off); e32(0);
             } else {
-                e8(0xFF); e8(0x8D); e32((uint32_t)off);  /* dec dword [ebp+off] */
+                e8(0x8B); e8(0x85); e32((uint32_t)off);
+            }
+            e8(0x50);  /* push eax */
+            /* mutate in memory */
+            if (gi >= 0) {
+                /* inc/dec dword [abs32] */
+                if (op == T_PLUS_PLUS) { e8(0xFF); e8(0x05); }
+                else                   { e8(0xFF); e8(0x0D); }
+                add_glob_fixup(cp, globals[gi].bss_off); e32(0);
+            } else {
+                if (op == T_PLUS_PLUS) { e8(0xFF); e8(0x85); e32((uint32_t)off); }
+                else                   { e8(0xFF); e8(0x8D); e32((uint32_t)off); }
             }
         } else {
             /* Variable read (might be array indexing) */
             int off = find_local(name);
-            if (off == 0x7FFFFFFF) {
+            int gi  = (off == 0x7FFFFFFF) ? find_global(name) : -1;
+            if (off == 0x7FFFFFFF && gi < 0) {
                 kprintf("tcc:%d: undefined variable '%s'\n", line_num, name);
+                err_count++;
                 e8(0x68); e32(0);
                 return;
             }
             if (cur_token == T_LBRACK) {
-                /* Array indexing: name[expr] */
+                /* Array indexing: name[expr]  — both read and write.
+                 *
+                 * Determine element size:
+                 *   - global array  -> globals[gi].elem_size  (1 or 4)
+                 *   - local  array  -> locals[li].elem_size
+                 *   - bare int      -> treat as pointer to int (size 4)
+                 *   - char* / param -> treat as pointer to char (size 1) */
+                int li = (gi >= 0) ? -1 : find_local_idx(name);
+                int elem_size;
+                int is_inline;     /* 1 = storage is inline (array), 0 = pointer */
+                if (gi >= 0) {
+                    elem_size = globals[gi].elem_size;
+                    is_inline = globals[gi].is_array;
+                } else if (li >= 0) {
+                    elem_size = locals[li].elem_size;
+                    is_inline = locals[li].is_array;
+                } else {
+                    elem_size = 4;
+                    is_inline = 0;
+                }
+
                 next_token();
                 parse_expr();
                 expect(T_RBRACK);
-                /* eax = index (on stack). Compute addr = ebp + off + index*4 */
-                e8(0x58);  /* pop eax = index */
-                e8(0xC1); e8(0xE0); e8(2);  /* shl eax, 2 */
-                e8(0x89); e8(0xEA);  /* mov edx, ebp */
-                e8(0x81); e8(0xC2); e32((uint32_t)off);  /* add edx, off (=arr base) */
-                e8(0x01); e8(0xC2);  /* add edx, eax */
-                e8(0x8B); e8(0x02);  /* mov eax, [edx] */
-                e8(0x50);  /* push eax */
+                /* Index is on the stack.  Build address in edx, then either
+                 * load (read) or pop a value and store (write). */
+                e8(0x58);              /* pop eax = index */
+                if (elem_size == 4) {
+                    e8(0xC1); e8(0xE0); e8(2);  /* shl eax, 2 */
+                }
+                /* eax = byte offset within the array */
+
+                if (is_inline) {
+                    /* The symbol owns the storage. edx = base address. */
+                    if (gi >= 0) {
+                        e8(0xBA); add_glob_fixup(cp, globals[gi].bss_off); e32(0);
+                    } else {
+                        e8(0x89); e8(0xEA);                              /* mov edx, ebp */
+                        e8(0x81); e8(0xC2); e32((uint32_t)off);          /* add edx, off */
+                    }
+                } else {
+                    /* The symbol HOLDS a pointer. Load it into edx. */
+                    if (gi >= 0) {
+                        e8(0x8B); e8(0x15); add_glob_fixup(cp, globals[gi].bss_off); e32(0);
+                    } else {
+                        e8(0x8B); e8(0x95); e32((uint32_t)off);          /* mov edx, [ebp+off] */
+                    }
+                }
+                e8(0x01); e8(0xC2);    /* add edx, eax  ->  &arr[i] */
+
+                if (cur_token == T_ASSIGN) {
+                    /* Array store: arr[i] = expr */
+                    e8(0x52);          /* push edx */
+                    next_token();
+                    parse_expr();
+                    e8(0x58);          /* pop eax = value */
+                    e8(0x5A);          /* pop edx = &arr[i] */
+                    if (elem_size == 1) {
+                        e8(0x88); e8(0x02);     /* mov [edx], al  (byte) */
+                    } else {
+                        e8(0x89); e8(0x02);     /* mov [edx], eax */
+                    }
+                    e8(0x50);          /* push eax (assignment returns value) */
+                } else {
+                    /* Array load */
+                    if (elem_size == 1) {
+                        e8(0x31); e8(0xC0);             /* xor eax, eax (zero-extend) */
+                        e8(0x8A); e8(0x02);             /* mov al, [edx] */
+                    } else {
+                        e8(0x8B); e8(0x02);             /* mov eax, [edx] */
+                    }
+                    e8(0x50);                            /* push eax */
+                }
             } else {
                 /* Simple variable read */
-                e8(0x8B); e8(0x85); e32((uint32_t)off);
+                if (gi >= 0) {
+                    e8(0xA1); add_glob_fixup(cp, globals[gi].bss_off); e32(0);
+                } else {
+                    e8(0x8B); e8(0x85); e32((uint32_t)off);
+                }
                 e8(0x50);
             }
         }
@@ -879,6 +1145,7 @@ static void parse_primary(void) {
         expect(T_RPAREN);
     } else {
         kprintf("tcc:%d: unexpected token %d\n", line_num, cur_token);
+        err_count++;
         next_token();
         e8(0x68); e32(0);
     }
@@ -907,16 +1174,24 @@ static void parse_unary(void) {
             strncpy(name, tok_ident, 63);
             next_token();
             int off = find_local(name);
-            if (off == 0x7FFFFFFF) {
+            int gi  = (off == 0x7FFFFFFF) ? find_global(name) : -1;
+            if (off == 0x7FFFFFFF && gi < 0) {
                 kprintf("tcc:%d: undefined variable '%s'\n", line_num, name);
+                err_count++;
                 e8(0x68); e32(0);
                 return;
             }
-            /* push ebp + offset */
-            e8(0x8D); e8(0x85); e32((uint32_t)off);  /* lea eax, [ebp+off] */
+            if (gi >= 0) {
+                /* mov eax, imm32 (bss_base + bss_off) */
+                e8(0xB8); add_glob_fixup(cp, globals[gi].bss_off); e32(0);
+            } else {
+                /* lea eax, [ebp+off]  → address of local */
+                e8(0x8D); e8(0x85); e32((uint32_t)off);
+            }
             e8(0x50);
         } else {
             kprintf("tcc:%d: & requires a variable name\n", line_num);
+            err_count++;
             parse_primary();
         }
     } else if (cur_token == T_STAR) {
@@ -936,6 +1211,7 @@ static void parse_unary(void) {
             int off = find_local(name);
             if (off == 0x7FFFFFFF) {
                 kprintf("tcc:%d: undefined variable '%s'\n", line_num, name);
+                err_count++;
                 e8(0x68); e32(0);
                 return;
             }
@@ -955,6 +1231,7 @@ static void parse_unary(void) {
             int off = find_local(name);
             if (off == 0x7FFFFFFF) {
                 kprintf("tcc:%d: undefined variable '%s'\n", line_num, name);
+                err_count++;
                 e8(0x68); e32(0);
                 return;
             }
@@ -1186,9 +1463,10 @@ static void parse_statement(void) {
         if (cur_token == T_SEMI) next_token();
 
     } else if (cur_token == T_INT || cur_token == T_CHAR) {
-        /* Variable declaration(s): int x; int x = expr; int x, y, z; */
-        int is_char = (cur_token == T_CHAR);
-        (void)is_char;
+        /* Variable declaration(s): int x; int x = expr; int x, y, z;
+         *                          char buf[N];  (byte array on stack)
+         *                          int  arr[N];  (4-byte array on stack) */
+        int decl_elem = (cur_token == T_CHAR) ? 1 : 4;
         next_token();
 
         for (;;) {
@@ -1197,22 +1475,27 @@ static void parse_statement(void) {
             next_token();  /* consume identifier */
 
             if (cur_token == T_LBRACK) {
-                /* Array: int arr[N]; */
+                /* Array: T arr[N]; */
                 next_token();
                 int size = tok_num;
                 next_token();
                 expect(T_RBRACK);
+                int bytes = size * decl_elem;
+                /* round up to 4-byte stack alignment */
+                if (bytes & 3) bytes = (bytes + 3) & ~3;
                 int off = find_local(vname);
                 if (off == 0x7FFFFFFF) {
-                    stack_offset -= size * 4;
+                    stack_offset -= bytes;
                     off = stack_offset;
                     if (nlocals < MAX_VARS) {
                         strncpy(locals[nlocals].name, vname, 31);
-                        locals[nlocals].offset = off;
+                        locals[nlocals].offset    = off;
+                        locals[nlocals].elem_size = decl_elem;
+                        locals[nlocals].is_array  = 1;
                         nlocals++;
                     }
                 }
-                e8(0x83); e8(0xEC); e8((uint8_t)(size * 4));
+                e8(0x83); e8(0xEC); e8((uint8_t)bytes);
             } else if (cur_token == T_ASSIGN) {
                 next_token();
                 parse_expr();
@@ -1305,9 +1588,11 @@ int tcc_compile(const char *src_path, const char *out_path)
     src = text;
     src_pos = 0;
     line_num = 1;
+    err_count = 0;
     cp = 0; dp = 0;
     nlocals = 0; stack_offset = 0;
     nfuncs = 0; ncall_fixups = 0; nstr_fixups = 0;
+    nglobals = 0; bss_size = 0; nglob_fixups = 0;
     loop_depth = 0;
     memset(code, 0, sizeof(code));
     memset(data_sec, 0, sizeof(data_sec));
@@ -1315,23 +1600,111 @@ int tcc_compile(const char *src_path, const char *out_path)
     hdr_size = 52 + 32;
 
     uint32_t call_main_pos;
-    e8(0xE8); call_main_pos = cp; e32(0);  /* call main */
-    e8(0xC3);  /* ret */
+    e8(0xE8); call_main_pos = cp; e32(0);  /* call main                       */
+    /* After main() returns, do exit(eax) instead of `ret`.  The user stack
+     * doesn't have a sensible return address on top, so plain `ret` jumps
+     * into garbage and faults.  Calling SYS_EXIT terminates the process
+     * cleanly with main's return value as the exit code. */
+    e8(0x89); e8(0xC3);                /* mov ebx, eax  (exit code = main's ret) */
+    e8(0xB8); e32(SYS_EXIT);           /* mov eax, 1                          */
+    e8(0xCD); e8(0x80);                /* int 0x80    -> never returns        */
+    e8(0xC3);                          /* ret (unreachable, kept as a safety) */
 
     next_token();
     while (cur_token != T_EOF) {
         if (cur_token == T_INT || cur_token == T_CHAR || cur_token == T_VOID) {
+            int type_tok = cur_token;     /* remember T_INT / T_CHAR / T_VOID */
             next_token();
-            if (cur_token == T_IDENT) {
+            if (cur_token != T_IDENT) {
+                kprintf("tcc:%d: expected identifier after type\n", line_num);
+                err_count++;
+                next_token();
+                continue;
+            }
+            /* Snapshot identifier, peek the next token: '(' = function,
+             * anything else = global variable / array. */
+            char gname[64];
+            strncpy(gname, tok_ident, 63);
+            gname[63] = 0;
+
+            /* Save lexer position to be able to "rewind" if it turns out
+             * this is a function definition (we need to leave tok_ident
+             * on the function name for parse_function()). */
+            int save_pos    = src_pos;
+            int save_line   = line_num;
+            int save_tok    = cur_token;
+            int save_num    = tok_num;
+            char save_id[64];
+            strncpy(save_id, tok_ident, 63); save_id[63] = 0;
+
+            next_token();   /* peek past the identifier */
+            if (cur_token == T_LPAREN) {
+                /* It's a function — rewind so parse_function sees the name. */
+                src_pos   = save_pos;
+                line_num  = save_line;
+                cur_token = save_tok;
+                tok_num   = save_num;
+                strncpy(tok_ident, save_id, 63);
                 parse_function();
+            } else {
+                /* Global variable / array.  Syntax we accept:
+                 *     int  x ;
+                 *     int  x , y , z ;
+                 *     int  arr [ NUM ] ;            (no initializer)
+                 *     char buf [ NUM ] ;            (byte array)
+                 * No initializer is supported — the BSS region starts
+                 * zero-filled, so assign values inside main() if needed.
+                 *
+                 * `type_tok` is the original type keyword; char[] = byte
+                 * array, int[] (and the default) = 4-byte array. */
+                int gelem = (type_tok == T_CHAR) ? 1 : 4;
+                for (;;) {
+                    if (cur_token == T_LBRACK) {
+                        next_token();
+                        int n = tok_num;
+                        next_token();
+                        expect(T_RBRACK);
+                        if (n <= 0) n = 1;
+                        if (find_global(gname) < 0)
+                            add_global(gname, (uint32_t)n * (uint32_t)gelem,
+                                       gelem, 1);
+                    } else {
+                        if (find_global(gname) < 0)
+                            add_global(gname, 4, 4, 0);
+                    }
+                    if (cur_token == T_COMMA) {
+                        next_token();
+                        if (cur_token != T_IDENT) {
+                            kprintf("tcc:%d: expected identifier\n", line_num);
+                            err_count++;
+                            break;
+                        }
+                        strncpy(gname, tok_ident, 63); gname[63] = 0;
+                        next_token();
+                        continue;
+                    }
+                    break;
+                }
+                if (cur_token == T_SEMI) next_token();
             }
         } else {
-            kprintf("tcc:%d: expected function definition\n", line_num);
+            kprintf("tcc:%d: expected function or global declaration\n", line_num);
+            err_count++;
             next_token();
         }
     }
 
     kfree(text);
+
+    /* Refuse to emit garbage: if the parser saw any error, the generated
+     * code stream is almost certainly malformed (jumps to nowhere, bad
+     * stack discipline...).  Writing the ELF anyway gave the user a
+     * "successful" file that crashed silently on exec.  Bail out cleanly
+     * so they can fix the source first. */
+    if (err_count > 0) {
+        kprintf("tcc: %d error(s); aborting (no output written).\n", err_count);
+        return -1;
+    }
 
     /* Fix call to main */
     int main_idx = -1;
@@ -1339,6 +1712,7 @@ int tcc_compile(const char *src_path, const char *out_path)
         if (strcmp(funcs[i].name, "main") == 0) { main_idx = i; break; }
     if (main_idx < 0) {
         kprintf("tcc: error: no main() function found\n");
+        err_count++;
         return -1;
     }
     patch32(call_main_pos, funcs[main_idx].code_offset - call_main_pos - 4);
@@ -1350,6 +1724,7 @@ int tcc_compile(const char *src_path, const char *out_path)
             if (strcmp(funcs[j].name, call_fixups[i].name) == 0) { fi = j; break; }
         if (fi < 0) {
             kprintf("tcc: undefined function '%s'\n", call_fixups[i].name);
+            err_count++;
             continue;
         }
         patch32(call_fixups[i].code_off,
@@ -1361,8 +1736,16 @@ int tcc_compile(const char *src_path, const char *out_path)
     for (int i = 0; i < nstr_fixups; i++)
         patch32(str_fixups[i].code_off, data_base_addr + str_fixups[i].data_off);
 
+    /* Place BSS right after .data in the runtime address space.  It is NOT
+     * stored in the file — the ELF loader zero-fills the gap between
+     * filesz and memsz, which is exactly what we want. */
+    bss_base_addr = data_base_addr + dp;
+    for (int i = 0; i < nglob_fixups; i++)
+        patch32(glob_fixups[i].code_off, bss_base_addr + glob_fixups[i].bss_off);
+
     /* Build ELF */
-    uint32_t total = hdr_size + cp + dp;
+    uint32_t total = hdr_size + cp + dp;       /* on-disk size */
+    uint32_t memsz = total + bss_size;         /* in-memory size (incl. BSS) */
     uint8_t *elf = (uint8_t *)kmalloc(total + 16);
     if (!elf) { kprintf("tcc: out of memory for ELF\n"); return -1; }
     memset(elf, 0, total);
@@ -1382,8 +1765,8 @@ int tcc_compile(const char *src_path, const char *out_path)
     *(uint32_t*)(ph+0)  = 1;
     *(uint32_t*)(ph+8)  = BASE_ADDR;
     *(uint32_t*)(ph+12) = BASE_ADDR;
-    *(uint32_t*)(ph+16) = total;
-    *(uint32_t*)(ph+20) = total;
+    *(uint32_t*)(ph+16) = total;          /* p_filesz: bytes in the file */
+    *(uint32_t*)(ph+20) = memsz;          /* p_memsz : bytes at runtime (BSS gets zero-filled) */
     *(uint32_t*)(ph+24) = 7;
     *(uint32_t*)(ph+28) = 0x1000;
 
@@ -1397,7 +1780,7 @@ int tcc_compile(const char *src_path, const char *out_path)
     vfs_write(out, 0, total, elf);
     kfree(elf);
 
-    kprintf("tcc: compiled %u bytes code + %u bytes data -> %s (%u bytes)\n",
-            cp, dp, out_path, total);
+    kprintf("tcc: compiled %u bytes code + %u bytes data + %u bytes bss -> %s (%u file, %u mem)\n",
+            cp, dp, bss_size, out_path, total, memsz);
     return 0;
 }

@@ -12,6 +12,9 @@
 #define SYS_SLEEP   5   /* ebx = milliseconds                                */
 #define SYS_GETC    6   /* blocking read of one key -> char                  */
 #define SYS_UPTIME  7   /* -> seconds since boot                             */
+#define SYS_READFILE  8 /* ebx = path, ecx = buf, edx = maxlen -> bytes (-1) */
+#define SYS_WRITEFILE 9 /* ebx = path, ecx = buf, edx = len    -> bytes (-1) */
+#define SYS_GETLINE  10 /* ebx = buf,  ecx = max               -> length     */
 
 /* Install the int 0x80 gate (DPL 3 so ring-3 code may invoke it). */
 void syscall_install(void);

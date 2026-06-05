@@ -35,7 +35,8 @@ C_SOURCES := $(wildcard boot/*.c kernel/*.c drivers/*.c cpu/*.c mm/*.c \
                         user/*.c)
 ASM_SOURCES := boot/boot.asm boot/kernel_entry.asm boot/gdt_flush.asm \
                cpu/idt_flush.asm cpu/isr_asm.asm cpu/irq_asm.asm \
-               cpu/syscall_asm.asm process/switch.asm process/thread_exit.asm
+               cpu/syscall_asm.asm cpu/elf_jmp.asm \
+               process/switch.asm process/thread_exit.asm
 
 OBJS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.asm=.o)
 

@@ -26,6 +26,9 @@
 #include "hello_elf.h"
 #include "vgademo_elf.h"
 #include "snake_elf.h"
+#include "tce_src.h"
+#include "mini_test_src.h"
+#include "slow_src.h"
 
 /* Install built-in ELF binaries into /bin if they don't already exist.
  * Called AFTER diskfs_load() so they survive regardless of disk state. */
@@ -56,6 +59,35 @@ static void install_builtin_apps(void)
         if (f) {
             f->permissions = 0755;
             vfs_write(f, 0, apps[i].size, (uint8_t *)apps[i].data);
+        }
+    }
+
+    /* Drop the bundled source of `tce.c` into /root so the user can do:
+     *     cd /root && tcc tce.c && exec tce
+     * straight after boot.  Only created the first time (do nothing if
+     * the user has already saved their own version to disk). */
+    vfs_node_t *root_home = vfs_resolve("/root", vfs_get_root());
+    if (!root_home)
+        root_home = vfs_mkdir("/root", vfs_get_root());
+    if (root_home && !vfs_finddir(root_home, "tce.c")) {
+        vfs_node_t *src = vfs_create("/root/tce.c", vfs_get_root());
+        if (src) {
+            src->permissions = 0644;
+            vfs_write(src, 0, tce_src_size, (uint8_t *)tce_src);
+        }
+    }
+    if (root_home && !vfs_finddir(root_home, "mini_test.c")) {
+        vfs_node_t *src = vfs_create("/root/mini_test.c", vfs_get_root());
+        if (src) {
+            src->permissions = 0644;
+            vfs_write(src, 0, mini_test_src_size, (uint8_t *)mini_test_src);
+        }
+    }
+    if (root_home && !vfs_finddir(root_home, "slow.c")) {
+        vfs_node_t *src = vfs_create("/root/slow.c", vfs_get_root());
+        if (src) {
+            src->permissions = 0644;
+            vfs_write(src, 0, slow_src_size, (uint8_t *)slow_src);
         }
     }
 }
@@ -141,6 +173,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     /* Devices */
     timer_init(100);         ok("PIT timer @ 100 Hz");
     keyboard_init();         ok("PS/2 keyboard (US QWERTY)");
+    serial_enable_input();   ok("COM1 serial input (paste-friendly, 115200 8N1)");
 
     /* Filesystem */
     vfs_init();
@@ -185,8 +218,12 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     users_init();            ok("User accounts (/etc/passwd, /etc/shadow)");
 
     /* Processes */
-    process_init();
-    scheduler_init();        ok("Process table + scheduler");
+    /* Order matters: scheduler_init() resets the run queue, and
+     * process_init() registers the idle task with scheduler_add().
+     * If we call process_init first the registration is wiped out
+     * by the subsequent scheduler_init(). */
+    scheduler_init();
+    process_init();          ok("Process table + scheduler");
 
     /* Enable interrupts and launch the shell. */
     __asm__ volatile("sti");

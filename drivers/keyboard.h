@@ -30,5 +30,11 @@ int  keyboard_getchar(void);                       /* blocking; returns key */
 int  keyboard_trygetchar(void);                    /* non-blocking; -1 if none */
 int  keyboard_readline(char *buffer, int max_len); /* returns length */
 void keyboard_reset_modifiers(void);               /* force-reset shift/ctrl/alt */
+void keyboard_reset_all(void);                     /* also clears caps_lock */
+
+/* Inject one fully-decoded key (ASCII char or KEY_* code) into the keyboard
+ * input queue, as if the user had typed it on the PS/2 keyboard. Used by
+ * the serial-input driver so paste-into-COM1 works everywhere. */
+void keyboard_inject_char(int key);
 
 #endif /* DRIVERS_KEYBOARD_H */

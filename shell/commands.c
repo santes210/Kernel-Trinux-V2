@@ -5,6 +5,7 @@
 #include "../drivers/timer.h"
 #include "../drivers/rtc.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/serial.h"
 #include "../cpu/ports.h"
 #include "../fs/vfs.h"
 #include "../fs/path.h"
@@ -1581,27 +1582,85 @@ static void top_render(void)
     }
 
     /* ---- process table ---- */
+    /* Compute the total ticks consumed by all processes during this sample
+     * window so each %CPU is normalised against the others.  When the box
+     * is idle the bulk of those ticks belong to the `idle` task, which is
+     * exactly what htop on Linux shows too. */
+    uint32_t window_total = 0;
     uint32_t n = process_count();
+    for (uint32_t i = 0; i < n; i++) {
+        process_t *p = process_at(i);
+        if (p) window_total += p->ticks_window;
+    }
+    if (window_total == 0) window_total = 1;  /* avoid /0 */
+
     kprintf("\n  Tasks: %u\n", n);
     uint8_t th = vga_entry_color(VGA_BLACK, VGA_LIGHT_GREY);
     vga_set_color(th);
-    kprintf("  PID  STATE  NAME                          ");
+    kprintf("  PID  PRI  STATE  %%CPU   US%%   TIME+      NAME             ");
     vga_set_color(shell_get_state()->color);
     kprintf("\n");
 
-    for (uint32_t i = 0; i < n && i < 12; i++) {
+    for (uint32_t i = 0; i < n && i < 11; i++) {
         process_t *p = process_at(i);
         if (!p) continue;
+
+        /* The `idle` slot is conceptually always "running" — whenever it
+         * accumulates ticks the CPU was literally executing HLT.  Showing
+         * it as "RDY" while it has 100% CPU was confusing, so display
+         * RUN here regardless of its bookkeeping state. */
+        proc_state_t display_state = p->state;
+        if (p->priority >= PRIO_IDLE && p->cpu_ticks > 0)
+            display_state = PROC_RUNNING;
+
         uint8_t sc;
-        switch (p->state) {
+        switch (display_state) {
         case PROC_RUNNING:  sc = vga_entry_color(VGA_LIGHT_GREEN, VGA_BLACK); break;
         case PROC_READY:    sc = vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK);  break;
         case PROC_SLEEPING: sc = vga_entry_color(VGA_LIGHT_BROWN, VGA_BLACK); break;
         default:            sc = vga_entry_color(VGA_LIGHT_RED, VGA_BLACK);   break;
         }
+
+        uint32_t pcpu      = (p->ticks_window * 100) / window_total;
+        if (pcpu > 100) pcpu = 100;   /* clamp tiny rounding overshoot */
+        uint32_t hz        = timer_get_freq();
+        if (hz == 0) hz = 100;
+        uint32_t total_sec = p->cpu_ticks / hz;
+        uint32_t total_cs  = (p->cpu_ticks * 100 / hz) % 100;
+        /* US%% = fraction of THIS process' total time spent in ring 3 */
+        uint32_t us_pct = p->cpu_ticks
+            ? (p->cpu_ticks_user * 100) / p->cpu_ticks : 0;
+
+        /* PRI: print as signed; the idle task is shown as "idl" to make
+         * it visually obvious that it isn't a user-tweakable value. */
         kprintf("  %-3u  ", p->pid);
-        vga_print_color(proc_state_str(p->state), sc);
-        kprintf("   %s\n", p->name);
+        if (p->priority >= PRIO_IDLE) kprintf("idl  ");
+        else                          kprintf("%3d  ", p->priority);
+
+        /* Print the STATE column.  We use kprintf for the text so the VGA
+         * cursor advances (and the column on serial gets the same text);
+         * the colour highlight is painted on top of the cells we just
+         * wrote, which is what vga_print_color_at_cursor() does.  Using
+         * vga_print_color() alone wrote directly to the framebuffer
+         * without moving the cursor, which is why the column appeared
+         * EMPTY on the screen (it was correct on serial only). */
+        const char *st = proc_state_str(display_state);
+        uint8_t saved = vga_get_color();
+        vga_set_color(sc);
+        kprintf("%s", st);
+        vga_set_color(saved);
+
+        kprintf("  %3u%%  %3u%%  %u:%02u.%02u    %s\n",
+                pcpu, us_pct,
+                total_sec / 60, total_sec % 60, total_cs,
+                p->name);
+    }
+
+    /* Reset the sliding %CPU window for every process so the NEXT call to
+     * top_render() reports CPU usage for the next interval only. */
+    for (uint32_t i = 0; i < n; i++) {
+        process_t *p = process_at(i);
+        if (p) p->ticks_window = 0;
     }
 }
 
@@ -1650,6 +1709,67 @@ static int cmd_kill(int argc, char **argv)
     else if (r == -2) kprintf("kill: (%d) - No such process\n", pid);
     else kprintf("killed %d\n", pid);
     return 0;
+}
+
+/* renice <prio> <pid>  -- change the scheduling priority of a process.
+ *
+ * Priority follows the Unix `nice` convention:
+ *     -20 = top priority (gets the CPU first; can starve others)
+ *       0 = default
+ *     +19 = bottom priority (only runs when nobody else wants to)
+ *
+ * Examples:
+ *     renice -5 12        ; boost pid 12 a bit
+ *     renice 10 7         ; ask pid 7 to be polite, let others run first   */
+static int cmd_renice(int argc, char **argv)
+{
+    if (argc < 3) {
+        kprintf("usage: renice <prio> <pid>\n");
+        kprintf("  prio: %d .. %d (lower = more CPU)\n", PRIO_MIN, PRIO_MAX);
+        return 1;
+    }
+    int prio = atoi(argv[1]);
+    int pid  = atoi(argv[2]);
+    int r = process_set_priority((uint32_t)pid, prio);
+    if (r == -1)      kprintf("renice: (%d) - No such process\n", pid);
+    else if (r == -2) kprintf("renice: prio %d out of range (%d..%d)\n",
+                              prio, PRIO_MIN, PRIO_MAX);
+    else              kprintf("pid %d: priority set to %d\n", pid, prio);
+    return 0;
+}
+
+/* nice <prio> <cmd...>  -- run <cmd> at the requested priority.
+ *
+ * Trinux doesn't fork yet, so we can't change a "child" before exec
+ * the way Unix does.  Instead we stash the desired priority globally:
+ * the next call to process_create() (which is what `exec`, internal
+ * commands like `top`, and the shell-spawned background tasks all use)
+ * picks it up and clears it.  So a typical session looks like:
+ *
+ *     nice 10 exec heavy.elf      # heavy.elf starts at +10 (low priority)
+ *     nice -5 exec render.elf     # render.elf starts at -5 (boosted)
+ *
+ * After the command runs, you can confirm with `ps` or `top`. */
+static int cmd_nice(int argc, char **argv)
+{
+    if (argc < 3) {
+        kprintf("usage: nice <prio> <cmd> [args...]\n");
+        kprintf("  prio: %d .. %d (lower = more CPU)\n", PRIO_MIN, PRIO_MAX);
+        return 1;
+    }
+    int prio = atoi(argv[1]);
+    if (prio < PRIO_MIN || prio > PRIO_MAX) {
+        kprintf("nice: prio %d out of range (%d..%d)\n",
+                prio, PRIO_MIN, PRIO_MAX);
+        return 1;
+    }
+    process_set_next_priority(prio);
+    /* One short confirmation, useful to spot accidentally swapped args
+     * (e.g. `nice 5` vs `nice -5`).  The actual ELF then loads right
+     * after on the same line of output. */
+    kprintf("nice: prio=%d  ", prio);
+    /* Re-dispatch argv[2..] as a normal command line. */
+    return commands_dispatch(argc - 2, &argv[2]);
 }
 
 static int cmd_reboot(int argc, char **argv)
@@ -2376,6 +2496,8 @@ static const command_t table[] = {
     {"ps",       cmd_ps,       "list processes"},
     {"top",      cmd_top,      "live system/process monitor (q to quit)"},
     {"kill",     cmd_kill,     "kill a process by pid"},
+    {"nice",     cmd_nice,     "run command at given priority: nice <prio> <cmd>"},
+    {"renice",   cmd_renice,   "change priority of running pid: renice <prio> <pid>"},
     {"reboot",   cmd_reboot,   "reboot the machine"},
     {"shutdown", cmd_shutdown, "power off"},
     {"halt",     cmd_shutdown, "power off"},
@@ -2434,10 +2556,11 @@ int commands_dispatch(int argc, char **argv)
 
     /* Register this command as a transient process so `ps`/`top` show
      * something meaningful. We mark it RUNNING during execution and ZOMBIE
-     * on return, which gets garbage-collected by future process_create()
-     * calls when the table fills up. Built-ins like `top` and `edit` that
-     * take over the screen for a while are the most interesting to see. */
-    process_t *cmd_proc = process_create(argv[0], NULL);
+     * on return; process_create() reuses ZOMBIE slots so the table never
+     * grows. Use the "tracking" variant so a pending `nice` hint passes
+     * through this placeholder and lands on the real ELF that the user
+     * actually wanted to renice (e.g. `nice -5 exec /bin/foo`). */
+    process_t *cmd_proc = process_create_tracking(argv[0]);
     if (cmd_proc) cmd_proc->state = PROC_RUNNING;
 
     /* alias expansion (single level) */
