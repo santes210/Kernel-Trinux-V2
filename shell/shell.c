@@ -19,6 +19,30 @@ static int  history_head;   /* next write slot (circular) */
 
 shell_state_t *shell_get_state(void) { return &state; }
 
+/* Inicialización mínima cuando NO arrancamos shell_run() (modo ring-3 init). */
+void shell_state_init_minimal(void)
+{
+    state.cwd = vfs_get_root();
+    strcpy(state.user, "user");
+    strcpy(state.hostname, "trinux");
+    state.color = vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK);
+    state.running = true;
+    state.umask = 022;
+    state.pipe_in = NULL;
+    state.pipe_in_len = 0;
+    vfs_set_umask(state.umask);
+
+    /* Cargar hostname de /etc/hostname si existe */
+    vfs_node_t *hn = vfs_resolve("/etc/hostname", state.cwd);
+    if (hn && hn->type == VFS_FILE && hn->size > 0) {
+        char tmp[64];
+        uint32_t n = vfs_read(hn, 0, sizeof(tmp) - 1, (uint8_t *)tmp);
+        tmp[n] = '\0';
+        for (uint32_t i = 0; i < n; i++) if (tmp[i] == '\n') tmp[i] = 0;
+        if (tmp[0]) strncpy(state.hostname, tmp, sizeof(state.hostname) - 1);
+    }
+}
+
 void shell_add_history(const char *line)
 {
     if (line[0] == '\0')

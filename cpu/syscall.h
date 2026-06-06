@@ -3,33 +3,23 @@
 
 #include "idt.h"
 
-/* Syscall numbers (passed in eax). Mirrors a tiny subset of Linux's i386 ABI
- * spirit, not its exact numbers. Args: ebx, ecx, edx. Return value: eax. */
-#define SYS_EXIT    1   /* ebx = exit code; never returns to the user        */
-#define SYS_WRITE   2   /* ebx = fd(ignored), ecx = buf, edx = len -> bytes  */
-#define SYS_GETPID  3   /* -> current pid                                    */
-#define SYS_YIELD   4   /* cooperatively give up the CPU (calls schedule())  */
-#define SYS_SLEEP   5   /* ebx = milliseconds                                */
-#define SYS_GETC    6   /* blocking read of one key -> char                  */
-#define SYS_UPTIME  7   /* -> seconds since boot                             */
-#define SYS_READFILE  8 /* ebx = path, ecx = buf, edx = maxlen -> bytes (-1) */
-#define SYS_WRITEFILE 9 /* ebx = path, ecx = buf, edx = len    -> bytes (-1) */
-#define SYS_GETLINE  10 /* ebx = buf,  ecx = max               -> length     */
+/* Syscall numbers: la fuente única de verdad vive en user/trinux.h
+ * (compartida con los programas ELF de /bin). El kernel los importa
+ * con TRINUX_KERNEL_INCLUDE para no arrastrar los typedef de uint32_t
+ * (ya los tiene en lib/types.h) ni las inline wrappers. */
+#define TRINUX_KERNEL_INCLUDE 1
+#include "../user/trinux.h"
 
-/* Install the int 0x80 gate (DPL 3 so ring-3 code may invoke it). */
+/* Instala el gate int 0x80 con DPL=3 (ring-3 puede invocarlo). */
 void syscall_install(void);
 
-/* If a ring-3 program is running, terminate it (return to the kernel) instead
- * of panicking. Used by the CPU exception handler. Returns false if no user
- * program is active (so the kernel should panic as usual). */
+/* Si hay un programa ring-3 activo, mátalo en vez de panic. */
 bool usermode_fault_kill(int signal_code);
 
-/* C dispatcher called from syscall_asm.asm. */
+/* Despachador en C invocado desde syscall_asm.asm. */
 void syscall_handler(registers_t *regs);
 
-/* Run a ring-3 program: switches to user mode at `entry` with a fresh user
- * stack, and returns here when the program calls SYS_EXIT. Returns the exit
- * code. `name` is used for the process table (ps/top). */
+/* Arranca un programa ring-3 plain (sin ELF) y lo registra como proceso. */
 int  usermode_run(const char *name, void (*entry)(void));
 
 #endif /* CPU_SYSCALL_H */

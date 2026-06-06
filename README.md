@@ -19,17 +19,128 @@ el disco es IDE, SATA (AHCI) o USB (xHCI), así que puedes correrlo en
 laptops modernas como la HP Stream 14 donde la USB de boot es el único
 medio de almacenamiento accesible.
 
+---
+
+## 🆕 Novedades v0.2.1 — Ring 3 real (Fases 1-4)
+
+Esta versión migra el sistema de **kernel-mode-only** a un modelo
+**ring 0 + ring 3** real, con shell y comandos corriendo en CPL=3.
+
+### Lo que cambió
+
+| Antes (v0.2.0)                       | Ahora (v0.2.1)                                  |
+|---|---|
+| Shell vivía en el kernel (ring 0)   | **`/bin/sh` es un ELF userland en ring 3 (PID 5)** |
+| Built-ins en C dentro del kernel    | **61 binarios `/bin/*` + 3 aliases**, todos ELF ring 3 |
+| 10 syscalls                          | **48 syscalls** (open/read/write/spawn/login/...) |
+| Sin aislamiento de privilegio       | **CPL=3 real** (cs=0x1B): `cli`/`outb`/IO/MSR prohibidos |
+| Sin pipes en ring 3                 | **Pipes `cmd1 \| cmd2 \| cmd3`** (hasta 8 stages) |
+| 1 user stack global                 | **Stack por nivel de anidamiento** (L0..L3) |
+
+### Comandos en `/bin/` ejecutándose en ring 3
+
+```
+ls cp mv rm rmdir mkdir touch cat stat chmod chown
+head tail wc grep sort uniq cut tee write
+pwd basename dirname which env find tree
+date free df ps neofetch uptime hostname uname id whoami users groups
+echo true false yes seq calc hexdump sleep clear cls color
+login logout su useradd passwd
+reboot shutdown halt sync kill renice battery
+ringtest   ← prueba que CPL=3 es real (intenta `cli` → #GP, kernel mata el proceso)
+```
+
+### Verificar el aislamiento
+
+```
+root@trinux:~# ringtest
+[ringtest] Soy un programa userland. PID=10
+[ringtest] Intentando ejecutar 'cli' (instrucción privilegiada)...
+
+*** CPU EXCEPTION ***
+  General Protection Fault (interrupt 13)
+  eip=080480d5 cs=001b  eflags=00010246 ds=0023
+                ^^^^^^^                  ^^^^^^^
+                CPL=3 user code segment   user data segment
+  (terminating ring-3 program; kernel continues)
+root@trinux:~#                ← el shell sobrevive
+```
+
+### Pipes funcionando
+
+```
+$ ls /bin | wc                          → 1 65 422
+$ cat /etc/passwd | grep root           → root:x:0:0:root:/root:/bin/sh
+$ seq 1 20 | wc                         → 20 20 51
+$ cat /etc/passwd | head -n 1 | wc      → 1 1 30   (3 stages)
+```
+
+### Cómo está organizado el nuevo userland
+
+```
+user/
+├── trinux.h             # ABI única: 48 syscalls + libc mini (ring-3)
+├── coreutils/
+│   ├── build.sh         # compila los 61 .c → ELF32 → .h embebido
+│   ├── crt0.S, user.ld  # startup + linker script para ring 3
+│   ├── *.c              # 62 fuentes (echo, cat, ls, ps, neofetch, ...)
+│   ├── hdrs/*.h         # generado: cada ELF como blob xxd -i
+│   └── user_bins.h      # generado: tabla {nombre, blob, size} para el kernel
+└── usersh/
+    ├── sh.c             # el shell completo ring-3 (login, prompt, pipes)
+    └── sh_elf.h         # generado: blob del shell
+```
+
+### Recompilar
+
+```sh
+# 1. Compila los ELFs userland (necesita gcc-multilib, nasm, xxd)
+bash user/coreutils/build.sh
+
+# 2. Compila el kernel (embebe los ELFs en /bin/ al boot)
+make
+
+# 3. Genera la imagen USB persistente de 512 MiB
+bash make-usb-image.sh 512
+
+# 4. Corre en QEMU
+qemu-system-i386 -drive file=mykernel-usb.img,format=raw,if=ide -m 512M
+```
+
+### Cómo volver al shell viejo (debug)
+
+Si quieres comparar con el shell legacy en ring 0:
+
+1. En el menú de GRUB, presiona `e` para editar la entrada
+2. En la línea `multiboot /boot/mykernel.bin`, agrega `oldsh` al final
+3. Presiona Ctrl-X para bootear
+
+### Lo que aún NO está
+
+- **Address spaces por proceso reales** (CR3 distinto por task con `copy_from_user`/`copy_to_user`).
+  Hoy el ring 3 protege **privilegio** (no puede `cli`/`outb`/MSR), pero
+  todos los procesos comparten el identity-map de 256 MiB del kernel.
+  El "multi-stack por nivel" de Fase 4 resuelve el problema práctico de
+  spawn anidado sin necesitar CR3 separados.
+- `fork()` real con COW (usamos `posix_spawn` semantics: SPAWN + WAITPID).
+- `top` interactivo y el editor `nano/edit` siguen siendo built-ins ring 0.
+
+Ver detalles técnicos:
+- [`RING3_CHANGES.md`](RING3_CHANGES.md) — Fase 1 (loader ELF a ring 3 + 27 coreutils)
+- [`RING3_FASE2.md`](RING3_FASE2.md) — Fase 2 (shell entero a ring 3)
+- Fases 3 y 4 (resto de coreutils + pipes + multi-stack) documentadas en esta sección.
+
+---
+
 ```
 user@trinux:/$ neofetch
       .--.        user@trinux
-     |o_o |       OS: Trinux 0.2.0
-     |:_/ |       Arch: i686
-    //   \ \      Kernel: x86 32-bit protected mode
-   (|     | )     Uptime: 42 s
-  /'\_   _/`\     Memory: 16/511 MB
-  \___)=(___/     Disk: 0 MB used / 14336 MB
-                  Shell: mysh
-                  Battery: 72% (discharging)
+     |o_o |       OS:     Trinux 0.2.1 (ring 3 shell)
+     |:_/ |       Kernel: x86 32-bit protected mode
+    //   \ \      Uptime: 42 s
+   (|     | )     Shell:  /bin/sh (PID=5, ring 3)
+  /'\_   _/`\     Memory: 16/511 MiB
+  \___)=(___/     Disk:   0/14336 MiB
 ```
 
 ---

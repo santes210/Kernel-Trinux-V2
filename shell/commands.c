@@ -2593,6 +2593,40 @@ int commands_dispatch(int argc, char **argv)
         }
     }
 
+    /* === Ring-3 routing ===
+     * Antes de invocar el built-in del kernel, miramos si existe
+     * /bin/<argv[0]>.  Si sí, lo ejecutamos como ELF en ring 3 vía
+     * elf_exec_argv() — pasándole argv completo.  Esto reproduce el
+     * comportamiento de Linux: `ls` se resuelve a /bin/ls y corre
+     * unprivileged, no como código del kernel.
+     *
+     * Hay built-ins que NO podemos delegar a ring 3 porque cambian
+     * estado del propio shell (cwd, alias, history, login).  Esos los
+     * marcamos como "internal-only" y se quedan en kernel mode. */
+    static const char *internal_only[] = {
+        "cd", "alias", "history", "logout", "su", "login", "exit",
+        "exec", "tcc", "asm", "edit", "color", "umask",
+        "usertest", "neofetch",  /* requieren contexto compartido */
+        NULL
+    };
+    int is_internal = 0;
+    for (int k = 0; internal_only[k]; k++)
+        if (strcmp(argv[0], internal_only[k]) == 0) { is_internal = 1; break; }
+
+    if (!is_internal) {
+        /* Construye "/bin/<cmd>" y prueba si existe como ELF. */
+        char bin_path[80];
+        snprintf(bin_path, sizeof(bin_path), "/bin/%s", argv[0]);
+        shell_state_t *s = shell_get_state();
+        vfs_node_t *bin_node = vfs_resolve(bin_path, s ? s->cwd : NULL);
+        if (bin_node && bin_node->type == VFS_FILE && bin_node->size > 0) {
+            int rc = elf_exec_argv(bin_path, s ? s->cwd : NULL, argc, argv);
+            if (cmd_proc) cmd_proc->state = PROC_ZOMBIE;
+            return rc;
+        }
+    }
+
+    /* Fallback: built-ins del kernel. */
     for (unsigned i = 0; i < ARRAY_LEN(table); i++) {
         if (strcmp(argv[0], table[i].name) == 0) {
             int rc = table[i].fn(argc, argv);
@@ -2600,12 +2634,11 @@ int commands_dispatch(int argc, char **argv)
             return rc;
         }
     }
-    /* Not a built-in command.  If it looks like a path (starts with /
-     * or ./), try to execute it as an ELF binary — just like Linux. */
+    /* Not a built-in.  Si parece path (/ o ./), ejecutarlo como ELF. */
     if (argv[0][0] == '/' ||
         (argv[0][0] == '.' && argv[0][1] == '/')) {
         shell_state_t *s = shell_get_state();
-        int rc = elf_exec(argv[0], s->cwd);
+        int rc = elf_exec_argv(argv[0], s->cwd, argc, argv);
         if (cmd_proc) cmd_proc->state = PROC_ZOMBIE;
         return rc;
     }

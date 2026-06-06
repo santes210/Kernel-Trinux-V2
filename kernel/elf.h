@@ -57,4 +57,9 @@ typedef struct {
  */
 int elf_exec(const char *path, vfs_node_t *cwd);
 
+/* Versión con argumentos: argv ya tokenizado.
+ * argv[0] suele ser el nombre del programa, argv[argc] = NULL.
+ * Idéntico a elf_exec() en lo demás. */
+int elf_exec_argv(const char *path, vfs_node_t *cwd, int argc, char **argv);
+
 #endif /* KERNEL_ELF_H */

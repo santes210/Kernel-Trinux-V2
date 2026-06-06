@@ -23,43 +23,48 @@
 #include "../process/scheduler.h"
 #include "../lib/printf.h"
 #include "../shell/shell.h"
-#include "hello_elf.h"
-#include "vgademo_elf.h"
-#include "snake_elf.h"
+#include "elf.h"
+/* Old V2.0 demo blobs (compilados con ABI de syscalls desactualizada).
+ * Reemplazados por user/coreutils/user_bins.h.  Conservamos los .c sources
+ * (tce/mini_test/slow) para `tcc`. */
 #include "tce_src.h"
 #include "mini_test_src.h"
 #include "slow_src.h"
+#include "../user/coreutils/user_bins.h"
+#include "../user/usersh/sh_elf.h"
 
 /* Install built-in ELF binaries into /bin if they don't already exist.
  * Called AFTER diskfs_load() so they survive regardless of disk state. */
 static void install_builtin_apps(void)
 {
-    static const struct {
-        const char *name;
-        const unsigned char *data;
-        unsigned int size;
-    } apps[] = {
-        { "hello",   hello_elf,   hello_elf_size },
-        { "vgademo", vgademo_elf, vgademo_elf_size },
-        { "snake",   snake_elf,   snake_elf_size },
-    };
-
     /* ensure /bin exists */
     vfs_node_t *bin = vfs_resolve("/bin", vfs_get_root());
     if (!bin)
         bin = vfs_mkdir("/bin", vfs_get_root());
     if (!bin) return;
 
-    for (unsigned i = 0; i < sizeof(apps)/sizeof(apps[0]); i++) {
-        if (vfs_finddir(bin, apps[i].name))
-            continue;   /* already exists (from disk restore) */
+    /* Drop los binarios coreutils ring-3 generados por user/coreutils/build.sh
+     * en /bin/. SIEMPRE los sobreescribimos para asegurar que el ABI de
+     * syscalls del kernel coincide con el de los binarios compilados
+     * (si el usuario tenía versiones viejas en disco con números viejos
+     * se reemplazan en cada boot). */
+    for (unsigned i = 0; i < user_bins_count; i++) {
         char path[64];
-        snprintf(path, sizeof(path), "/bin/%s", apps[i].name);
+        snprintf(path, sizeof(path), "/bin/%s", user_bins[i].name);
         vfs_node_t *f = vfs_create(path, vfs_get_root());
         if (f) {
             f->permissions = 0755;
-            vfs_write(f, 0, apps[i].size, (uint8_t *)apps[i].data);
+            f->size = 0;
+            vfs_write(f, 0, *user_bins[i].size_p, (uint8_t *)user_bins[i].data);
         }
+    }
+
+    /* Y el shell userland (vive aparte) */
+    vfs_node_t *fsh = vfs_create("/bin/sh", vfs_get_root());
+    if (fsh) {
+        fsh->permissions = 0755;
+        fsh->size = 0;
+        vfs_write(fsh, 0, u_sh_len, (uint8_t *)u_sh);
     }
 
     /* Drop the bundled source of `tce.c` into /root so the user can do:
@@ -256,6 +261,9 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     extern void shell_set_boot_mode(int mode);
     shell_set_boot_mode(boot_mode);
 
+    /* Modo "oldsh": fuerza usar la shell vieja en ring 0 (debug). */
+    int use_old_shell = (cmdline && cmdline_has(cmdline, "oldsh")) ? 1 : 0;
+
     vga_set_color(vga_entry_color(VGA_WHITE, VGA_BLACK));
     kprintf("\n  Type 'help' for a list of commands.\n");
     if (boot_mode == 0)
@@ -264,7 +272,29 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     kprintf("\n");
     vga_set_color(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
 
-    shell_run();
+    if (use_old_shell) {
+        kprintf("  [init] launching legacy ring-0 shell (oldsh)\n");
+        shell_run();
+    } else {
+        /* === NUEVO: ejecutar /bin/sh en ring 3 como init. === */
+        /* Necesitamos un shell_state vacío para que los syscalls que lo
+         * usan (chdir, getcwd) tengan algo a lo que apuntar. */
+        extern void shell_state_init_minimal(void);
+        shell_state_init_minimal();
+
+        /* Pre-loguear root si modo single, para que el shell ring-3 lo vea. */
+        if (boot_mode == 1) {
+            user_t *root = users_find("root");
+            if (root) set_current_user(root);
+        }
+
+        kprintf("  [init] launching /bin/sh in RING 3 (CPL=3)\n");
+        for (;;) {
+            int rc = elf_exec("/bin/sh", vfs_get_root());
+            kprintf("\n  [init] /bin/sh exited with code %d, restarting in 1s...\n", rc);
+            for (volatile int i = 0; i < 50000000; i++);  /* delay tonto */
+        }
+    }
 
     /* Should never return. */
     for (;;)

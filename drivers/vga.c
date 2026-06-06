@@ -22,6 +22,8 @@ void vga_capture_begin(char *buf, uint32_t cap)
     capture_len = 0;
 }
 
+int vga_capture_active(void) { return capture_buf != NULL; }
+
 uint32_t vga_capture_end(void)
 {
     uint32_t n = capture_len;
