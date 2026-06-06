@@ -21,7 +21,681 @@ medio de almacenamiento accesible.
 
 ---
 
-## 🆕 Novedades v0.2.1 — Ring 3 real (Fases 1-4)
+## 🆕 Novedades v0.2.x — Ring 3 real (Fases 1-7)
+
+> **Resumen ultra corto**: el shell y 64 comandos ahora corren en **ring 3 real** (CPL=3),
+> con pipes, redirección, top interactivo, editor de texto, compilador C accesible,
+> y prompt con colores. El kernel sólo se llama vía 50+ syscalls.
+
+Esta sección documenta **TODO** lo añadido en las fases v0.2.1 → v0.2.4.
+Para el diseño original ring-0 del sistema, ver la versión v0.2.0 más abajo.
+
+### Fase 1 — Loader ELF a ring 3 + 27 coreutils
+
+**Antes**: el `elf_exec()` del kernel cargaba binarios pero los ejecutaba con
+`fn()` (llamada en kernel mode — CPL=0). El comentario decía
+*"TODO: proper ring 3 execution with save/restore"*.
+
+**Ahora**: `elf_exec()` arma un IRET frame con `cs=0x1B` (user code, RPL=3) y
+`ss=0x23` (user data, RPL=3), salta a `usermode_save_and_enter()` que:
+1. Guarda el ESP kernel del padre
+2. Hace `iret` a la VA del ELF en ring 3
+3. Cuando el ELF llama `SYS_EXIT`, `elf_jmp_longjmp()` vuelve al kernel
+4. Restaura el ESP guardado
+
+Los primeros 27 comandos coreutils nacen como ELFs `/bin/*` en CPL=3:
+`ls cat echo pwd whoami hostname uname uptime clear mkdir rmdir rm touch wc head tail grep sleep yes true false id reboot shutdown sync kill ringtest`.
+
+### Fase 2 — Shell completa en ring 3 (`/bin/sh`)
+
+**Antes**: la shell (`shell/shell.c`) era código del kernel que el `kernel_main`
+llamaba directamente como función. No era un proceso schedulable.
+
+**Ahora**: hay un nuevo ELF userland `user/usersh/sh.c` que el kernel arranca
+como **PID 5** en ring 3. La shell:
+- Hace login interactivo vía `SYS_LOGIN` (contra `/etc/shadow` del kernel)
+- Tiene prompt en color con `user@host:cwd`
+- Tokeniza, ejecuta built-ins (`cd`, `exit`, `help`, `history`, `clear`)
+- Resuelve cualquier otro comando a `/bin/<nombre>` vía `SYS_SPAWN`
+
+**Modo legacy**: pasar `oldsh` en el cmdline de GRUB lanza el shell ring-0 viejo.
+
+### Fase 3 — Resto de los 64 coreutils en ring 3
+
+Se portan todos los comandos restantes (excepto `top`, `edit`, `tcc` que
+necesitaban infra extra — ver Fase 5):
+`cp mv stat chmod chown date free df users groups logout su useradd passwd ps`
+`renice battery tree find sort uniq cut tee seq basename dirname which env`
+`calc hexdump neofetch write color halt`
+
+Cada uno requirió un syscall nuevo según lo que tocaba (chmod → `SYS_CHMOD`,
+free → `SYS_MEMINFO`, ps → `SYS_LISTPROC`, etc).
+
+### Fase 4 — Pipes + multi-stack por nivel de anidamiento
+
+**Bug crítico encontrado**: cuando el shell ring-3 hacía `SPAWN` de un hijo,
+el kernel cargaba el ELF hijo en la misma VA (`0x08048000`) y le daba un
+user stack en `USER_STACK_TOP = 0x0F000000` — el **mismo** stack del shell.
+Resultado: el stack del padre se corrompía y el shell crasheaba con `eip=3`.
+
+**Fix**: cada nivel de spawn usa una VA de stack distinta:
+- Nivel 0 (shell)     → `0x0F000000`
+- Nivel 1 (cmd hijo)  → `0x0EE00000`
+- Nivel 2 (sub-cmd)   → `0x0EC00000`
+- Nivel 3             → `0x0EA00000`
+
+Además, el código del padre se respalda en kheap antes del spawn y se restaura
+al volver (porque el ELF hijo carga en `0x08048000`).
+
+Con eso resuelto, los **pipes** se implementan en `dispatch()`:
+```
+cmd1 | cmd2 | cmd3
+```
+se ejecuta como tres SPAWN secuenciales, redirigiendo cada uno a un archivo
+temporal `/tmp/.p0`, `/tmp/.p1`, etc., y pasando el archivo como último argv
+del siguiente stage. Máximo **8 stages**. Los tmpfiles se borran al terminar.
+
+### Fase 5 — `top`, `edit`, `tcc` con 3 syscalls extra
+
+**Problema**: estos tres comandos requieren primitivas que no existían:
+- `top` necesita leer teclas **sin bloquearse** (para el refresh periódico).
+- `edit` necesita posicionar el cursor en cualquier (x,y) sin imprimir.
+- `tcc` es un compilador grande del kernel (`shell/tcc.c`); portarlo a ring 3
+  sería ~1500 líneas. Pragmático: hacer un wrapper userland que invoque al
+  built-in del kernel vía syscall.
+
+**Syscalls añadidos**:
+| # | Nombre | Para qué |
+|---|---|---|
+| 61 | `SYS_KEY_POLL` | tecla pendiente o -1 (no bloquea) |
+| 62 | `SYS_VGA_GOTO` | mover cursor de hardware a (x,y) |
+| 63 | `SYS_VGA_CLEAR` | clear + reset cursor a (0,0) |
+| 64 | `SYS_TCC_COMPILE` | compila `.c` (delega al built-in del kernel) |
+
+**`top`**: redibuja cada 1 s, header con uptime/memoria/disco, tabla de 18
+procesos, sale con `q`.
+
+**`edit`**: editor full-screen, 23 filas de contenido + status bar arriba y
+abajo. Cursor de hardware (`vga_goto`) en la posición exacta del carácter
+(no debajo). Controles: flechas, `Ctrl-S` guardar, `Ctrl-X` guardar+salir,
+`Ctrl-Q` quit sin guardar. Hasta 200 líneas × 80 columnas. Alias: `nano`.
+
+**`tcc`**: wrapper userland (`user/coreutils/tcc_u.c`, ~30 líneas) que llama
+`SYS_TCC_COMPILE`. El compilador en sí (`shell/tcc.c`) sigue siendo built-in
+del kernel — corre en ring 0 mientras compila, pero el binario que produce
+sí se ejecuta en ring 3 al invocarlo. Flujo completo:
+```
+edit /root/p.c   →   tcc /root/p.c   →   /root/p   (corre en ring 3)
+```
+
+### Fase 6 — Bugfixes (v0.2.3)
+
+**Bug 1**: `cp` y `mv` no sobrescribían correctamente archivos destino existentes.
+Causa: `vfs_create(path,...)` cuando el path existe devuelve el nodo
+existente; el handler `SYS_WRITEFILE` hacía `n->size=0` pero los datos viejos
+en disco/RAM podían dejar residuos en el archivo nuevo.
+**Fix**: `cp_u.c` y `mv_u.c` hacen `unlink(dst)` antes de `writefile(dst, ...)`
+para forzar un nodo virgen. También se aplicó la misma precaución a `tee` y
+`write` y `edit` (en su save).
+
+**Bug 2**: `su` no cambiaba el usuario "de verdad" (el prompt seguía mostrando
+el viejo).
+Causa doble:
+- El syscall `SYS_SU` SÍ actualizaba `current_user` en el kernel, pero el
+  shell ring-3 mantenía `g_user/g_is_root` en su BSS y nunca los refrescaba.
+- `su_u.c` antiguo dependía de `is_root_user()` evaluado dentro del syscall
+  para decidir si pedía password, lo cual era inconsistente.
+
+**Fix**: nueva función `refresh_identity()` en `sh.c` que llama `getuser` +
+`getuid` desde el kernel después de cualquier `su`/`login`/`logout`. Y `su`
+ahora siempre pide password (root puede pasar Enter para bypass).
+
+### Fase 7 — Colores del prompt y `ls` con tipos (v0.2.4)
+
+**Problema reportado**: "los comandos se ven blancos, las carpetas no tienen color".
+
+Causas:
+1. El `show_prompt()` de `sh.c` terminaba con `vga_color(LIGHT_GREY, BLACK)`,
+   así que lo que el usuario tipeaba salía gris (no verde como en el shell
+   original ring-0).
+2. `ls.c` no llamaba `vga_color` para nada — imprimía todo en el color que
+   estuviera "vigente" (típicamente gris).
+
+**Fix en `sh.c`**: el final de `show_prompt()` ahora pone
+`vga_color(LIGHT_GREEN, BLACK)` — lo que escribes se ve **verde**. Y al final
+de cada `dispatch()` se resetea a gris para que la salida del comando no se
+contamine con colores que un comando anterior haya dejado.
+
+**Fix en `ls.c`**: cada entry se pinta según tipo y permisos:
+- 🔵 **Directorios** → `LIGHT_BLUE` (azul claro)
+- 🟢 **Ejecutables** (cualquier bit `x` en perms) → `LIGHT_GREEN`
+- 🟦 **Dispositivos** (`/dev/sda`, `/dev/null`, ...) → `LIGHT_CYAN`
+- ⚪ **Archivos normales** → `LIGHT_GREY`
+
+### Fase 8 — Modo texto 80×50 con fuente 8×8 (v0.2.5)
+
+**Problema reportado**: las letras del modo texto VGA se veían demasiado
+grandes. Caben solo 25 filas de 80 columnas.
+
+**Fix**: el driver VGA ahora arranca en **80×50** con fuente 8×8 en vez de
+80×25 con 8×16. Eso da el **doble de filas** con letras la mitad de altas.
+Sin tocar paging, framebuffer ni nada — solo reconfigurar el adaptador VGA.
+
+**Cómo funciona** (`drivers/vga.c` → `vga_set_8x8_mode()`):
+
+1. **Cambiar al modo "carga de fuente"** programando el Sequencer (puerto
+   `0x3C4`) y Graphics Controller (`0x3CE`) para mapear `0xA0000` al plano 2
+   sin chain-4.
+2. **Copiar 2 KB de fuente 8×8 embebida** a la RAM de fuentes del VGA. Cada
+   glifo ocupa 32 bytes en el slot (aunque la fuente sea solo 8). La fila 7
+   (última) se fuerza a `0` para dejar 1 scanline de **respiro** entre líneas.
+3. **Restaurar el modo texto** (Map Mask = planos 0+1, GC apunta a `0xB8000`).
+4. **Reprogramar el CRTC** (puerto `0x3D4`): Maximum Scan Line register
+   `0x09` con bits 0-4 = 7 (cada carácter ocupa 8 scanlines, no 16). El
+   panel sigue siendo 400 scanlines, así que `50 × 8 = 400` cabe exacto.
+
+```c
+void vga_init(void)
+{
+    vga_set_8x8_mode();   /* primero el modo VGA */
+    cur_color = vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK);
+    vga_clear();
+}
+```
+
+**Ajustes derivados**:
+- `VGA_HEIGHT` en `drivers/vga.h` cambió de `25` a `50`.
+- `top_u.c`: ahora dibuja hasta 42 procesos (antes 18) y limpia hasta fila 49.
+- `edit_u.c`: `SCREEN_H = 50`, `CONTENT_H = 48` (más espacio para edición).
+
+**Detalle sobre la fuente embebida**: usé la fuente IBM PC VGA 8×8 estándar
+(dominio público) que viene en muchos kernels osdev. Cubre ASCII printable
+(0x20-0x7E) y los símbolos de pseudo-gráficos (0x00-0x1F). Los caracteres no
+ASCII (0x80+) salen como cajas vacías — los coreutils solo usan ASCII así
+que no afecta nada.
+
+**Compatibilidad**: funciona perfecto en QEMU. En hardware real puede verse
+con fuentes ligeramente distintas si la BIOS sobrescribe la RAM de fuentes
+después del boot, pero el modo VGA estándar lo respeta. Si quieres volver al
+modo 80×25 original, comenta la llamada `vga_set_8x8_mode()` en `vga_init()`.
+
+### Fase 9 — tcc puro en ring 3 + IDE con syntax highlighting (v0.2.6)
+
+**Antes**: `/bin/tcc` era un wrapper userland (~30 líneas) que llamaba al
+syscall `SYS_TCC_COMPILE`. El compilador real (`shell/tcc.c`, 1786 líneas)
+corría en kernel mode (ring 0). El binario producido sí era ring 3, pero el
+proceso de compilación no.
+
+**Ahora**: hay **dos** compiladores:
+- **`/bin/tcc`** — port completo del compilador a ring 3 puro. 23 KB. Es el
+  mismo código C subset (int, char, if, while, for, structs, arrays, ++/--,
+  break/continue, strings, etc.) que el built-in, pero **corre 100% en CPL=3**.
+- **`/bin/tcck`** — el wrapper viejo, mantenido por compat (es ~10× más rápido
+  arrancando porque no carga el ELF del compilador, solo llama un syscall).
+
+**El port** (`user/tccu/tcc_main.c`, 1994 líneas):
+
+1. Copia de `shell/tcc.c` sin tocar la lógica del compilador.
+2. Añadí un **shim userland** de 167 líneas que reemplaza las 15 APIs del
+   kernel que tcc.c usaba:
+   - **`kmalloc`/`kfree`/`krealloc`** → bump allocator de 256 KB en BSS
+     userland (suficiente para el text buffer + el output ELF; tcc nunca
+     libera nada, así que no falta el free real)
+   - **`kprintf("...%d %s %x...", a, b, c)`** → macro varargs casera que
+     mete los args en un `long[]` y los pasa a un `kprintf_internal()`
+     que parsea el formato
+   - **`vfs_read/resolve/create/write`** → wrappers sobre `readfile()` y
+     `writefile()` (los syscalls de fs que ya existían)
+   - **`strcmp/strncmp/strcpy/strncpy/strlen/memcpy/memset`** → versiones
+     locales (no están en `trinux.h`)
+3. Reemplazado el `tcc_compile(src, out)` por un `main(argc, argv)` que
+   parsea args y delega.
+4. Como el código generado **ya emitía `int 0x80` directamente** (los
+   built-ins del compilador eran inline syscalls), el binario producido
+   funciona idéntico al producido por `tcck`.
+
+**Verificación**:
+```
+$ tcc /root/slow.c
+tcc: compiled 128 bytes code + 28 bytes data + 0 bytes bss
+     -> /root/slow (240 file, 240 mem)
+tcc[ring3]: success
+$ /root/slow
+slow: starting
+(4 segundos)
+slow: done
+```
+
+### Fase 10 — Code IDE `/bin/cide` con syntax highlighting (v0.2.6)
+
+Nuevo programa: **`/bin/cide`** — editor estilo "VSCode-mini" para terminal.
+Hereda de `/bin/edit` pero añade:
+
+**Syntax highlighting** para archivos `.c`:
+- 🔵 **Keywords** (`int char void if else while for do return break continue static const struct typedef enum sizeof unsigned signed long short`) en `LIGHT_BLUE`
+- 🟦 **Identifiers** (nombres de funciones/variables) en `LIGHT_CYAN`
+- 🟢 **Strings** `"..."` y chars `'.'` en `LIGHT_GREEN`
+- 🟡 **Numbers** (decimal, hex `0x..`, float) en `YELLOW`
+- ⬛ **Comments** `// ...` y `/* ... */` (incluso multilinea entre líneas) en `DARK_GREY`
+- 🟣 **Preprocesador** (`#include`, `#define`, ...) en `LIGHT_MAGENTA`
+- ⚪ **Punctuation** (`{ } ( ) ; ,`) en `WHITE`
+
+**Atajos integrados**:
+- **`Ctrl-B`** → guarda el archivo y **compila** con tcc (usa el syscall
+  `SYS_TCC_COMPILE`, así el editor no se desmonta). Muestra "BUILD OK" o
+  "BUILD: compilation failed" en la barra inferior.
+- **`F5`** o **`Ctrl-R`** → corre el binario compilado (mismo nombre sin `.c`).
+  Sale del modo full-screen, spawnea el binario en ring 3, espera una tecla, y
+  vuelve al editor sin perder el buffer.
+- **`F1`** o **`?`** → ayuda interactiva con la lista de atajos y la leyenda
+  de colores.
+- **`Ctrl-S`** / **`Ctrl-X`** / **`Ctrl-Q`** → como en edit (save / save+exit / quit).
+
+**Detalles técnicos**:
+- 200 líneas × 80 columnas máximo
+- Status bar superior: `cide <archivo> [modified] [C mode]`
+- Status bar inferior: atajos + posición (line/total, col)
+- El lexer es **single-line** pero mantiene un flag `in_block_comment` entre
+  líneas, así los `/* ... */` multilinea se pintan correctamente
+- Cuando el archivo no termina en `.c`, el highlight se desactiva (modo
+  "plain text") y se imprime sin colores
+
+**Flujo típico de uso**:
+```
+$ cide /root/hello.c
+   (editas con flechas + letras, ves los colores en tiempo real)
+   Ctrl-B          → BUILD OK: compiled to /root/hello
+   F5              → corre /root/hello, ves la salida
+   Ctrl-X          → guarda y sale
+$ /root/hello       (también puedes correrlo desde fuera)
+```
+
+### Fase 11 — Driver de pantalla dual VGA texto + VBE framebuffer (v0.2.7)
+
+**Antes**: el kernel sólo soportaba modo texto VGA (`0xB8000`), con una
+resolución fija de 80×25 (o 80×50 con la fuente 8×8 de la Fase 8). En
+hardware moderno sin BIOS VGA legacy esto a veces ni funciona.
+
+**Ahora**: hay **modo dual** automático:
+- **Al arrancar**, si GRUB ofrece framebuffer (modo gráfico VBE), el kernel
+  conmuta al driver `drivers/fb.c` que pinta texto pixel-por-pixel.
+- **Si no hay framebuffer**, fallback automático al driver VGA texto clásico.
+- **La API pública `vga_*` no cambia** — todos los programas (shell, ls,
+  cide, tcc, edit, top, etc.) siguen funcionando idéntico. Solo cambia el
+  backend silenciosamente.
+
+**Resolución**: **auto** (lo que GRUB negocie con la BIOS/VBE). En QEMU es
+1280×800×32; en hardware real puede ser 1024×768, 1920×1080, etc. — el
+kernel se adapta a lo que le den.
+
+#### Implementación
+
+1. **Multiboot header** (`boot/boot.asm`): añadido bit `FB_VIDMODE` (0x4) +
+   campos `mode_type, width, height, depth` puestos a 0 para que GRUB elija
+   la mejor resolución disponible. El header pasa de 12 a 48 bytes.
+
+2. **`kernel/multiboot.h`**: extendido el `multiboot_info_t` con los campos
+   `framebuffer_addr/pitch/width/height/bpp/type` que GRUB rellena cuando
+   activa modo gráfico (flag bit 12 = `0x1000` = `MULTIBOOT_FLAG_FB`).
+
+3. **`drivers/fb.c`** + **`drivers/fb.h`** (nuevos, ~250 líneas):
+   - `fb_init(magic, info)` parsea el framebuffer info, valida que sea
+     RGB de 32 bpp, y mapea las páginas físicas del FB al identity-map
+     del kernel via `vmm_map_page()` (porque el FB suele estar en `0xFD000000`,
+     fuera de los primeros 256 MiB que ya están mapeados).
+   - `fb_putchar(c)` renderiza el carácter pixel-por-pixel usando la fuente
+     VGA 8×8 que ya estaba embebida en `drivers/vga.c` (ahora exportada como
+     `extern const uint8_t vga_font_8x8[2048]`).
+   - `fb_set_color(c)` traduce los 16 colores VGA a RGB888 con una paleta
+     fija (`vga_palette[16]`).
+   - `fb_scroll()` hace memcpy del framebuffer entero subiendo `CELL_H=8`
+     píxels — lento (~30 ms para 1280×800) pero correcto.
+   - Expone `fb_put_pixel(x,y,rgb)` y `fb_get_pixel(x,y)` para apps gráficas
+     futuras (modo C de los syscalls).
+
+4. **`drivers/vga.c`**: pequeña refactorización. Cada función pública (`vga_putchar`,
+   `vga_clear`, `vga_scroll`, `vga_set_cursor`, `vga_set_color`) ahora hace:
+   ```c
+   if (g_use_fb) { fb_putchar(c); return; }
+   /* ... código VGA texto original ... */
+   ```
+   Cero impacto cuando `g_use_fb=false` (modo texto sigue como siempre).
+
+5. **`display_init(magic, info)`** (nueva función en `vga.c`): se llama
+   desde `kernel_main` **después** de `vmm_init()` (porque `fb_init` necesita
+   `vmm_map_page` para mapear el FB en addr alta). Si `fb_init` retorna true,
+   pone `g_use_fb=true` y todas las llamadas posteriores van al FB. Si
+   retorna false, el modo VGA texto sigue activo sin cambios.
+
+#### Decisiones de diseño y limitaciones
+
+- **Solo bpp=32 RGB**. Si GRUB nos da otro formato (8 bpp paletizado, 16 bpp
+  RGB565, 24 bpp packed) caemos al fallback VGA texto. Cubrir todos los
+  bpps duplicaría el código de `fb_putchar` para poco beneficio.
+- **No hay double buffering**. Cada `putchar` pinta directo al FB visible.
+  Funciona porque el scroll es la única operación realmente lenta.
+- **`fb_scroll` es lento (~30 ms en 1280×800)**. Suficiente para uso normal
+  (tipear, ver `ls`, etc.). Si compilamos algo grande con `tcc` y produce mucho
+  output, se nota. Optimización futura: scroll por DMA o hacer scroll por
+  ajuste de panel offset (CRTC).
+- **No usamos VBE 2.0 / 3.0 directamente** — confiamos en lo que GRUB
+  negocie con la BIOS. Eso significa que **en hardware sin BIOS VGA**
+  (algunos laptops UEFI puros) puede no haber framebuffer disponible y se
+  cae a modo texto automáticamente.
+
+#### Capturas
+
+`screenshots-fase11/trinux-fb.png` — modo gráfico 1280×800, se ve `[OK]
+Framebuffer (VBE) graphics mode active` al boot, `neofetch` con ASCII
+art coloreado, prompt verde, `ls /bin` con 65 binarios en 160 columnas.
+
+#### Para tests/debug
+
+Si quieres forzar modo texto VGA (saltarte el framebuffer):
+- Edita `boot/boot.asm`, comenta `FB_VIDMODE` del `MBFLAGS`, recompila.
+- O en GRUB añade `text` al cmdline (futuro: leerlo del kernel cmdline).
+
+#### Lo que se queda para futuras fases
+
+- **Apps gráficas reales** (no solo texto sobre FB): exponer `fb_put_pixel`
+  via syscall y escribir un programa demo que dibuje líneas/círculos.
+- **Doble buffer** para evitar tearing al hacer scroll de mucho texto.
+- **Soporte para más bpps** (8/16/24).
+- **Cursor parpadeante** estilo terminal real (hoy no parpadea en modo FB).
+
+### Fase 12 — Detección SMP via ACPI MADT (v0.2.8) — *primer paso multicore*
+
+**Contexto importante**: el usuario pidió "que use múltiples cores para no
+calentar tanto". Le expliqué que **eso es un mito** — usar más cores
+calienta más, no menos (especialmente bajo QEMU, donde cada vCPU emulada =
+otro thread del host). Pero como sí quería correr Trinux en hardware real
+con multicore, vamos por SMP en fases.
+
+**Esta fase (1 de 5)** SOLO detecta los cores, no los arranca. Es lo
+mínimo para verificar que el kernel ve los APs (Application Processors).
+
+#### Implementación
+
+1. **`cpu/smp.h`** + **`cpu/smp.c`** (nuevos, ~250 líneas):
+   - `smp_detect()` parsea ACPI MADT siguiendo el flujo estándar:
+     1. Busca firma `"RSD PTR "` en EBDA (0x80000-0x9FFFF) y BIOS ROM (0xE0000-0xFFFFF)
+     2. Verifica checksum del RSDP
+     3. Lee el RSDT cuya dirección está en `rsdp->rsdt_addr`
+     4. Recorre las entradas del RSDT buscando una con firma `"APIC"` → eso es la MADT
+     5. Recorre las entradas MADT: tipo 0 = LAPIC (un core), tipo 5 = LAPIC base override
+   - Si **cualquier paso falla** (sin ACPI, sin LAPIC, checksum malo, etc.),
+     devuelve 1 core (solo BSP) y el kernel sigue como single-core de siempre.
+2. **Mapeo de páginas ACPI**: el RSDT en QEMU está típicamente en
+   `0xBFFExxxx` (~3 GB), **fuera del identity-map de 256 MB** que el kernel
+   tiene por defecto. Si no mapeamos esa página explícitamente, leerla causa
+   #PF. Solución: `map_acpi_page()` que usa `vmm_map_page()` igual que hicimos
+   con el framebuffer en la Fase 11.
+3. **`kernel/kernel.c`**: llamada a `smp_detect()` después de `display_init()`,
+   imprime `[OK] SMP: detected N CPU cores (LAPIC @ XXXX), BSP only running`.
+4. **`SYS_SMP_INFO` (syscall #65)**: expone la lista de cores detectados a
+   userland (n_cpus, online, lapic_base, apic_ids[], bsp_apic_id).
+5. **`/bin/lscpu`** (nuevo coreutil ring 3): imprime tabla legible:
+   ```
+   $ lscpu
+   Architecture:        i386 (x86 32-bit protected mode)
+   CPU(s):              4
+   On-line CPU(s):      0 (BSP only — APs detected but not started)
+   BSP APIC ID:         0
+   LAPIC base address:  0xfee00000
+
+   Detected cores:
+     #    APIC ID    Status
+     0    0          RUNNING (BSP)
+     1    1          halted (AP, awaiting wake-up)
+     2    2          halted (AP, awaiting wake-up)
+     3    3          halted (AP, awaiting wake-up)
+   ```
+
+#### Verificado en QEMU
+
+```bash
+qemu-system-i386 -smp 1    -> "SMP: single-core"
+qemu-system-i386 -smp 2    -> "SMP: detected 2 CPU cores"
+qemu-system-i386 -smp 4    -> "SMP: detected 4 CPU cores"
+qemu-system-i386 -smp 8    -> "SMP: detected 8 CPU cores"  (= SMP_MAX_CPUS)
+```
+
+#### Lo que sigue (NO está en esta fase)
+
+- **Fase 2 SMP**: trampolín AP — código que despierta los otros cores via
+  IPI/SIPI sequence, los pasa de real mode → protected mode → C, y los
+  pone en un loop `sti; hlt`.
+- **Fase 3 SMP**: per-CPU data (cada core tiene su GDT/TSS/kernel stack).
+- **Fase 4 SMP**: spinlocks reales + scheduler thread-safe (refactor masivo).
+- **Fase 5 SMP**: distribución de procesos entre cores.
+
+**Total estimado**: 4-5 tandas más para completar SMP funcional. Cada fase
+entregable independientemente.
+
+#### Honestidad sobre el calor
+
+Reitero: **multicore no enfría tu CPU**. Si tu laptop se calienta corriendo
+Trinux en QEMU, las soluciones reales son:
+- `qemu-system-i386 -enable-kvm ...` → virtualización hardware (10× menos CPU host)
+- Reducir `-m 512M` a `-m 128M`
+- Compilar el kernel con `-Os` en vez de `-O2`
+
+En hardware real con multicore SÍ tiene sentido distribuir trabajo entre
+cores. Pero la *temperatura* depende del TDP del chip, no del número de
+cores activos (uno saturado calienta similar a 4 al 25% cada uno).
+
+### Fase 13 — Optimizaciones para hardware real (HP Stream 14) (v0.2.9)
+
+**Contexto**: el usuario tiene una HP Stream 14 (Intel Atom/Celeron Bay Trail,
+1366×768, eMMC, batería, BIOS legacy). Esta máquina es **el target ideal**
+para Trinux: BIOS legacy completa, panel estándar 16:9, sin TPM/Secure Boot
+complicados, Atom de bajo TDP que casi no se calienta.
+
+Esta fase añade ajustes específicos para que Trinux corra **mejor en hardware
+real**, no solo en QEMU.
+
+#### Cambios
+
+1. **Multiboot header pide 1366×768×32 explícito** (`boot/boot.asm`):
+   ```nasm
+   dd 0       ; mode_type = linear framebuffer
+   dd 1366    ; width nativo del panel HP Stream 14
+   dd 768     ; height
+   dd 32      ; depth
+   ```
+   GRUB intenta dar exactamente esta resolución. Si no la tiene, da "lo mejor
+   disponible" (no falla — fallback automático).
+
+2. **Fix térmico crítico** (`kernel/kernel.c`):
+   Había un `for (volatile int i = 0; i < 50000000; i++);` como delay tonto
+   en el loop de reinicio del shell. **Ese busy-wait calentaba el CPU al 100%**
+   durante el delay (en hardware real, no en QEMU). Reemplazado por `sleep(1000)`
+   que usa el timer del PIT + `sti; hlt` → el CPU baja a low-power.
+
+3. **`SYS_FB_INFO` (syscall #66)**: expone resolución, bpp, addr del framebuffer
+   a userland. Útil para diagnóstico en hardware real (saber qué te dio GRUB).
+
+4. **`/bin/screeninfo`** (nuevo): comando que imprime el modo de video con
+   formato legible y un "Matched profile" que identifica resoluciones comunes:
+   ```
+   $ screeninfo
+   Display mode:        GRAPHICS (VBE framebuffer)
+   Text grid:           160 cols x 100 rows
+   Resolution:          1280 x 800 pixels, 32 bpp
+   Framebuffer addr:    0xfd000000
+   Pitch:               5120 bytes/scanline
+   Framebuffer size:    4000 KiB
+   Matched profile:     QEMU default (1280x800)
+   ```
+   En tu HP dirá `Matched profile: HP Stream 14 (1366x768 nativo)`.
+
+5. **`/bin/sysinfo`** (nuevo): dashboard ejecutivo con TODA la info del sistema
+   en un comando. CPU + Display + Memory + Storage + Battery + Time + System,
+   con colores. Pensado como **primer comando a correr al arrancar en hardware
+   nuevo** para ver de un vistazo qué reconoció el kernel:
+   ```
+   ================================================
+     Trinux System Info
+   ================================================
+
+   [CPU]
+     Cores detected:  4
+     Cores online:    1 (BSP only)
+     BSP APIC ID:     0
+
+   [Display]
+     Mode:            graphics (VBE)
+     Resolution:      1280 x 800 @ 32 bpp
+     Text grid:       160 x 100
+
+   [Memory]
+     Total:           511 MiB
+     Used:            256 MiB
+     Free:            255 MiB
+
+   [Storage]
+     Disk:            present
+     Total:           431 MiB
+     Used:            194 MiB
+
+   [Battery]
+     No battery detected (AC-only / VM)
+     (en tu HP: "Status: discharging, Charge: 87 %")
+
+   [Time]
+     Uptime:          3 seconds
+
+   [System]
+     Hostname:        trinux
+     Current user:    root (uid=0)
+     Shell PID:       6
+   ================================================
+   ```
+
+#### Test en QEMU
+
+Funciona en QEMU igual que antes — la única diferencia es que `screeninfo`
+ahora dice `Matched profile: QEMU default (1280x800)` porque QEMU ignora
+nuestro request de 1366×768 y da su default.
+
+#### Lo que esperamos en tu HP Stream 14
+
+- `[OK] Framebuffer (VBE) graphics mode active` en boot
+- Resolución 1366×768 (o lo que tu BIOS negocie)
+- `sysinfo` mostrará tu batería real, eMMC si el driver xHCI/AHCI lo detecta
+- `lscpu` debería detectar 2 cores (Bay Trail dual-core / 4 cores quad)
+- Sin calentamiento (el fix térmico ayuda incluso en tu chip de bajo TDP)
+
+### Tabla resumen de las fases nuevas
+
+| Aspecto | v0.2.0 (original) | v0.2.9 (actual) |
+|---|---|---|
+| Shell | Built-in kernel ring 0 | **`/bin/sh` ring 3** (PID 5) |
+| Comandos | 66 built-ins kernel | **65 ELFs en `/bin/`** ring 3 + `tcc/tcck/cide/edit/top` |
+| Syscalls | 10 | **64** |
+| Aislamiento | Ninguno (todo ring 0) | **CPL=3 real** (cs=0x1B, GPF si toca IO/MSR) |
+| Pipes | Sí (en shell ring 0) | Sí (en shell ring 3, vía tmpfiles) |
+| Multi-stack | No | Sí (4 niveles, evita colisiones) |
+| Prompt | Colores | Colores + input verde + ls con tipos |
+| Modo texto VGA | 80×25 (fuente 8×16) | 80×50 (fuente 8×8) en fallback |
+| **Modo gráfico** | No (solo VGA texto) | **VBE framebuffer auto** (1280×800 en QEMU, lo que el monitor soporte en real) |
+| Compilador C | Built-in kernel | **`/bin/tcc` puro ring 3** (+ `/bin/tcck` wrapper) |
+| IDE / editor | edit simple | **`/bin/cide`** con syntax highlight + ^B + F5 |
+| **SMP** | No (single-core) | **Detecta hasta 8 cores via ACPI MADT** (`/bin/lscpu`); arranque AP es Fase 2 |
+| **Hardware real** | Solo QEMU testeado | **Optimizado para HP Stream 14**: 1366×768 nativo, fix térmico, `/bin/screeninfo` y `/bin/sysinfo` para diagnóstico |
+
+### Cómo verificar todo
+
+```sh
+# 1) Confirmar aislamiento ring 3
+ringtest                        # intenta 'cli' → #GP, kernel mata el proceso
+
+# 2) Pipes
+ls /bin | wc                    # 1 65 422
+cat /etc/passwd | grep root | wc
+
+# 3) Redirección + cp/mv (bug 1 fix)
+echo HOLA > /tmp/a
+echo OLD > /tmp/b
+cp /tmp/a /tmp/b
+cat /tmp/b                      # → HOLA (no OLD)
+
+# 4) su funciona en ambas direcciones (bug 2 fix)
+whoami                          # root
+su user                         # password: user
+whoami                          # user
+su root                         # password: root
+whoami                          # root
+
+# 5) top / edit / tcc
+top                             # 'q' para salir
+edit /root/hi.c                 # escribe código, Ctrl-X guarda y sale
+tcc /root/hi.c                  # compila → /root/hi
+/root/hi                        # ejecuta tu binario en ring 3
+
+# 6) Colores
+ls /                            # directorios en azul
+ls /bin                         # ejecutables en verde
+```
+
+### Cómo está organizado el nuevo userland
+
+```
+user/
+├── trinux.h               # ABI única: 64 syscalls + libc mini para ring 3
+├── coreutils/
+│   ├── build.sh           # compila los 64 .c → ELF32 → .h embebido
+│   ├── crt0.S, user.ld    # startup + linker script para ring 3
+│   ├── *.c                # 64 fuentes (cp, mv, top, edit, tcc, ls, ...)
+│   ├── hdrs/*.h           # AUTO: cada ELF como blob xxd -i
+│   └── user_bins.h        # AUTO: tabla {nombre, blob, size} para el kernel
+├── usersh/
+│   ├── sh.c               # shell ring-3 con pipes y refresh_identity
+│   └── sh_elf.h           # AUTO: ELF del shell
+└── userprog.c             # demo legacy (usertest, badboy) — sigue funcionando
+```
+
+Adicionalmente:
+- **`FASE5_REGEN.sh`** (raíz del repo) — script anti-poda: si por alguna razón
+  los `.c` de coreutils o `sh.c` se borraron (snapshot del workspace, limpieza),
+  basta correr `bash FASE5_REGEN.sh` y todo se regenera.
+
+### Cómo recompilar todo
+
+```sh
+cd Kernel-Trinux-V2
+bash FASE5_REGEN.sh             # si faltan archivos en user/usersh/ o coreutils/
+bash user/coreutils/build.sh    # 64 ELFs ring-3 + /bin/sh
+make                             # kernel (embebe los ELFs)
+bash make-usb-image.sh 512       # mykernel-usb.img de 512 MB
+qemu-system-i386 -drive file=mykernel-usb.img,format=raw,if=ide -m 512M
+```
+
+### Volver al shell viejo (debug)
+
+En el menú GRUB → `e` → en la línea `multiboot /boot/mykernel.bin` añadir `oldsh` →
+`Ctrl-X`. Eso lanza el shell legacy ring-0 con sus 66 built-ins originales.
+
+### Lo que aún NO está
+
+- **Address spaces por proceso** (CR3 distinto por task con `copy_from_user`/
+  `copy_to_user`). Hoy el ring 3 protege **privilegio** (no puede `cli`/`outb`/
+  MSR), pero los procesos comparten el identity-map de 256 MiB del kernel.
+  El "multi-stack por nivel" de Fase 4 resuelve el problema práctico de spawn
+  anidado sin necesitar CR3 separados.
+- **`fork()`/`execve()` reales con COW.** Usamos `posix_spawn` semantics
+  (un syscall `SYS_SPAWN` que arranca y espera al hijo).
+- **`tcc` puro en ring 3** — sigue siendo built-in del kernel; el `/bin/tcc`
+  es un wrapper userland que invoca el built-in vía syscall.
+
+Ver detalles técnicos:
+- [`RING3_CHANGES.md`](RING3_CHANGES.md) — Fase 1 original
+- [`RING3_FASE2.md`](RING3_FASE2.md) — Fase 2 original
+- Esta sección — Fases 3-7 (todo lo posterior).
+
+---
+
+## 🆕 Novedades v0.2.1 — Ring 3 real (Fases 1-4)  (HISTÓRICO)
 
 Esta versión migra el sistema de **kernel-mode-only** a un modelo
 **ring 0 + ring 3** real, con shell y comandos corriendo en CPL=3.

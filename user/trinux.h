@@ -97,6 +97,31 @@ typedef int            int32_t;
 #define SYS_VFS_FIND  58  /* ebx=&find_req_t -> n (recursive name search)      */
 #define SYS_VFS_TREE  59  /* ebx=&tree_req_t -> 0 (imprime árbol via SYS_WRITE)*/
 #define SYS_RESOLVE   60  /* ebx=path, ecx=out_buf, edx=max -> length          */
+#define SYS_KEY_POLL  61  /* tecla pendiente o -1 si no hay                    */
+#define SYS_VGA_GOTO  62  /* ebx=x ecx=y -> mover cursor sin imprimir          */
+#define SYS_VGA_CLEAR 63  /* limpia pantalla (alias estable de SYS_CLEAR)      */
+#define SYS_TCC_COMPILE 64 /* ebx=src_path -> 0/-1 (built-in tcc del kernel)   */
+#define SYS_SMP_INFO  65   /* ebx=&smp_info_t -> 0/-1                          */
+#define SYS_FB_INFO   66   /* ebx=&fb_info_t -> 0/-1 (1 si modo grafico)       */
+
+typedef struct {
+    int  n_cpus;             /* cuantos cores detecto el kernel */
+    int  online;             /* cuantos estan corriendo (hoy siempre = 1, BSP) */
+    uint32_t lapic_base;     /* direccion fisica del LAPIC */
+    uint8_t  apic_ids[8];    /* APIC ID de cada core */
+    uint8_t  bsp_apic_id;
+} smp_info_t;
+
+typedef struct {
+    int      active;          /* 1 = modo grafico, 0 = modo texto VGA */
+    uint32_t fb_addr;         /* direccion fisica del framebuffer (0 si texto) */
+    uint32_t pitch;           /* bytes por scanline */
+    int      width;           /* pixels (0 si texto, e.g. 80 cells = 0) */
+    int      height;          /* pixels */
+    int      bpp;             /* bits por pixel: 32 tipicamente */
+    int      text_cols;       /* columnas de texto efectivas */
+    int      text_rows;       /* filas de texto efectivas */
+} fb_info_t;
 
 #define SPAWN_F_WAIT      0x01    /* esperar a que el hijo termine             */
 #define SPAWN_F_BACKGROUND 0x02   /* lanzar en background                      */
@@ -347,6 +372,12 @@ static inline int tree_(tree_req_t *r){ return _syscall1(SYS_VFS_TREE, (int)r); 
 static inline int resolve_(const char *path, char *out, int max){
     return _syscall3(SYS_RESOLVE, (int)path, (int)out, max);
 }
+static inline int key_poll(void){ return _syscall0(SYS_KEY_POLL); }
+static inline void vga_goto(int x, int y){ _syscall2(SYS_VGA_GOTO, x, y); }
+static inline void vga_clear_(void){ _syscall0(SYS_VGA_CLEAR); }
+static inline int tcc_compile(const char *src){ return _syscall1(SYS_TCC_COMPILE, (int)src); }
+static inline int smp_info(smp_info_t *out){ return _syscall1(SYS_SMP_INFO, (int)out); }
+static inline int fb_info(fb_info_t *out){ return _syscall1(SYS_FB_INFO, (int)out); }
 
 /* ============================================================================
  *  Helpers de string puramente ring-3 (no son syscalls)

@@ -24,7 +24,7 @@ enum vga_color {
 };
 
 #define VGA_WIDTH  80
-#define VGA_HEIGHT 25
+#define VGA_HEIGHT 50    /* 80x50 con fuente 8x8 (antes 25 con 8x16) */
 
 static inline uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg)
 {
@@ -33,6 +33,15 @@ static inline uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg)
 
 void vga_init(void);
 void vga_clear(void);
+/* Cambia a modo texto 80x50 (fuente 8x8). Se llama desde vga_init(). */
+void vga_set_8x8_mode(void);
+
+/* Cambia al backend de framebuffer (VBE) si GRUB nos dio uno.
+ * Si no esta disponible, sigue usando VGA text. Devuelve true si conmuto. */
+bool display_init(uint32_t mb_magic, uint32_t mb_info_addr);
+bool display_using_fb(void);
+int  display_text_cols(void);
+int  display_text_rows(void);
 void vga_putchar(char c);
 void vga_print(const char *str);
 void vga_print_color(const char *str, uint8_t color);

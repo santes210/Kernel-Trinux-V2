@@ -19,6 +19,7 @@
 #include "../fs/blockfs.h"
 #include "../drivers/rtc.h"
 #include "../drivers/acpi_ec.h"
+#include "../shell/tcc.h"
 
 extern void syscall_stub(void);
 extern void enter_usermode(uint32_t entry, uint32_t user_stack);
@@ -857,6 +858,121 @@ void syscall_handler(registers_t *regs)
         int i = 0; while (tmp[i] && i < max-1){ out[i]=tmp[i]; i++; }
         out[i] = 0;
         regs->eax = (uint32_t)i;
+        break;
+    }
+
+    /* ---- ABI extra para top/edit/tcc (Fase 5) ---- */
+    case SYS_KEY_POLL: {
+        int k = keyboard_try_getchar();
+        if (k >= 0) {
+            switch (k) {
+                case KEY_UP:    k = KEY_F_UP;    break;
+                case KEY_DOWN:  k = KEY_F_DOWN;  break;
+                case KEY_LEFT:  k = KEY_F_LEFT;  break;
+                case KEY_RIGHT: k = KEY_F_RIGHT; break;
+                case KEY_HOME:  k = KEY_F_HOME;  break;
+                case KEY_END:   k = KEY_F_END;   break;
+                default: break;
+            }
+        }
+        regs->eax = (uint32_t)k;
+        break;
+    }
+
+    case SYS_VGA_GOTO: {
+        extern void vga_set_cursor(int x, int y);
+        vga_set_cursor((int)a1, (int)a2);
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_VGA_CLEAR: {
+        extern void vga_clear(void);
+        vga_clear();
+        extern void vga_set_cursor(int x, int y);
+        vga_set_cursor(0, 0);
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_TCC_COMPILE: {
+        const char *src = (const char *)a1;
+        if (!src) { regs->eax = (uint32_t)-1; break; }
+        /* Copia local del path porque puede vivir en memoria del shell
+         * que se respalda durante operaciones internas. */
+        static char k_src[128]; static char k_out[128];
+        int i = 0; while (src[i] && i < 127){ k_src[i] = src[i]; i++; } k_src[i] = 0;
+        /* derivar nombre de salida: quitar ".c" si existe */
+        int j = 0; while (k_src[j] && j < 127){ k_out[j] = k_src[j]; j++; } k_out[j] = 0;
+        if (j > 2 && k_out[j-2] == '.' && k_out[j-1] == 'c') k_out[j-2] = 0;
+        regs->eax = (uint32_t)tcc_compile(k_src, k_out);
+        break;
+    }
+
+    case SYS_SMP_INFO: {
+        extern int      smp_cpu_count(void);
+        extern uint32_t smp_lapic_base(void);
+        extern uint8_t  smp_bsp_apic_id(void);
+        /* Need a cpu accessor — declared in cpu/smp.h, ya hay extern arriba */
+        extern struct smp_cpu_t *smp_cpu_at(int i);
+        typedef struct {
+            uint8_t  apic_id;
+            uint8_t  acpi_id;
+            bool     enabled;
+            bool     online;
+        } smp_cpu_local_t;
+        extern smp_cpu_local_t *smp_cpu_at_raw(int i);
+
+        smp_info_t *out = (smp_info_t *)a1;
+        if (!out) { regs->eax = (uint32_t)-1; break; }
+        int n = smp_cpu_count();
+        out->n_cpus = n;
+        out->online = 1;  /* hoy solo el BSP corre */
+        out->lapic_base = smp_lapic_base();
+        out->bsp_apic_id = smp_bsp_apic_id();
+        for (int i = 0; i < n && i < 8; i++) {
+            /* smp_cpu_at devuelve smp_cpu_t*; usamos misma estructura */
+            extern uint8_t smp_get_apic_id_at(int i);
+            out->apic_ids[i] = smp_get_apic_id_at(i);
+        }
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_FB_INFO: {
+        /* Devuelve info del display activo: framebuffer si modo grafico,
+         * texto VGA si fallback. Util para diagnostico en hardware real. */
+        extern bool display_using_fb(void);
+        extern int  display_text_cols(void);
+        extern int  display_text_rows(void);
+        extern int  fb_pixel_width(void);
+        extern int  fb_pixel_height(void);
+        /* Para acceder a addr/pitch/bpp tendríamos que exponerlos desde fb.c.
+         * Lo hacemos via funciones helper. */
+        extern uint32_t fb_get_addr(void);
+        extern uint32_t fb_get_pitch(void);
+        extern int      fb_get_bpp(void);
+
+        fb_info_t *out = (fb_info_t *)a1;
+        if (!out) { regs->eax = (uint32_t)-1; break; }
+        if (display_using_fb()) {
+            out->active   = 1;
+            out->fb_addr  = fb_get_addr();
+            out->pitch    = fb_get_pitch();
+            out->width    = fb_pixel_width();
+            out->height   = fb_pixel_height();
+            out->bpp      = fb_get_bpp();
+        } else {
+            out->active   = 0;
+            out->fb_addr  = 0;
+            out->pitch    = 0;
+            out->width    = 0;
+            out->height   = 0;
+            out->bpp      = 0;
+        }
+        out->text_cols = display_text_cols();
+        out->text_rows = display_text_rows();
+        regs->eax = 0;
         break;
     }
 

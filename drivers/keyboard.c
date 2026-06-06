@@ -255,6 +255,9 @@ int keyboard_getchar(void)
     return key;
 }
 
+/* Public: non-blocking variant. Returns -1 if no key is queued. */
+int keyboard_try_getchar(void) { return buf_pop(); }
+
 int keyboard_readline(char *buffer, int max_len)
 {
     int len = 0;

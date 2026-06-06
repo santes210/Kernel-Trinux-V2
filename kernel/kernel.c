@@ -175,6 +175,29 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     pmm_init(total_mem);     ok("Physical memory manager");
     vmm_init();              ok("Paging enabled (identity map 256 MiB)");
 
+    /* Modo grafico (VBE/framebuffer) si GRUB lo ofrece. Necesita vmm
+     * para mapear el framebuffer que esta en addr alta (> 256 MB). */
+    if (display_init(magic, mb_info_addr)) {
+        ok("Framebuffer (VBE) graphics mode active");
+    } else {
+        ok("Text mode VGA (no framebuffer offered by bootloader)");
+    }
+
+    /* SMP detection (Fase 1: solo lista cores, no los arranca).
+     * Si la deteccion ACPI MADT falla, devuelve 1 (solo BSP). */
+    {
+        extern int  smp_detect(void);
+        extern int  smp_cpu_count(void);
+        extern uint32_t smp_lapic_base(void);
+        int n = smp_detect();
+        if (n > 1) {
+            kprintf("  [ OK ] SMP: detected %d CPU cores (LAPIC @ %x), BSP only running\n",
+                    n, smp_lapic_base());
+        } else {
+            ok("SMP: single-core (no ACPI MADT or only 1 CPU)");
+        }
+    }
+
     /* Devices */
     timer_init(100);         ok("PIT timer @ 100 Hz");
     keyboard_init();         ok("PS/2 keyboard (US QWERTY)");
@@ -292,7 +315,11 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
         for (;;) {
             int rc = elf_exec("/bin/sh", vfs_get_root());
             kprintf("\n  [init] /bin/sh exited with code %d, restarting in 1s...\n", rc);
-            for (volatile int i = 0; i < 50000000; i++);  /* delay tonto */
+            /* FIX TERMICO: usar sleep() basado en timer (sti+hlt) en vez de
+             * busy-loop que calentaba el CPU al 100% durante el delay.
+             * Importante en hardware real (HP Stream 14 etc), nulo en QEMU. */
+            extern void sleep(uint32_t ms);
+            sleep(1000);
         }
     }
 
