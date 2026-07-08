@@ -1,4 +1,5 @@
 #include "syscall.h"
+#include "uaccess.h"
 #include "idt.h"
 #include "../drivers/vga.h"
 #include "../drivers/serial.h"
@@ -20,6 +21,7 @@
 #include "../drivers/rtc.h"
 #include "../drivers/acpi_ec.h"
 #include "../shell/tcc.h"
+#include "../fs/pipe.h"
 
 extern void syscall_stub(void);
 extern void enter_usermode(uint32_t entry, uint32_t user_stack);
@@ -159,6 +161,8 @@ void syscall_handler(registers_t *regs)
     case SYS_WRITE: {
         const char *buf = (const char *)a2;
         uint32_t len = a3;
+        /* CAMBIO #2: validar puntero de usuario antes de leer */
+        if (len > 0 && !uaccess_ok(buf, len)) { regs->eax = (uint32_t)-14; break; }
         for (uint32_t i = 0; i < len; i++) {
             vga_putchar(buf[i]);  /* respeta vga_capture_begin internamente */
             /* Si vga capture está activa, no duplicamos al serial — el
@@ -193,6 +197,9 @@ void syscall_handler(registers_t *regs)
         const char *path  = (const char *)a1;
         uint8_t    *buf   = (uint8_t    *)a2;
         uint32_t    maxsz = a3;
+        /* CAMBIO #2: validar punteros de usuario */
+        if (uaccess_strnlen(path, 512) < 0) { regs->eax = (uint32_t)-14; break; }
+        if (maxsz > 0 && !uaccess_ok(buf, maxsz)) { regs->eax = (uint32_t)-14; break; }
         vfs_node_t *n = vfs_resolve(path, cwd_of_caller());
         if (!n || n->type != VFS_FILE) { regs->eax = (uint32_t)-1; break; }
         uint32_t want = n->size < maxsz ? n->size : maxsz;
@@ -204,6 +211,9 @@ void syscall_handler(registers_t *regs)
         const char *path = (const char *)a1;
         uint8_t    *buf  = (uint8_t    *)a2;
         uint32_t    len  = a3;
+        /* CAMBIO #2: validar punteros de usuario */
+        if (uaccess_strnlen(path, 512) < 0) { regs->eax = (uint32_t)-14; break; }
+        if (len > 0 && !uaccess_ok(buf, len)) { regs->eax = (uint32_t)-14; break; }
         vfs_node_t *n = vfs_create(path, cwd_of_caller());
         if (!n) { regs->eax = (uint32_t)-1; break; }
         n->size = 0;
@@ -225,6 +235,8 @@ void syscall_handler(registers_t *regs)
 
     case SYS_CHDIR: {
         const char *p = (const char *)a1;
+        /* CAMBIO #2: validar path de usuario */
+        if (uaccess_strnlen(p, 512) < 0) { regs->eax = (uint32_t)-1; break; }
         vfs_node_t *n = vfs_resolve(p, cwd_of_caller());
         if (!n || n->type != VFS_DIRECTORY) { regs->eax = (uint32_t)-1; break; }
         S()->cwd = n;
@@ -976,7 +988,23 @@ void syscall_handler(registers_t *regs)
         break;
     }
 
-    default:
+
+    /* ---- CAMBIO #3: pipes en memoria ---- */
+    case SYS_PIPE: {
+        /* ecx = puntero a int[2] donde se escriben los fds */
+        int *fds = (int *)a2;
+        if (!uaccess_ok(fds, sizeof(int) * 2)) { regs->eax = (uint32_t)-14; break; }
+        regs->eax = (uint32_t)pipe_create(fds);
+        break;
+    }
+
+    case SYS_PIPE_CLOSE: {
+        pipe_close((int)a1);
+        regs->eax = 0;
+        break;
+    }
+
+        default:
         kprintf("\n[syscall] unknown syscall %u\n", num);
         regs->eax = (uint32_t)-1;
         break;

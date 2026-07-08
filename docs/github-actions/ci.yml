@@ -1,0 +1,43 @@
+name: Trinux — CI (compilación rápida en PRs)
+
+# Verifica que el kernel compila correctamente en cada Pull Request.
+# Más rápido que build.yml — solo compila, no genera ISO ni USB.
+
+on:
+  pull_request:
+    branches:
+      - master
+      - 'arena/**'
+
+permissions:
+  contents: read
+
+jobs:
+  compile-check:
+    name: 🔧 Verificar compilación
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📦 Instalar compilador y ensamblador
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-multilib nasm binutils
+          echo "gcc : $(gcc --version | head -1)"
+          echo "nasm: $(nasm --version | head -1)"
+          echo "ld  : $(ld --version | head -1)"
+
+      - name: ⚙️ Compilar (make clean && make)
+        run: |
+          make clean
+          make -j$(nproc)
+
+      - name: ✅ Verificar artefacto
+        run: |
+          ls -lh mykernel.bin
+          SIZE=$(stat -c%s mykernel.bin)
+          echo "Tamaño: $((SIZE/1024)) KiB"
+          [ "$SIZE" -gt 102400 ] && echo "✅ Kernel OK" || (echo "❌ Muy pequeño" && exit 1)

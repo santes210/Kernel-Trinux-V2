@@ -4,13 +4,18 @@
  * NOT hardware isolation. Everything still runs in ring 0; the kernel just
  * tracks who is logged in and enforces ownership/root checks in the shell/VFS.
  *
- * Password storage is plaintext on purpose: this is an educational kernel with
- * no real crypto. /etc/shadow holds `name:password` lines.
+ * CAMBIO #1 — Seguridad: contraseñas hasheadas con SHA-256.
+ * /etc/shadow guarda hashes SHA-256 de 64 chars hex en vez de texto plano.
+ * - Verificación en tiempo constante (anti timing-attack).
+ * - Migración automática: si el hash almacenado tiene < 64 chars se asume
+ *   legacy (texto plano) y se re-hashea en el primer login exitoso.
+ * - users_add() ya hashea la contraseña antes de guardarla.
  */
 #include "users.h"
 #include "../fs/vfs.h"
 #include "../lib/string.h"
 #include "../lib/printf.h"
+#include "../lib/sha256.h"
 
 static user_t users[MAX_USERS];
 static int    user_count;
@@ -53,6 +58,29 @@ static int split_fields(char *line, char sep, char **fields, int maxf)
     return n;
 }
 
+/* ---------- password hashing helpers ---------- */
+
+/* Hashea una contraseña en texto plano a hex SHA-256. */
+static void hash_password(const char *plain, char out[65])
+{
+    uint32_t len = (uint32_t)strlen(plain);
+    sha256_hex((const uint8_t *)plain, len, out);
+}
+
+/* Detecta si el string almacenado ya es un hash SHA-256 (64 hex chars). */
+static bool is_hashed(const char *stored)
+{
+    if (!stored) return false;
+    uint32_t n = (uint32_t)strlen(stored);
+    if (n != 64) return false;
+    for (uint32_t i = 0; i < 64; i++) {
+        char c = stored[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
 /* ---------- shadow (passwords) ---------- */
 
 /* Manual line walker (NOT strtok) so it is safe to call from inside another
@@ -66,7 +94,6 @@ static void shadow_get(const char *name, char *out, uint32_t cap)
 
     char *p = buf;
     while (*p) {
-        /* extract one line */
         char line[128];
         int i = 0;
         while (*p && *p != '\n' && i < (int)sizeof(line) - 1)
@@ -98,8 +125,6 @@ void users_load(void)
     if (read_file("/etc/passwd", buf, sizeof(buf)) < 0)
         return;
 
-    /* Manual line walker (NOT strtok): shadow_get() below calls into the VFS
-     * which itself uses strtok, so we must not rely on strtok state here. */
     char *p = buf;
     while (*p && user_count < MAX_USERS) {
         char line[256];
@@ -133,7 +158,7 @@ void users_load(void)
 void users_save(void)
 {
     char passwd[2048];
-    char shadow[1024];
+    char shadow[2048];   /* más espacio: hashes son 64 chars cada uno */
     passwd[0] = '\0';
     shadow[0] = '\0';
 
@@ -144,7 +169,8 @@ void users_save(void)
                        u->name, u->uid, u->gid, u->gecos, u->home, u->shell);
         strncat(passwd, line, sizeof(passwd) - strlen(passwd) - 1);
 
-        char sline[96];
+        /* shadow: nombre:hash_sha256 */
+        char sline[128];
         snprintf(sline, sizeof(sline), "%s:%s\n", u->name, u->password);
         strncat(shadow, sline, sizeof(shadow) - strlen(shadow) - 1);
     }
@@ -155,29 +181,35 @@ void users_save(void)
 
 void users_init(void)
 {
-    /* Seed /etc/passwd and /etc/shadow if missing or empty.
-     * This covers: fresh boot, corrupted disk image, empty files from
-     * a previous sync that went wrong, etc. */
+    /* Generar hashes de las contraseñas por defecto. */
+    char root_hash[65], user_hash[65];
+    hash_password("root", root_hash);
+    hash_password("user", user_hash);
+
     char buf[64];
     int r = read_file("/etc/passwd", buf, sizeof(buf));
     if (r <= 0 || buf[0] == '\0' || buf[0] == '\n') {
         write_file("/etc/passwd",
             "root:x:0:0:root:/root:/bin/sh\n"
             "user:x:1000:1000:Default User:/home/user:/bin/sh\n");
-        write_file("/etc/shadow",
-            "root:root\n"
-            "user:user\n");
+
+        /* Guardar hashes SHA-256, no texto plano */
+        char shadow_content[256];
+        snprintf(shadow_content, sizeof(shadow_content),
+                 "root:%s\nuser:%s\n", root_hash, user_hash);
+        write_file("/etc/shadow", shadow_content);
     }
 
-    /* Also check /etc/shadow separately — passwd can exist without shadow */
+    /* También verificar /etc/shadow por separado */
     r = read_file("/etc/shadow", buf, sizeof(buf));
     if (r <= 0 || buf[0] == '\0' || buf[0] == '\n') {
-        write_file("/etc/shadow",
-            "root:root\n"
-            "user:user\n");
+        char shadow_content[256];
+        snprintf(shadow_content, sizeof(shadow_content),
+                 "root:%s\nuser:%s\n", root_hash, user_hash);
+        write_file("/etc/shadow", shadow_content);
     }
 
-    /* ensure home directories exist */
+    /* Asegurar que los directorios home existen */
     if (!vfs_resolve("/root", vfs_get_root()))
         vfs_mkdir("/root", vfs_get_root());
     if (!vfs_resolve("/home/user", vfs_get_root())) {
@@ -188,20 +220,15 @@ void users_init(void)
 
     users_load();
 
-    /* Safety net: if after loading there's still no root or user account,
-     * force-create them. This handles the case where /etc/passwd existed
-     * on disk but contained garbage that users_load() couldn't parse. */
     if (!users_find("root"))
         users_add("root", "root", 0, 0, "/root");
     if (!users_find("user"))
         users_add("user", "user", 1000, 1000, "/home/user");
 
-    /* default session: the regular user */
     cur_user = users_find("user");
     if (!cur_user && user_count > 0)
         cur_user = &users[0];
 
-    /* let the VFS query who is logged in for permission checks */
     vfs_set_cred_provider(users_get_cred);
 }
 
@@ -213,7 +240,7 @@ vfs_cred_t users_get_cred(void)
         c.uid = cur_user->uid;
         c.gid = cur_user->gid;
     } else {
-        c.uid = 0;   /* pre-login: act as root */
+        c.uid = 0;
         c.gid = 0;
     }
     return c;
@@ -262,9 +289,14 @@ user_t *users_add(const char *name, const char *password,
     else
         snprintf(u->home, USER_HOME_MAX, "/home/%s", name);
     strncpy(u->shell, "/bin/sh", USER_HOME_MAX - 1);
-    strncpy(u->password, password ? password : "", USER_PASS_MAX - 1);
 
-    /* create the home directory and give it to the new user */
+    /* CAMBIO #1: hashear la contraseña antes de guardar */
+    if (password && *password) {
+        char hashed[65];
+        hash_password(password, hashed);
+        strncpy(u->password, hashed, USER_PASS_MAX - 1);
+    }
+
     if (!vfs_resolve(u->home, vfs_get_root()))
         vfs_mkdir(u->home, vfs_get_root());
     vfs_node_t *hd = vfs_resolve(u->home, vfs_get_root());
@@ -279,8 +311,16 @@ int users_set_password(const char *name, const char *password)
     user_t *u = users_find(name);
     if (!u)
         return -1;
-    strncpy(u->password, password ? password : "", USER_PASS_MAX - 1);
-    u->password[USER_PASS_MAX - 1] = '\0';
+
+    /* CAMBIO #1: siempre guardar hash, nunca texto plano */
+    if (password && *password) {
+        char hashed[65];
+        hash_password(password, hashed);
+        strncpy(u->password, hashed, USER_PASS_MAX - 1);
+        u->password[USER_PASS_MAX - 1] = '\0';
+    } else {
+        u->password[0] = '\0';  /* sin contraseña */
+    }
     users_save();
     return 0;
 }
@@ -290,9 +330,22 @@ int users_check_password(const char *name, const char *password)
     user_t *u = users_find(name);
     if (!u)
         return 0;
-    if (u->password[0] == '\0')   /* no password set */
+    if (u->password[0] == '\0')   /* sin contraseña configurada */
         return 1;
-    return strcmp(u->password, password ? password : "") == 0;
+
+    /* CAMBIO #1: usar sha256_verify (soporta legacy y hashes) */
+    bool ok = sha256_verify(password ? password : "", u->password);
+
+    /* Migración automática: si era legacy y el login fue exitoso,
+     * re-hashear y guardar para que futuras verificaciones usen SHA-256. */
+    if (ok && !is_hashed(u->password)) {
+        char hashed[65];
+        hash_password(password, hashed);
+        strncpy(u->password, hashed, USER_PASS_MAX - 1);
+        users_save();
+    }
+
+    return ok ? 1 : 0;
 }
 
 user_t *current_user(void)            { return cur_user; }

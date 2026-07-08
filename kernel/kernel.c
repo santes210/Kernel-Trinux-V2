@@ -135,11 +135,16 @@ static uint32_t detect_memory(uint32_t magic, uint32_t mb_addr)
 
 static void print_banner(uint32_t total_mem)
 {
+    /* CAMBIO #11: detectar soporte de 64 bits via CPUID */
+    extern int longmode_check(void);
+    int has64 = longmode_check();
+
     vga_set_color(vga_entry_color(VGA_LIGHT_CYAN, VGA_BLACK));
     kprintf("\n");
     kprintf("  =============================================\n");
     kprintf("   %s v%s  (%s)\n", KERNEL_NAME, KERNEL_VERSION, KERNEL_ARCH);
     kprintf("   %s\n", KERNEL_BUILD);
+    kprintf("   CPU 64-bit (Long Mode): %s\n", has64 ? "SUPPORTED" : "not available");
     kprintf("  =============================================\n");
     vga_set_color(vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK));
     kprintf("  Memory detected : %u KiB (%u MiB)\n",
@@ -183,19 +188,25 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
         ok("Text mode VGA (no framebuffer offered by bootloader)");
     }
 
-    /* SMP detection (Fase 1: solo lista cores, no los arranca).
-     * Si la deteccion ACPI MADT falla, devuelve 1 (solo BSP). */
+    /* CAMBIO #6: SMP — detección Y arranque de APs.
+     * Fase 1: detectar cores via ACPI MADT.
+     * Fase 2: arrancar los APs via LAPIC IPI (INIT + STARTUP). */
     {
         extern int  smp_detect(void);
         extern int  smp_cpu_count(void);
         extern uint32_t smp_lapic_base(void);
+        extern int  smp_boot_aps(void);
+        extern void pipe_init(void);
         int n = smp_detect();
         if (n > 1) {
-            kprintf("  [ OK ] SMP: detected %d CPU cores (LAPIC @ %x), BSP only running\n",
+            kprintf("  [ OK ] SMP: detected %d CPU cores (LAPIC @ %x)\n",
                     n, smp_lapic_base());
         } else {
             ok("SMP: single-core (no ACPI MADT or only 1 CPU)");
         }
+        /* Inicializar subsistema de pipes (CAMBIO #3) */
+        pipe_init();
+        ok("Pipe subsystem ready (in-memory ring buffers)");
     }
 
     /* Devices */

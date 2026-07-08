@@ -61,6 +61,40 @@ static int      cols, rows;      /* cells de texto */
 static int      cur_col, cur_row;
 static uint8_t  cur_color;       /* mismo formato VGA: (bg<<4)|fg */
 
+/* CAMBIO #10: double buffering.
+ * back_buf es donde pintamos. fb_present() copia back→front (phys FB).
+ * Esto elimina el parpadeo en scroll y reduce el tiempo de copia a
+ * un único memcpy de la región "sucia" (dirty_min_row..dirty_max_row). */
+static uint8_t *back_buf = NULL;    /* copia de trabajo en kheap */
+static uint32_t back_buf_size = 0;
+static int       dirty_min_row = 0;
+static int       dirty_max_row = 0;
+static bool      use_double_buf = false;
+
+/* Actualiza el framebuffer real desde el back buffer (solo filas sucias). */
+static void fb_present(void)
+{
+    if (!use_double_buf || !back_buf) return;
+    int y0 = dirty_min_row * CELL_H;
+    int y1 = (dirty_max_row + 1) * CELL_H;
+    if (y0 < 0) y0 = 0;
+    if (y1 > fb_height) y1 = fb_height;
+    for (int y = y0; y < y1; y++) {
+        uint8_t *dst = fb_ptr   + (uint32_t)y * fb_pitch;
+        uint8_t *src = back_buf + (uint32_t)y * fb_pitch;
+        for (uint32_t x = 0; x < (uint32_t)(fb_width * 4); x++)
+            dst[x] = src[x];
+    }
+    dirty_min_row = rows;
+    dirty_max_row = 0;
+}
+
+static void mark_dirty(int row)
+{
+    if (row < dirty_min_row) dirty_min_row = row;
+    if (row > dirty_max_row) dirty_max_row = row;
+}
+
 bool fb_is_active(void)    { return active; }
 int  fb_text_cols(void)    { return cols; }
 int  fb_text_rows(void)    { return rows; }
@@ -122,6 +156,17 @@ bool fb_init(uint32_t mb_magic, uint32_t mb_info_addr)
     cur_color = 0x07;  /* light_grey on black */
     active    = true;
 
+    /* CAMBIO #10: alocar back buffer para double buffering.
+     * Usamos pitch*height bytes. Si kmalloc falla, seguimos sin double buf. */
+    extern void *kmalloc(uint32_t size);
+    back_buf_size = fb_pitch * (uint32_t)fb_height;
+    back_buf      = (uint8_t *)kmalloc(back_buf_size);
+    if (back_buf) {
+        use_double_buf = true;
+        dirty_min_row  = 0;
+        dirty_max_row  = rows - 1;
+    }
+
     fb_clear();
     return true;
 }
@@ -158,9 +203,14 @@ static void blit_glyph(int cx, int cy, char c, uint8_t color)
     int px = cx * CELL_W;
     int py = cy * CELL_H;
 
+    mark_dirty(cy);   /* CAMBIO #10 */
     for (int row = 0; row < CELL_H; row++) {
         uint8_t bits = glyph[row];
-        uint32_t *line = (uint32_t *)(fb_ptr + (uint32_t)(py + row) * fb_pitch);
+        /* Escribir al back buffer si existe, si no, directo al FB */
+        uint8_t *target = use_double_buf
+                          ? back_buf + (uint32_t)(py + row) * fb_pitch
+                          : fb_ptr   + (uint32_t)(py + row) * fb_pitch;
+        uint32_t *line = (uint32_t *)target;
         for (int col = 0; col < CELL_W; col++) {
             line[px + col] = (bits & 0x80) ? fg_rgb : bg_rgb;
             bits <<= 1;
@@ -202,23 +252,28 @@ void fb_scroll(void)
 {
     if (cur_row < rows) return;
 
-    /* Subir todo el contenido una fila de cells (= CELL_H pixels). */
-    int shift = CELL_H;
+    /* CAMBIO #10: scroll opera sobre el back buffer para eliminar parpadeo.
+     * Si no hay back buffer, opera directamente sobre el framebuffer físico. */
+    int shift  = CELL_H;
     int copy_h = fb_height - shift;
-    /* memcpy de las lineas (skip top, dst=top, src=top+shift) */
+    uint8_t *canvas = use_double_buf ? back_buf : fb_ptr;
+
+    /* Mover filas hacia arriba */
     for (int y = 0; y < copy_h; y++) {
-        uint8_t *dst = fb_ptr + (uint32_t)y * fb_pitch;
-        uint8_t *src = fb_ptr + (uint32_t)(y + shift) * fb_pitch;
-        /* copia byte por byte; fb_pitch puede ser > width*4 (padding) */
+        uint8_t *dst = canvas + (uint32_t)y * fb_pitch;
+        uint8_t *src = canvas + (uint32_t)(y + shift) * fb_pitch;
         for (uint32_t i = 0; i < fb_pitch; i++) dst[i] = src[i];
     }
-    /* Limpiar la ultima fila de cells. */
+    /* Borrar la última fila de cells */
     uint8_t bg = (cur_color >> 4) & 0x0F;
     uint32_t rgb = vga_palette[bg];
     for (int y = copy_h; y < fb_height; y++) {
-        uint32_t *line = (uint32_t *)(fb_ptr + (uint32_t)y * fb_pitch);
+        uint32_t *line = (uint32_t *)(canvas + (uint32_t)y * fb_pitch);
         for (int x = 0; x < fb_width; x++) line[x] = rgb;
     }
+    /* Marcar todo como sucio para que fb_present() lo copie todo */
+    dirty_min_row = 0;
+    dirty_max_row = rows - 1;
     cur_row = rows - 1;
 }
 
@@ -249,4 +304,5 @@ void fb_putchar(char c)
         break;
     }
     fb_scroll();
+    fb_present();   /* CAMBIO #10: flush back→front */
 }
