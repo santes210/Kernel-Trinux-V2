@@ -200,14 +200,11 @@ void users_init(void)
         write_file("/etc/shadow", shadow_content);
     }
 
-    /* También verificar /etc/shadow por separado */
-    r = read_file("/etc/shadow", buf, sizeof(buf));
-    if (r <= 0 || buf[0] == '\0' || buf[0] == '\n') {
-        char shadow_content[256];
-        snprintf(shadow_content, sizeof(shadow_content),
-                 "root:%s\nuser:%s\n", root_hash, user_hash);
-        write_file("/etc/shadow", shadow_content);
-    }
+    /* Regenerar SIEMPRE shadow con hashes correctos */
+    char shadow_content[300];
+    snprintf(shadow_content, sizeof(shadow_content),
+             "root:%s\nuser:%s\n", root_hash, user_hash);
+    write_file("/etc/shadow", shadow_content);
 
     /* Asegurar que los directorios home existen */
     if (!vfs_resolve("/root", vfs_get_root()))
