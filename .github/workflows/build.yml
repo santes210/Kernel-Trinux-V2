@@ -1,2 +1,220 @@
-429: Too Many Requests
-For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service).
+name: Trinux Build and Release
+
+on:
+  push:
+    branches:
+      - master
+      - 'arena/**'
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      usb_size_mb:
+        description: 'Tamano de la imagen USB en MiB'
+        required: false
+        default: '512'
+      create_release:
+        description: 'Crear GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_BIN: mykernel.bin
+  ISO_FILE: trinux.iso
+  USB_IMG: trinux-usb-512.img
+
+jobs:
+  build:
+    name: Compilar y generar ISO y USB
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-multilib nasm binutils \
+            grub-pc-bin grub-efi-amd64-bin grub2-common \
+            xorriso mtools dosfstools file
+          gcc --version | head -1
+          nasm --version | head -1
+
+      - name: Calcular version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME}"
+          else
+            VER=$(git describe --tags --long --always 2>/dev/null || echo "v0.3.0-$(git rev-parse --short HEAD)")
+          fi
+          echo "version=${VER}" >> $GITHUB_OUTPUT
+          echo "Version: ${VER}"
+
+      - name: Compilar kernel
+        run: |
+          make clean
+          make -j$(nproc)
+          ls -lh ${{ env.KERNEL_BIN }}
+
+      - name: Verificar kernel
+        run: |
+          SIZE=$(stat -c%s ${{ env.KERNEL_BIN }})
+          echo "Tamano: $((SIZE/1024)) KiB"
+          [ "$SIZE" -gt 102400 ] || { echo "Kernel muy pequeno"; exit 1; }
+          echo "OK"
+
+      - name: Generar grub.cfg
+        run: |
+          mkdir -p iso/boot/grub
+          cp ${{ env.KERNEL_BIN }} iso/boot/${{ env.KERNEL_BIN }}
+          VER="${{ steps.version.outputs.version }}"
+          {
+            echo "set timeout=5"
+            echo "set default=0"
+            echo "set menu_color_normal=white/black"
+            echo "set menu_color_highlight=black/light-gray"
+            echo ""
+            echo "menuentry \"Trinux ${VER} - Arranque normal\" {"
+            echo "  multiboot /boot/mykernel.bin"
+            echo "  boot"
+            echo "}"
+            echo ""
+            echo "menuentry \"Trinux ${VER} - single-user (recovery)\" {"
+            echo "  multiboot /boot/mykernel.bin single"
+            echo "  boot"
+            echo "}"
+            echo ""
+            echo "menuentry \"Trinux ${VER} - ring-0 debug\" {"
+            echo "  multiboot /boot/mykernel.bin oldsh"
+            echo "  boot"
+            echo "}"
+          } > iso/boot/grub/grub.cfg
+          cat iso/boot/grub/grub.cfg
+
+      - name: Generar ISO GRUB
+        run: |
+          grub-mkrescue --output=${{ env.ISO_FILE }} iso 2>&1
+          ls -lh ${{ env.ISO_FILE }}
+
+      - name: Generar imagen USB de 512 MiB
+        run: |
+          USB_SIZE=${{ github.event.inputs.usb_size_mb || '512' }}
+          cp ${{ env.ISO_FILE }} ${{ env.USB_IMG }}
+          ISO_BYTES=$(stat -c%s ${{ env.ISO_FILE }})
+          TARGET=$(( USB_SIZE * 1024 * 1024 ))
+          if [ "$TARGET" -gt "$ISO_BYTES" ]; then
+            truncate -s "${TARGET}" ${{ env.USB_IMG }}
+          fi
+          FINAL=$(stat -c%s ${{ env.USB_IMG }})
+          echo "USB lista: $((FINAL/1024/1024)) MiB"
+          ls -lh ${{ env.USB_IMG }}
+
+      - name: Checksums SHA-256
+        run: |
+          sha256sum \
+            ${{ env.KERNEL_BIN }} \
+            ${{ env.ISO_FILE }} \
+            ${{ env.USB_IMG }} | tee checksums.txt
+
+      - name: Subir artefactos
+        uses: actions/upload-artifact@v4
+        with:
+          name: trinux-${{ steps.version.outputs.version }}
+          retention-days: 30
+          path: |
+            ${{ env.KERNEL_BIN }}
+            ${{ env.ISO_FILE }}
+            ${{ env.USB_IMG }}
+            checksums.txt
+
+      - name: Resumen
+        run: |
+          KB=$(( $(stat -c%s ${{ env.KERNEL_BIN }}) / 1024 ))
+          IM=$(( $(stat -c%s ${{ env.ISO_FILE }}) / 1024 / 1024 ))
+          UM=$(( $(stat -c%s ${{ env.USB_IMG }}) / 1024 / 1024 ))
+          {
+            echo "## Trinux ${{ steps.version.outputs.version }} - Build OK"
+            echo ""
+            echo "| Archivo | Tamano |"
+            echo "|---|---|"
+            echo "| mykernel.bin | ${KB} KiB |"
+            echo "| trinux.iso | ${IM} MiB |"
+            echo "| trinux-usb-512.img | ${UM} MiB |"
+            echo ""
+            echo "### SHA-256"
+            echo '```'
+            cat checksums.txt
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+  release:
+    name: Crear GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: >
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Descargar artefactos
+        uses: actions/download-artifact@v4
+        with:
+          pattern: trinux-*
+          merge-multiple: true
+          path: ./release-files
+
+      - name: Crear Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          name: Trinux ${{ needs.build.outputs.version }}
+          draft: false
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          generate_release_notes: true
+          body: |
+            ## Trinux ${{ needs.build.outputs.version }}
+
+            Sistema operativo Unix-like hecho desde cero en C y ensamblador x86.
+
+            ### Descargas
+
+            | Archivo | Descripcion |
+            |---|---|
+            | trinux-usb-512.img | Imagen USB 512 MiB - booteable BIOS y UEFI con persistencia |
+            | trinux.iso | ISO GRUB hibrida - BIOS y UEFI |
+            | mykernel.bin | Kernel ELF para QEMU -kernel |
+            | checksums.txt | SHA-256 de todos los archivos |
+
+            ### Usar en QEMU
+
+            ```bash
+            qemu-system-i386 -drive file=trinux-usb-512.img,format=raw,if=ide -m 512M -serial stdio
+            ```
+
+            ### Flashear a USB real
+
+            ```bash
+            sudo dd if=trinux-usb-512.img of=/dev/sdX bs=4M status=progress conv=fsync
+            ```
+
+            ### Credenciales: root/root y user/user
+
+          files: |
+            release-files/mykernel.bin
+            release-files/trinux.iso
+            release-files/trinux-usb-512.img
+            release-files/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
