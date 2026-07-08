@@ -33,10 +33,15 @@ LDFLAGS := $(LDARCH) -T linker.ld -nostdlib
 C_SOURCES := $(wildcard boot/*.c kernel/*.c drivers/*.c cpu/*.c mm/*.c \
                         fs/*.c process/*.c shell/*.c auth/*.c lib/*.c \
                         user/*.c)
+# CAMBIOS #1-#12: los nuevos .c ya los recoge el wildcard de arriba automáticamente.
+# (lib/sha256.c, fs/pipe.c, mm/fork.c, drivers/rtl8139.c, drivers/net.c,
+#  drivers/acpi_power.c, cpu/smp_boot.c)
 ASM_SOURCES := boot/boot.asm boot/kernel_entry.asm boot/gdt_flush.asm \
                cpu/idt_flush.asm cpu/isr_asm.asm cpu/irq_asm.asm \
                cpu/syscall_asm.asm cpu/elf_jmp.asm \
                process/switch.asm process/thread_exit.asm
+# longmode.asm es infraestructura 64-bit (no se enlaza en el build 32-bit actual)
+# ASM_SOURCES += boot/longmode.asm
 
 OBJS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.asm=.o)
 
