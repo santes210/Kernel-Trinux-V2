@@ -102,7 +102,9 @@ typedef int            int32_t;
 #define SYS_VGA_CLEAR 63  /* limpia pantalla (alias estable de SYS_CLEAR)      */
 #define SYS_TCC_COMPILE 64 /* ebx=src_path -> 0/-1 (built-in tcc del kernel)   */
 #define SYS_SMP_INFO  65   /* ebx=&smp_info_t -> 0/-1                          */
-#define SYS_FB_INFO   66   /* ebx=&fb_info_t -> 0/-1 (1 si modo grafico)       */
+#define SYS_FB_INFO   66
+#define SYS_PIPE      67
+#define SYS_PIPE_CLOSE 68
 
 typedef struct {
     int  n_cpus;             /* cuantos cores detecto el kernel */

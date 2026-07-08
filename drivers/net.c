@@ -329,7 +329,7 @@ int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
     ping_seq++;
     ping_reply_got = false;
 
-    uint8_t frame[64];
+    uint8_t frame[74];
     eth_t  *eth  = (eth_t  *)frame;
     ipv4_t *ip   = (ipv4_t *)(frame + 14);
     icmp_t *icmp = (icmp_t *)(frame + 34);

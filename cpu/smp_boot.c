@@ -124,7 +124,7 @@ extern void smp_ap_entry(void);
 #define TRAMP_PARAM_CR3    0xFE   /* 4 bytes — nota: 0x100 = 256 bytes total */
 
 /* Trampoline en real mode (16 bits). Los offsets asumen base 0x8000. */
-static const uint8_t trampoline_code[256] = {
+static const uint8_t trampoline_code[] = {
     /* 0x00: cli */
     0xFA,
     /* 0x01: lgdt [0x8000 + TRAMP_PARAM_GDT]
