@@ -1,0 +1,39 @@
+# ============================================================
+# Trinux — .gitignore
+# ============================================================
+
+# Binarios compilados (se regeneran con 'make')
+*.o
+*.bin
+*.iso
+*.img
+
+# Excepciones: los .o de ASM precompilados están en el repo
+# para compilar sin nasm en entornos de desarrollo local.
+# En CI se usa nasm directamente para compilar todo limpio.
+!boot/boot.o
+!boot/kernel_entry.o
+!boot/gdt_flush.o
+!cpu/idt_flush.o
+!cpu/isr_asm.o
+!cpu/irq_asm.o
+!cpu/syscall_asm.o
+!cpu/elf_jmp.o
+!process/switch.o
+!process/thread_exit.o
+
+# Directorio temporal de la ISO
+iso/
+
+# Imagen de disco de persistencia
+disk.img
+
+# Archivos temporales de editor
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Artefactos de CI
+checksums.txt
+trinux-usb-*.img
