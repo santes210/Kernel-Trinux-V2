@@ -3116,3 +3116,147 @@ Free:  896 MB (user space en identity-map)
 
 Nota: Los 1GB adicionales (>1GB) están detectados por el PMM pero requieren
 mapeo explícito vía `vmm_map_page()` para ser accesibles.
+
+---
+
+## 🚀 v0.5.1 - Address Spaces por Proceso (Aislamiento de Memoria Real)
+
+> **Resumen**: Cada proceso tiene ahora su propio page directory (CR3). Las páginas
+> del kernel (0–80 MB) están marcadas como **supervisor-only (U/S=0)**; las páginas
+> de usuario (80 MB–1 GB) son **user-accessible (U/S=1)**. El `context_switch()`
+> cambia `CR3` en cada cambio de contexto. Un proceso en ring 3 **ya no puede
+> leer/escribir memoria del kernel** aunque conozca la dirección virtual.
+
+### 🛡️ Qué cambia
+
+| Antes (v0.5.0) | Ahora (v0.5.1) |
+|---|---|
+| Un solo page directory global | **Page directory por proceso** (`p->page_dir`) |
+| Todas las páginas con `PAGE_USER` | **Kernel (0–0x05000000): U/S=0** · **User (≥0x05000000): U/S=1** |
+| `context_switch()` solo guarda/rest. regs | **`context_switch()` también hace `mov cr3, new_pd`** |
+| ELF se carga en address space global | **ELF se mapea en el page directory del proceso** vía `vmm_map_page_in()` |
+| `fork()` copia address space sin COW | **`fork()` duplica page directory** (full-copy por ahora) |
+| `brk()` usa placeholder | **`SYS_BRK` mapea páginas en el address space del proceso** |
+
+### 🔧 Detalles técnicos
+
+#### Límite Kernel/User (`KERNEL_END_VIRT = 0x05000000 = 80 MiB`)
+
+```
+0x00000000 – 0x00100000:  BIOS/IVT/VGA                [KERNEL, U/S=0]
+0x00100000 – ~0x03000000: Kernel code + data (~32 MB) [KERNEL, U/S=0]
+~0x03000000 – ~0x05000000: Kernel heap (32 MB)       [KERNEL, U/S=0]
+0x05000000 – 0x40000000:  User space (944 MB)         [USER,   U/S=1]
+```
+
+- **Page tables 0–19** (0–80 MB): `PAGE_USER` **NO** puesto → supervisor-only
+- **Page tables 20–255** (80 MB–1 GB): `PAGE_USER` **SÍ** puesto → user-accessible
+
+#### `vmm_create_address_space()` — shallow copy con split kernel/user
+
+```c
+uint32_t vmm_create_address_space(void) {
+    uint32_t pd_phys = pmm_alloc_frame();
+    uint32_t* pd = (uint32_t*)pd_phys;
+    for (int i = 0; i < 1024; i++) {
+        if (i < IDENTITY_TABLES) {
+            if (i < KERNEL_END_TABLE)   // 0-19: kernel
+                pd[i] = page_directory[i] & ~PAGE_USER;  // strip USER bit
+            else                        // 20+: user
+                pd[i] = page_directory[i];               // keep USER bit
+        } else {
+            pd[i] = 0;
+        }
+    }
+    return pd_phys;
+}
+```
+
+#### `context_switch()` — CR3 switch
+
+```asm
+; process/switch.asm
+context_switch:
+    ; ... save old context ...
+    test ecx, ecx          ; ecx = new_page_dir
+    jz .no_cr3_switch
+    mov cr3, ecx           ; <-- CAMBIO DE ADDRESS SPACE AQUÍ
+.no_cr3_switch:
+    ; ... load new context ...
+    ret
+```
+
+#### `elf_exec_argv_inner()` — carga ELF en address space del proceso
+
+```c
+if (proc && proc->page_dir) {
+    for (uint32_t pg = vaddr & ~0xFFF; pg < vaddr + memsz; pg += 0x1000) {
+        uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
+        vmm_map_page_in(proc->page_dir, pg, pg, flags);
+    }
+}
+```
+
+#### `SYS_BRK` (syscall #72) — heap userland por proceso
+
+```c
+case SYS_BRK:
+    if (new_brk >= KERNEL_END_VIRT && new_brk < 0x40000000) {
+        for (uint32_t pg = (old_brk & ~0xFFF); pg < end_pg; pg += 0x1000)
+            vmm_map_page_in(p->page_dir, pg, pg, PAGE_PRESENT|PAGE_RW|PAGE_USER);
+        regs->eax = old_brk;
+    }
+```
+
+### ✅ Verificación del aislamiento
+
+```sh
+# 1. Compila un programa que intente leer memoria del kernel
+cat > /root/leak.c <<'EOF'
+int main() {
+    // 0x00100000 = inicio del kernel code (protegido U/S=0)
+    volatile int *kernel_mem = (int *)0x00100000;
+    int val = *kernel_mem;   // Debe causar PAGE FAULT (U/S violation)
+    print_num(val);
+    return 0;
+}
+EOF
+
+tcc /root/leak.c
+exec /root/leak
+# Resultado esperado:
+# *** PAGE FAULT en ring 3 (proceso X: leak) ***
+#   addr=00100000  protection read
+#   Terminando proceso con SIGSEGV (11)
+
+# 2. El kernel sigue vivo, shell responde
+root@trinux:~# ls /
+bin  dev  etc  home  root  tmp  var
+```
+
+### 📁 Archivos modificados
+
+| Archivo | Cambio principal |
+|---|---|
+| `mm/vmm.c` | `vmm_init()`: kernel pages (0–80 MB) sin `PAGE_USER`; `vmm_create_address_space()`: shallow copy con split kernel/user |
+| `mm/vmm.h` | Añadido `#define KERNEL_END_VIRT 0x05000000U` |
+| `process/process.c` | `process_create()`: llama `vmm_create_address_space()`; `process_exit()`: llama `vmm_free_address_space()` |
+| `process/switch.asm` | 3er argumento `new_page_dir`; `mov cr3, ecx` antes de cargar nuevo contexto |
+| `process/scheduler.c` | `schedule()`: pasa `p->page_dir` al `context_switch()` |
+| `kernel/elf.c` | `elf_exec_argv()`: crea proceso ANTES de cargar ELF; usa `vmm_map_page_in(proc->page_dir, ...)` para segmentos y stack |
+| `cpu/syscall.c` | Handler `SYS_BRK` (72): mapea páginas en `proc->page_dir` con `vmm_map_page_in()`; usa `KERNEL_END_VIRT` |
+| `user/trinux.h` | `#define SYS_BRK 72` + wrapper `brk_()` |
+
+### ⚠️ Limitaciones actuales
+
+1. **`fork()` hace full-copy** del page directory (no COW). Lento para procesos grandes.
+2. **No hay `execve()` real** — `SYS_SPAWN` sigue usando el mecanismo `setjmp/longjmp` + `elf_exec_argv()`.
+3. **`brk()` tracking por proceso** es placeholder (usa `0x08100000` fijo).
+4. **Kernel stacks** siguen en identity-map global (accesibles si se conoce la dirección, pero requieren `CR3` del kernel).
+
+### 🎯 Próximos pasos (Fase 2 del plan)
+
+1. **COW en `fork()`** — marcar páginas como copy-on-write (bit `PAGE_COW` personalizado o usar `PAGE_RW=0` + page fault handler).
+2. **`SYS_EXECVE`** — reemplazar address space del proceso actual en lugar de crear uno nuevo.
+3. **`brk` real por proceso** — campo `heap_brk` en `process_t`, actualizado por `SYS_BRK`.
+4. **Shell como proceso ring 3** — `kernel_main()` → `execve("/bin/mysh")`.

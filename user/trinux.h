@@ -108,6 +108,7 @@ typedef int            int32_t;
 #define SYS_FORK       69  /* -> pid del hijo al padre, 0 al hijo, -1 error    */
 #define SYS_GETPPID    70  /* -> ppid del proceso actual                       */
 #define SYS_SIGNAL     71  /* ebx=sig, ecx=handler -> old_handler              */
+#define SYS_BRK        72  /* ebx=new_brk -> old_brk (0 on error)              */
 
 /* Opciones para waitpid */
 #define WNOHANG        1   /* no bloquear si no hay hijos terminados           */
@@ -395,6 +396,7 @@ static inline int waitpid_(int pid, int *status, int opts){
     return _syscall3(SYS_WAITPID, pid, (int)status, opts);
 }
 static inline int getppid_(void){ return _syscall0(SYS_GETPPID); }
+static inline int brk_(void *addr){ return _syscall1(SYS_BRK, (int)addr); }
 
 /* signal(): registra un handler para una señal.
  * handler puede ser SIG_DFL (default), SIG_IGN (ignorar), o una función. */

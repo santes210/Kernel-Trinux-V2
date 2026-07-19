@@ -23,6 +23,7 @@
 #include "../shell/tcc.h"
 #include "../fs/pipe.h"
 #include "../mm/fork.h"
+#include "../mm/vmm.h"
 
 extern void syscall_stub(void);
 extern void enter_usermode(uint32_t entry, uint32_t user_stack);
@@ -163,7 +164,7 @@ void syscall_handler(registers_t *regs)
     uint32_t a3  = regs->edx;
 
     /* CRITICAL: Validate syscall number to prevent out-of-bounds dispatch */
-    if (num > 72) {
+    if (num > 73) {
         kprintf("[syscall] WARNING: invalid syscall number %u from pid %d\n",
                 num, process_get_current() ? process_get_current()->pid : 0);
         regs->eax = (uint32_t)-1;
@@ -1169,6 +1170,39 @@ void syscall_handler(registers_t *regs)
         void (*handler)(int) = (void (*)(int))a2;
         void (*old)(int) = process_sigaction(sig, handler);
         regs->eax = (uint32_t)old;
+        break;
+    }
+
+    case SYS_BRK: {
+        /* brk() - cambia el límite del heap del proceso.
+         * ebx = nueva dirección de break (0 = solo consultar actual)
+         * Retorna la dirección anterior de break, o 0 en error.
+         * El heap userland crece hacia arriba desde el final del BSS del ELF. */
+        process_t *p = process_get_current();
+        if (!p || !p->page_dir) {
+            regs->eax = 0;
+            break;
+        }
+        uint32_t new_brk = a1;
+        /* TODO: Implementar gestión real de heap por proceso.
+         * Por ahora, solo retornamos la dirección actual si new_brk == 0,
+         * o aceptamos el nuevo valor si está en rango válido (user space). */
+        if (new_brk == 0) {
+            /* Consultar break actual - por ahora usamos una heurística */
+            regs->eax = 0x08100000;  /* aprox. fin del área ELF típica */
+        } else if (new_brk >= KERNEL_END_VIRT && new_brk < 0x40000000) {
+            /* Rango válido de user space (dentro de 1 GiB identity-map, above kernel) */
+            /* Mapear las páginas necesarias en el address space del proceso */
+            uint32_t old_brk = 0x08100000;  /* placeholder */
+            uint32_t end_pg = ((new_brk + 0xFFF) & ~0xFFF);
+            for (uint32_t pg = (old_brk & ~0xFFF); pg < end_pg; pg += 0x1000) {
+                uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
+                vmm_map_page_in(p->page_dir, pg, pg, flags);
+            }
+            regs->eax = old_brk;
+        } else {
+            regs->eax = 0;  /* error */
+        }
         break;
     }
 
