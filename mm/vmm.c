@@ -1,8 +1,15 @@
 /* mm/vmm.c  -  virtual memory / paging.
  *
- * Sets up a page directory that identity-maps the first 256 MiB (kernel + heap),
+ * Sets up a page directory that identity-maps the first 1 GiB (kernel + heap + user space),
  * enables paging, and installs a page-fault handler. Uses statically allocated,
  * page-aligned tables to avoid bootstrap ordering issues.
+ *
+ * Memory layout:
+ *   0x00000000 - 0x00100000: BIOS/IVT/VGA (reserved, first 1 MiB)
+ *   0x00100000 - ~0x03000000: Kernel code + data (~32 MiB)
+ *   ~0x03000000 - ~0x05000000: Kernel heap (32 MiB)
+ *   0x05000000 - 0x40000000: Available for user processes (944 MiB)
+ *   Total identity-mapped: 1 GiB
  */
 #include "vmm.h"
 #include "../lib/string.h"
@@ -13,10 +20,10 @@
 
 #define PAGES_PER_TABLE 1024
 #define TABLES_PER_DIR  1024
-#define IDENTITY_TABLES 64              /* 64 tables * 4 MiB = 256 MiB */
+#define IDENTITY_TABLES 256             /* 256 tables * 4 MiB = 1024 MiB = 1 GiB */
 
 /* Extra page tables for on-demand MMIO mappings (AHCI ABAR, etc.).
- * These cover addresses above the 256 MiB identity-mapped region.
+ * These cover addresses above the 1 GiB identity-mapped region.
  * We keep a small pool of 8 tables — enough for mapping a handful of
  * MMIO regions without needing the heap or the PMM. */
 #define EXTRA_TABLES    8
