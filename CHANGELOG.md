@@ -5,6 +5,43 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [0.3.1] - 2026-01-18
+
+### 🍴 Fork real + waitpid + SIGPIPE
+
+#### `SYS_FORK` (69) — Creación de procesos
+- Nuevo syscall que crea un proceso hijo con copia del address space del padre
+- Usa la infraestructura existente de `process_fork()` en `mm/fork.c`
+- Devuelve el PID del hijo al padre, -1 en error
+- El hijo hereda `parent_pid`, `cwd`, y espacio de memoria copiado
+
+#### `SYS_GETPPID` (70) — Obtener PID del padre
+- Nuevo syscall que devuelve el PID del proceso padre
+- `parent_pid` trackeado en cada `process_create()`
+
+#### `SYS_WAITPID` (32) — Mejorado con blocking real
+- El stub no-op fue reemplazado con `process_waitpid()` real
+- Soporta `pid > 0` (esperar hijo específico) y `pid == -1` (cualquier hijo)
+- Opción `WNOHANG` para polling no-bloqueante
+- Bloquea con `schedule()` hasta que un hijo zombie esté disponible
+
+#### SIGPIPE (13) — Escritura a pipe roto
+- Cuando un proceso escribe a un pipe cuyo extremo de lectura está cerrado,
+  recibe `SIGPIPE` (señal 13) que lo termina con exit code 141 (128+13)
+- `SYS_FILE_WRITE` y `SYS_FILE_READ` ahora manejan fds de pipe correctamente
+- `SYS_FILE_CLOSE` ahora cierra extremos de pipe correctamente
+
+### Archivos modificados
+
+| Archivo | Cambio |
+|---|---|
+| `user/trinux.h` | +SYS_FORK (69), +SYS_GETPPID (70), +WNOHANG, +wrappers fork_/waitpid_/getppid_, +WIFEXITED/WEXITSTATUS/WIFSIGNALED/WTERMSIG |
+| `process/process.h` | +SIGPIPE (13), +parent_pid en process_t, +process_get_ppid(), +process_waitpid() |
+| `process/process.c` | +parent_pid tracking en process_create(), +process_get_ppid(), +process_waitpid() |
+| `cpu/syscall.c` | +SYS_FORK, +SYS_GETPPID handlers, +SIGPIPE en FILE_WRITE, +pipe_read en FILE_READ, +pipe_close en FILE_CLOSE, waitpid real |
+
+---
+
 ## [0.3.0] - 2026-01-18
 
 ### 🛡️ Seguridad

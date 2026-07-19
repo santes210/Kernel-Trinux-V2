@@ -22,6 +22,7 @@
 #include "../drivers/acpi_ec.h"
 #include "../shell/tcc.h"
 #include "../fs/pipe.h"
+#include "../mm/fork.h"
 
 extern void syscall_stub(void);
 extern void enter_usermode(uint32_t entry, uint32_t user_stack);
@@ -459,6 +460,14 @@ void syscall_handler(registers_t *regs)
             regs->eax = (uint32_t)keyboard_readline(b, len);
             break;
         }
+        /* Pipe read: check if fd is a pipe before checking kfds */
+        if (pipe_is_pipe(fd)) {
+            uint32_t len = a3;
+            if (!uaccess_ok((void *)a2, len)) { regs->eax = (uint32_t)-14; break; }
+            int got = pipe_read(fd, (void *)a2, len);
+            regs->eax = (uint32_t)got;
+            break;
+        }
         if (fd < 3 || fd >= FD_MAX || !kfds[fd].used) {
             regs->eax = (uint32_t)-1; break;
         }
@@ -486,6 +495,19 @@ void syscall_handler(registers_t *regs)
             regs->eax = len;
             break;
         }
+        /* Pipe write: check if fd is a pipe before checking kfds */
+        if (pipe_is_pipe(fd)) {
+            int wrote = pipe_write(fd, buf, len);
+            if (wrote < 0) {
+                /* Broken pipe: deliver SIGPIPE to current process */
+                process_t *p = process_get_current();
+                if (p) {
+                    p->signal_pending = SIGPIPE;
+                }
+            }
+            regs->eax = (uint32_t)wrote;
+            break;
+        }
         if (fd < 3 || fd >= FD_MAX || !kfds[fd].used) {
             regs->eax = (uint32_t)-1; break;
         }
@@ -498,7 +520,11 @@ void syscall_handler(registers_t *regs)
 
     case SYS_FILE_CLOSE: {
         int fd = (int)a1;
-        if (fd >= 3 && fd < FD_MAX) kfds[fd].used = 0;
+        if (pipe_is_pipe(fd)) {
+            pipe_close(fd);
+        } else if (fd >= 3 && fd < FD_MAX) {
+            kfds[fd].used = 0;
+        }
         regs->eax = 0;
         break;
     }
@@ -564,11 +590,15 @@ void syscall_handler(registers_t *regs)
     }
 
     case SYS_WAITPID: {
-        /* Como SPAWN ya espera, WAITPID es no-op. Devuelve el último exit_code
-         * en *(int*)a2 si lo dan. */
-        int *out = (int *)a2;
-        if (out) *out = 0;
-        regs->eax = 0;
+        /* waitpid real: bloquea hasta que un hijo termine */
+        int pid = (int)a1;
+        int *status = (int *)a2;
+        int options = (int)a3;
+        if (status && !uaccess_ok(status, sizeof(int))) {
+            regs->eax = (uint32_t)-14;
+            break;
+        }
+        regs->eax = (uint32_t)process_waitpid(pid, status, options);
         break;
     }
 
@@ -1075,6 +1105,19 @@ void syscall_handler(registers_t *regs)
     case SYS_PIPE_CLOSE: {
         pipe_close((int)a1);
         regs->eax = 0;
+        break;
+    }
+
+    /* ---- fork/getppid (v0.3.1) ---- */
+    case SYS_FORK: {
+        int child_pid = process_fork();
+        regs->eax = (uint32_t)child_pid;
+        break;
+    }
+
+    case SYS_GETPPID: {
+        process_t *p = process_get_current();
+        regs->eax = p ? p->parent_pid : 0;
         break;
     }
 

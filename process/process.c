@@ -128,6 +128,8 @@ process_t *process_create(const char *name, void (*entry)(void))
 
     memset(p, 0, sizeof(process_t));
     p->pid = next_pid++;
+    /* Track parent PID: current process is the parent (0 for init) */
+    p->parent_pid = current ? current->pid : 0;
     strncpy(p->name, name, PROC_NAME_MAX - 1);
     p->state = PROC_READY;
     p->entry = entry;
@@ -281,4 +283,60 @@ bool process_check_signal(void)
     p->state = PROC_ZOMBIE;
     p->exit_code = 128 + sig;
     return true;
+}
+
+/* ---- fork/waitpid (v0.3.1) ---- */
+
+uint32_t process_get_ppid(uint32_t pid)
+{
+    process_t *p = process_get(pid);
+    if (!p) return 0;
+    return p->parent_pid;
+}
+
+/* waitpid: bloquea al proceso actual hasta que un hijo termine.
+ *
+ * pid > 0:  espera a ese hijo específico
+ * pid == -1: espera a cualquier hijo
+ * options & WNOHANG: no bloquea si no hay hijos terminados
+ *
+ * Devuelve: PID del hijo terminado, 0 si WNOHANG y no hay, -1 error.
+ * *status recibe el exit_code del hijo.
+ */
+int process_waitpid(int pid, int *status, int options)
+{
+    process_t *me = process_get_current();
+    if (!me) return -1;
+
+    for (;;) {
+        /* Buscar un hijo zombie que matchee el criterio */
+        for (uint32_t i = 0; i < proc_count; i++) {
+            process_t *child = &processes[i];
+            if (child->parent_pid != me->pid) continue;
+            if (pid > 0 && child->pid != (uint32_t)pid) continue;
+            if (child->state == PROC_ZOMBIE) {
+                int child_pid = (int)child->pid;
+                if (status) *status = child->exit_code;
+                /* El slot será reciclado en el próximo process_create */
+                return child_pid;
+            }
+        }
+
+        /* Si WNOHANG y no encontramos zombie, retornar 0 */
+        if (options & 1) return 0;  /* WNOHANG */
+
+        /* Verificar si tenemos algún hijo vivo */
+        bool has_children = false;
+        for (uint32_t i = 0; i < proc_count; i++) {
+            if (processes[i].parent_pid == me->pid &&
+                processes[i].state != PROC_ZOMBIE) {
+                has_children = true;
+                break;
+            }
+        }
+        if (!has_children) return -1;  /* ECHILD */
+
+        /* Bloquear: yield y reintentar */
+        schedule();
+    }
 }

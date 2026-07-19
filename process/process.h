@@ -56,6 +56,9 @@ typedef struct process {
     /* ---- signals (v0.3) ---- */
     int           signal_pending; /* non-zero: signal number to deliver      */
     bool          signaled;       /* true if killed by signal (exit=128+sig) */
+
+    /* ---- fork/waitpid (v0.3.1) ---- */
+    uint32_t      parent_pid;     /* PID del proceso padre (0 si init)       */
 } process_t;
 
 void        process_init(void);
@@ -95,6 +98,7 @@ void        process_set_current(process_t *p);
 #define SIGINT    2    /* Ctrl-C */
 #define SIGQUIT   3
 #define SIGKILL   9    /* cannot be caught/ignored */
+#define SIGPIPE  13    /* write to broken pipe */
 #define SIGTERM  15
 
 /* Deliver a signal to a process. Currently the only action is to set
@@ -106,5 +110,14 @@ int         process_signal(uint32_t pid, int sig);
  * with exit code 128+signum. Called from syscall return path. Returns
  * true if a signal was delivered (caller should not return to usermode). */
 bool        process_check_signal(void);
+
+/* Get the parent PID of a process. Returns 0 if no parent (init). */
+uint32_t    process_get_ppid(uint32_t pid);
+
+/* Wait for a child process to exit. If pid > 0, wait for that specific
+ * child. If pid == -1, wait for any child. Returns the child PID and
+ * sets *status to the exit code. If WNOHANG is set and no child has
+ * exited, returns 0 immediately. Returns -1 if no children or error. */
+int         process_waitpid(int pid, int *status, int options);
 
 #endif /* PROCESS_PROCESS_H */

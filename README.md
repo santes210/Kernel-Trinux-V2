@@ -21,6 +21,53 @@ medio de almacenamiento accesible.
 
 ---
 
+## 🆕 Novedades v0.3.1 — Fork real, waitpid y SIGPIPE
+
+> **Resumen**: fork() real con address space copiado, waitpid() con blocking,
+> SIGPIPE para pipes rotos, y getppid(). La shell puede gestionar procesos
+> hijos de forma similar a un sistema Unix real.
+
+### 🍴 Fork real y waitpid
+
+**Antes**: no había manera de crear procesos hijos desde ring 3.
+**Ahora**: programas ring 3 pueden usar `fork_()`, `waitpid_()` y `getppid_()`:
+
+```c
+int pid = fork_();
+if (pid == 0) {
+    // código del hijo
+    exit(42);
+}
+// código del padre
+int status;
+waitpid_(pid, &status, 0);
+if (WIFEXITED(status))
+    print_num(WEXITSTATUS(status));  // imprime 42
+```
+
+### 🔌 SIGPIPE (señal 13)
+
+Escribir a un pipe cuyo extremo de lectura está cerrado entrega `SIGPIPE`,
+que termina el proceso con exit code 141 (128+13), igual que en Linux.
+
+### Nuevos syscalls (ABI 3.2)
+
+| # | Nombre | Descripción |
+|---|---|---|
+| 69 | `SYS_FORK` | Crea proceso hijo con address space copiado |
+| 70 | `SYS_GETPPID` | Devuelve PID del proceso padre |
+
+### Mejoras a syscalls existentes
+
+| # | Nombre | Cambio |
+|---|---|---|
+| 32 | `SYS_WAITPID` | Ahora bloquea hasta que un hijo termine (antes era no-op) |
+| 37 | `SYS_FILE_WRITE` | Maneja pipe fds + entrega SIGPIPE en broken pipe |
+| 36 | `SYS_FILE_READ` | Maneja pipe fds correctamente |
+| 38 | `SYS_FILE_CLOSE` | Cierra extremos de pipe correctamente |
+
+---
+
 ## 🆕 Novedades v0.3.0 — Seguridad, Señales y Mejoras
 
 > **Resumen**: validación completa de punteros en syscalls (seguridad), señales
@@ -2766,7 +2813,7 @@ git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feat
 |---|---|
 | **Líneas de código** | ~12,500 (C + ASM) |
 | **Comandos de shell** | 70+ |
-| **Syscalls** | 68 |
+| **Syscalls** | 71 |
 | **Drivers** | 11 (VGA, teclado, timer, RTC, serial, PCI, ATA, AHCI, xHCI, ACPI EC) |
 | **Sistemas de archivos** | 6 (VFS, RAMFS, DISKFS, BLOCKFS, DEVFS, FAT16) |
 | **Fases implementadas** | 18+ |
