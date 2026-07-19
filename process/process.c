@@ -168,9 +168,46 @@ void process_exit(int code)
         current->exit_code = code;
         current->state = PROC_ZOMBIE;
 
+        /* CRITICAL: Close all file descriptors owned by this process
+         * to prevent FD leaks that would exhaust the global fd table. */
+        extern void fd_cleanup_process(uint32_t pid);
+        fd_cleanup_process(current->pid);
+
+        /* CRITICAL: Reparent orphan children to init (PID 1).
+         * When a parent dies before its children, the children become
+         * orphans. In POSIX, init adopts them and reaps them when they die. */
+        for (uint32_t i = 0; i < proc_count; i++) {
+            if (processes[i].state != PROC_ZOMBIE &&
+                processes[i].parent_pid == current->pid &&
+                processes[i].pid != 1) {
+                processes[i].parent_pid = 1;  /* Adopt by init */
+            }
+        }
+
         /* Enviar SIGCHLD al padre (si existe y no es init) */
         if (current->parent_pid > 0) {
             process_signal(current->parent_pid, SIGCHLD);
+        }
+
+        /* CRITICAL: Auto-reap zombies if table is getting full.
+         * If >75% of process slots are zombies, reap orphaned zombies
+         * (those whose parent is also dead) to prevent table exhaustion. */
+        int zombie_count = 0;
+        for (uint32_t i = 0; i < proc_count; i++) {
+            if (processes[i].state == PROC_ZOMBIE) zombie_count++;
+        }
+        if (zombie_count > (int)(proc_count * 3 / 4) && proc_count > 8) {
+            for (uint32_t i = 0; i < proc_count; i++) {
+                if (processes[i].state == PROC_ZOMBIE && processes[i].pid > 3) {
+                    process_t *parent = process_get(processes[i].parent_pid);
+                    if (!parent || parent->state == PROC_ZOMBIE) {
+                        /* Parent is dead or doesn't exist, safe to reap.
+                         * We mark the name as empty so process_create can
+                         * reuse this slot (memset in process_create clears it). */
+                        processes[i].name[0] = '\0';
+                    }
+                }
+            }
         }
     }
 }

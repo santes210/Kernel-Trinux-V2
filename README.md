@@ -2956,3 +2956,81 @@ Por definir (sugerencia: MIT o GPL-2.0).
 *Trinux es un proyecto educativo escrito completamente desde cero.
 Si encuentras un bug o quieres añadir una feature, ¡los pull requests
 son bienvenidos!*
+
+## Mejoras Críticas de Estabilidad (v0.3.2+)
+
+### 1. Prevención de FD Leaks
+
+**Problema**: Cuando un proceso moría sin cerrar sus file descriptors, estos quedaban abiertos para siempre, eventualmente agotando la tabla global de FDs y bloqueando todo el sistema.
+
+**Solución**: 
+- Agregado campo `owner_pid` a la estructura `kfd_t` para rastrear qué proceso abrió cada FD
+- Función `fd_cleanup_process(pid)` cierra automáticamente todos los FDs del proceso al morir
+- Limpieza automática de pipes asociados al proceso
+
+**Archivos modificados**:
+- `cpu/syscall.c`: Estructura `kfd_t` con `owner_pid`, función `fd_cleanup_process()`
+- `process/process.c`: Llamada a `fd_cleanup_process()` en `process_exit()`
+
+### 2. Manejo de Procesos Huérfanos
+
+**Problema**: Si un proceso padre moría antes que sus hijos, estos quedaban huérfanos sin nadie que los esperara con `waitpid()`, causando acumulación de zombies.
+
+**Solución**:
+- Cuando un proceso muere, todos sus hijos son automáticamente adoptados por `init` (PID 1)
+- `init` se encarga de hacer `waitpid()` y limpiar los zombies
+
+**Archivos modificados**:
+- `process/process.c`: Reparenting automático en `process_exit()`
+
+### 3. Prevención de Acumulación de Zombies
+
+**Problema**: Si los padres nunca llamaban `waitpid()`, los procesos zombie se acumulaban hasta llenar la tabla de procesos (MAX_PROCESSES), bloqueando la creación de nuevos procesos.
+
+**Solución**:
+- Auto-reaping cuando la tabla de procesos está >75% llena
+- Limpieza automática de zombies huérfanos (cuyo padre también murió)
+- Logging de advertencia cuando se activa el auto-reaping
+
+**Archivos modificados**:
+- `process/process.c`: Lógica de auto-reaping en `process_exit()`
+
+### 4. Validación de Números de Syscall
+
+**Problema**: Un proceso malicioso o con bugs podía pasar números de syscall inválidos, causando comportamiento indefinido.
+
+**Solución**:
+- Validación de rango al inicio de `syscall_handler()`
+- Syscalls con número > 72 retornan -1 y logean advertencia
+- Previene dispatch a handlers inexistentes
+
+**Archivos modificados**:
+- `cpu/syscall.c`: Validación al inicio de `syscall_handler()`
+
+### 5. Mejoras en Page Fault Handler
+
+**Problema**: Un page fault en ring 3 (user mode) causaba kernel panic, reiniciando todo el sistema.
+
+**Solución**:
+- Page faults en ring 3 ahora envían SIGSEGV al proceso y lo terminan
+- El kernel continúa ejecutándose normalmente
+- Solo page faults en ring 0 (kernel) causan panic (bug real del kernel)
+
+**Archivos modificados**:
+- `mm/vmm.c`: `page_fault_handler()` distingue ring 0 vs ring 3
+- `mm/vmm.c`: Incluye `process/process.h` para acceder a `process_t`
+
+## Resumen de Robustez
+
+Con estas mejoras, Trinux ahora:
+
+✅ **No tiene FD leaks** - Los FDs se limpian automáticamente al morir el proceso  
+✅ **No acumula zombies** - Auto-reaping cuando la tabla se llena  
+✅ **Maneja huérfanos** - Los procesos sin padre son adoptados por init  
+✅ **Sobrevive crashes de usuario** - Page faults en ring 3 no matan el kernel  
+✅ **Valida syscalls** - Números inválidos no causan comportamiento indefinido  
+✅ **Señales POSIX completas** - 15 señales soportadas con handlers personalizables  
+✅ **Fork/waitpid funcional** - Procesos pueden crear y esperar hijos  
+✅ **Pipes seguros** - SIGPIPE en pipes rotos, limpieza automática  
+
+El sistema es ahora significativamente más robusto y puede manejar procesos maliciosos o con bugs sin colapsar.

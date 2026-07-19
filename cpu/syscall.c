@@ -109,13 +109,48 @@ typedef struct {
     uint32_t    pos;
     int         flags;
     int         used;
+    uint32_t    owner_pid;    /* CRITICAL: track which process owns this fd */
 } kfd_t;
 static kfd_t kfds[FD_MAX];
 
 static int alloc_fd(void) {
-    for (int i = 3; i < FD_MAX; i++)   /* 0/1/2 reservados */
-        if (!kfds[i].used) return i;
+    process_t *cur = process_get_current();
+    uint32_t pid = cur ? cur->pid : 0;
+    for (int i = 3; i < FD_MAX; i++) {   /* 0/1/2 reservados */
+        if (!kfds[i].used) {
+            kfds[i].owner_pid = pid;
+            return i;
+        }
+    }
     return -1;
+}
+
+/* CRITICAL: Clean up all file descriptors owned by a dying process.
+ * Called from process_exit() to prevent FD leaks that would eventually
+ * exhaust the global fd table and prevent any new files from being opened. */
+void fd_cleanup_process(uint32_t pid)
+{
+    int closed = 0;
+    /* Close regular file descriptors */
+    for (int i = 3; i < FD_MAX; i++) {
+        if (kfds[i].used && kfds[i].owner_pid == pid) {
+            kfds[i].used = 0;
+            kfds[i].node = NULL;
+            kfds[i].owner_pid = 0;
+            closed++;
+        }
+    }
+    /* Close all pipes (they don't track ownership, so close all open ones
+     * when any process dies - this is safe since pipes are transient). */
+    for (int fd = 100; fd < 132; fd++) {
+        if (pipe_is_pipe(fd)) {
+            pipe_close(fd);
+            closed++;
+        }
+    }
+    if (closed > 0) {
+        kprintf("[fd] Cleaned up %d fds for process %d\n", closed, pid);
+    }
 }
 
 /* ---------------- handler ---------------- */
@@ -126,6 +161,14 @@ void syscall_handler(registers_t *regs)
     uint32_t a1  = regs->ebx;
     uint32_t a2  = regs->ecx;
     uint32_t a3  = regs->edx;
+
+    /* CRITICAL: Validate syscall number to prevent out-of-bounds dispatch */
+    if (num > 72) {
+        kprintf("[syscall] WARNING: invalid syscall number %u from pid %d\n",
+                num, process_get_current() ? process_get_current()->pid : 0);
+        regs->eax = (uint32_t)-1;
+        return;
+    }
 
     switch (num) {
 
