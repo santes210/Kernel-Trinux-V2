@@ -9,6 +9,7 @@
 #include "../lib/printf.h"
 #include "../cpu/isr.h"
 #include "../include/kernel.h"
+#include "../process/process.h"
 
 #define PAGES_PER_TABLE 1024
 #define TABLES_PER_DIR  1024
@@ -55,13 +56,31 @@ static void page_fault_handler(registers_t *regs)
     bool write   = regs->err_code & 0x2;
     bool user    = regs->err_code & 0x4;
 
-    kprintf("\n*** PAGE FAULT ***\n");
+    /* Si el fault vino de ring 3 (user mode), matar el proceso en lugar de panic */
+    if (user) {
+        process_t *cur = process_get_current();
+        if (cur) {
+            kprintf("\n*** PAGE FAULT en ring 3 (proceso %d: %s) ***\n", 
+                    cur->pid, cur->name);
+            kprintf("  addr=%08x  %s %s\n", faulting_address,
+                    present ? "protection" : "not-present",
+                    write ? "write" : "read");
+            kprintf("  eip=%08x\n", regs->eip);
+            kprintf("  Terminando proceso con SIGSEGV (11)\n");
+            /* Enviar SIGSEGV al proceso */
+            process_signal(cur->pid, 11);  /* SIGSEGV = 11 */
+            return;  /* El syscall handler detectará la señal y matará el proceso */
+        }
+    }
+
+    /* Fault en ring 0 (kernel) = bug serio, panic */
+    kprintf("\n*** PAGE FAULT EN KERNEL ***\n");
     kprintf("  addr=%08x  %s %s %s\n", faulting_address,
             present ? "protection" : "not-present",
             write ? "write" : "read",
             user ? "user" : "kernel");
     kprintf("  eip=%08x\n", regs->eip);
-    panic("Page fault");
+    panic("Page fault en kernel");
 }
 
 void vmm_init(void)

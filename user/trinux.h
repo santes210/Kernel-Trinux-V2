@@ -103,6 +103,14 @@ typedef int            int32_t;
 #define SYS_TCC_COMPILE 64 /* ebx=src_path -> 0/-1 (built-in tcc del kernel)   */
 #define SYS_SMP_INFO  65   /* ebx=&smp_info_t -> 0/-1                          */
 #define SYS_FB_INFO   66   /* ebx=&fb_info_t -> 0/-1 (1 si modo grafico)       */
+#define SYS_PIPE       67  /* ecx=int[2] -> 0/-1 (crea pipe, devuelve 2 fds)   */
+#define SYS_PIPE_CLOSE 68  /* ebx=fd -> 0 (cierra un extremo del pipe)         */
+#define SYS_FORK       69  /* -> pid del hijo al padre, 0 al hijo, -1 error    */
+#define SYS_GETPPID    70  /* -> ppid del proceso actual                       */
+#define SYS_SIGNAL     71  /* ebx=sig, ecx=handler -> old_handler              */
+
+/* Opciones para waitpid */
+#define WNOHANG        1   /* no bloquear si no hay hijos terminados           */
 
 typedef struct {
     int  n_cpus;             /* cuantos cores detecto el kernel */
@@ -378,6 +386,30 @@ static inline void vga_clear_(void){ _syscall0(SYS_VGA_CLEAR); }
 static inline int tcc_compile(const char *src){ return _syscall1(SYS_TCC_COMPILE, (int)src); }
 static inline int smp_info(smp_info_t *out){ return _syscall1(SYS_SMP_INFO, (int)out); }
 static inline int fb_info(fb_info_t *out){ return _syscall1(SYS_FB_INFO, (int)out); }
+static inline int pipe_(int fds[2]){ return _syscall1(SYS_PIPE, (int)fds); }
+static inline int pipe_close_(int fd){ return _syscall1(SYS_PIPE_CLOSE, fd); }
+
+/* fork/waitpid/getppid (v0.3.1 — fork real) */
+static inline int fork_(void){ return _syscall0(SYS_FORK); }
+static inline int waitpid_(int pid, int *status, int opts){
+    return _syscall3(SYS_WAITPID, pid, (int)status, opts);
+}
+static inline int getppid_(void){ return _syscall0(SYS_GETPPID); }
+
+/* signal(): registra un handler para una señal.
+ * handler puede ser SIG_DFL (default), SIG_IGN (ignorar), o una función. */
+#define SIG_DFL_U  ((void (*)(int))0)
+#define SIG_IGN_U  ((void (*)(int))1)
+typedef void (*sighandler_t)(int);
+static inline sighandler_t signal_(int sig, sighandler_t handler){
+    return (sighandler_t)_syscall2(SYS_SIGNAL, sig, (int)handler);
+}
+
+/* Macros para waitpid */
+#define WIFEXITED(s)   (((s) & 0x7f) == 0)
+#define WEXITSTATUS(s) (((s) >> 8) & 0xff)
+#define WIFSIGNALED(s) (((s) & 0x7f) != 0)
+#define WTERMSIG(s)    ((s) & 0x7f)
 
 /* ============================================================================
  *  Helpers de string puramente ring-3 (no son syscalls)

@@ -38,4 +38,11 @@ void keyboard_reset_all(void);                     /* also clears caps_lock */
  * the serial-input driver so paste-into-COM1 works everywhere. */
 void keyboard_inject_char(int key);
 
+/* Stdin override: when set, keyboard_getchar() reads from this buffer instead
+ * of the keyboard. Used for stdin redirection (< file). The buffer is
+ * consumed character by character; when exhausted, reads fall back to the
+ * keyboard. Pass NULL to clear the override. */
+void keyboard_set_stdin_override(const char *buf, uint32_t len);
+void keyboard_clear_stdin_override(void);
+
 #endif /* DRIVERS_KEYBOARD_H */

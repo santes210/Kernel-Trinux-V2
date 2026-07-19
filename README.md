@@ -21,6 +21,326 @@ medio de almacenamiento accesible.
 
 ---
 
+## 🆕 Novedades v0.3.2 — Aislamiento de memoria avanzado y signal handlers
+
+> **Resumen**: page faults en ring 3 ahora matan el proceso en lugar de hacer
+> panic del kernel, signal handlers en userspace con `signal()`, SIGCHLD para
+> notificar al padre cuando un hijo termina, y más señales POSIX.
+
+### 🛡️ Aislamiento de memoria real
+
+**Antes**: un page fault en ring 3 causaba kernel panic y reiniciaba todo el sistema.
+**Ahora**: un page fault en ring 3 mata solo el proceso que lo causó con SIGSEGV.
+
+```sh
+root@trinux:~# ringtest
+[ringtest] Intentando acceder memoria inválida...
+
+*** PAGE FAULT en ring 3 (proceso 10: ringtest) ***
+  addr=deadbeef  not-present read
+  eip=080480d5
+  Terminando proceso con SIGSEGV (11)
+root@trinux:~#
+```
+
+El kernel continúa funcionando normalmente después de matar el proceso.
+
+### 🎯 Signal handlers en userspace
+
+Los procesos ahora pueden registrar handlers para capturar señales:
+
+```c
+#include "../trinux.h"
+
+void mi_handler(int sig) {
+    print("Recibí señal ");
+    print_num(sig);
+    print("\n");
+}
+
+void main() {
+    signal_(SIGINT, mi_handler);   /* Capturar Ctrl-C */
+    signal_(SIGTERM, SIG_IGN_U);   /* Ignorar SIGTERM */
+    
+    while (1) {
+        msleep(1000);
+        print("sigo vivo\n");
+    }
+}
+```
+
+**Syscall añadido**: `SYS_SIGNAL` (71) - registra handlers de señales
+
+### 👶 SIGCHLD - Notificación de hijos terminados
+
+Cuando un proceso hijo termina, el padre recibe automáticamente `SIGCHLD` (17).
+Esto permite implementar waitpid() no-bloqueante y limpieza de zombies:
+
+```c
+volatile int child_exited = 0;
+
+void sigchld_handler(int sig) {
+    child_exited = 1;
+}
+
+void main() {
+    signal_(SIGCHLD, sigchld_handler);
+    
+    int pid = fork_();
+    if (pid == 0) {
+        /* hijo */
+        exit(0);
+    }
+    
+    /* padre espera notificación */
+    while (!child_exited) {
+        msleep(100);
+    }
+    
+    int status;
+    waitpid_(pid, &status, 0);
+}
+```
+
+### 📋 Señales POSIX soportadas
+
+| Señal | Número | Descripción | Capturable |
+|-------|--------|-------------|------------|
+| SIGHUP | 1 | Hangup | ✅ |
+| SIGINT | 2 | Ctrl-C | ✅ |
+| SIGQUIT | 3 | Quit | ✅ |
+| SIGILL | 4 | Instrucción ilegal | ✅ |
+| SIGTRAP | 5 | Breakpoint | ✅ |
+| SIGABRT | 6 | Abort | ✅ |
+| SIGBUS | 7 | Bus error | ✅ |
+| SIGFPE | 8 | Excepción punto flotante | ✅ |
+| **SIGKILL** | **9** | **Kill (no capturable)** | ❌ |
+| SIGSEGV | 11 | Segmentation fault | ✅ |
+| SIGPIPE | 13 | Pipe roto | ✅ |
+| SIGALRM | 14 | Alarma | ✅ |
+| SIGTERM | 15 | Terminación | ✅ |
+| SIGCHLD | 17 | Hijo terminó | ✅ |
+
+### 🎮 API de signal handlers
+
+```c
+typedef void (*sighandler_t)(int);
+
+/* Registrar handler para señal */
+sighandler_t signal_(int sig, sighandler_t handler);
+
+/* Valores especiales de handler */
+#define SIG_DFL_U  ((sighandler_t)0)  /* Acción por defecto (terminar) */
+#define SIG_IGN_U  ((sighandler_t)1)  /* Ignorar señal */
+```
+
+### Archivos modificados
+
+| Archivo | Cambio |
+|---------|--------|
+| `mm/vmm.c` | Page fault handler distingue ring 0 vs ring 3, envía SIGSEGV |
+| `process/process.h` | +15 señales POSIX, +sig_handlers[_NSIG], +process_sigaction(), +process_deliver_signal() |
+| `process/process.c` | +process_sigaction(), +process_deliver_signal(), SIGCHLD en process_exit() |
+| `cpu/syscall.c` | +SYS_SIGNAL handler |
+| `user/trinux.h` | +SYS_SIGNAL (71), +signal_() wrapper, +SIG_DFL_U, +SIG_IGN_U |
+
+---
+
+## 🆕 Novedades v0.3.1 — Fork real, waitpid y SIGPIPE
+
+> **Resumen**: fork() real con address space copiado, waitpid() con blocking,
+> SIGPIPE para pipes rotos, y getppid(). La shell puede gestionar procesos
+> hijos de forma similar a un sistema Unix real.
+
+### 🍴 Fork real y waitpid
+
+**Antes**: no había manera de crear procesos hijos desde ring 3.
+**Ahora**: programas ring 3 pueden usar `fork_()`, `waitpid_()` y `getppid_()`:
+
+```c
+int pid = fork_();
+if (pid == 0) {
+    // código del hijo
+    exit(42);
+}
+// código del padre
+int status;
+waitpid_(pid, &status, 0);
+if (WIFEXITED(status))
+    print_num(WEXITSTATUS(status));  // imprime 42
+```
+
+### 🔌 SIGPIPE (señal 13)
+
+Escribir a un pipe cuyo extremo de lectura está cerrado entrega `SIGPIPE`,
+que termina el proceso con exit code 141 (128+13), igual que en Linux.
+
+### Nuevos syscalls (ABI 3.2)
+
+| # | Nombre | Descripción |
+|---|---|---|
+| 69 | `SYS_FORK` | Crea proceso hijo con address space copiado |
+| 70 | `SYS_GETPPID` | Devuelve PID del proceso padre |
+
+### Mejoras a syscalls existentes
+
+| # | Nombre | Cambio |
+|---|---|---|
+| 32 | `SYS_WAITPID` | Ahora bloquea hasta que un hijo termine (antes era no-op) |
+| 37 | `SYS_FILE_WRITE` | Maneja pipe fds + entrega SIGPIPE en broken pipe |
+| 36 | `SYS_FILE_READ` | Maneja pipe fds correctamente |
+| 38 | `SYS_FILE_CLOSE` | Cierra extremos de pipe correctamente |
+
+---
+
+## 🆕 Novedades v0.3.0 — Seguridad, Señales y Mejoras
+
+> **Resumen**: validación completa de punteros en syscalls (seguridad), señales
+> POSIX básicas (Ctrl-C / SIGTERM / SIGKILL), redirección de stdin (`<`),
+> y dos nuevos syscalls (PIPE / PIPE_CLOSE).
+
+### 🔒 Seguridad: Validación de punteros en syscalls (uaccess)
+
+**Problema**: muchos syscalls recibían punteros de ring 3 sin validar, lo que
+permitía a un programa malicioso hacer que el kernel leyera o escribiera
+en su propia memoria pasando punteros al espacio del kernel (ej. `0x00100000`).
+
+**Solución**: se añadió validación `uaccess_ok()` y `UCHECK_STR()` a **todos**
+los syscalls que reciben punteros de userland (~35 syscalls). Si un puntero
+apunta fuera del rango de usuario (`0x08000000`–`0x10000000`), el syscall
+retorna `-EFAULT (−14)` sin ejecutar la operación.
+
+| Syscall | Validación añadida |
+|---|---|
+| `SYS_GETLINE` | `uaccess_ok(buf, max)` |
+| `SYS_GETCWD` | `uaccess_ok(buf, max)` |
+| `SYS_HOSTNAME` | `uaccess_ok(buf, max)` |
+| `SYS_GETUSER` | `uaccess_ok(buf, max)` |
+| `SYS_MKDIR` | `UCHECK_STR(path)` |
+| `SYS_RMDIR` | `UCHECK_STR(path)` |
+| `SYS_UNLINK` | `UCHECK_STR(path)` |
+| `SYS_RENAME` | `UCHECK_STR(src)` + `UCHECK_STR(dst)` |
+| `SYS_OPENDIR` | `UCHECK_STR(path)` |
+| `SYS_READDIR` | `uaccess_ok(de, sizeof(dirent))` |
+| `SYS_STAT` | `UCHECK_STR(path)` + `uaccess_ok(st, sizeof(stat))` |
+| `SYS_FILE_OPEN` | `UCHECK_STR(path)` |
+| `SYS_FILE_READ` | `uaccess_ok(buf, len)` |
+| `SYS_FILE_WRITE` | `uaccess_ok(buf, len)` |
+| `SYS_SPAWN` | `UCHECK_STR(path)` |
+| `SYS_SPAWN_R` | `uaccess_ok(req, sizeof(spawn_req))` |
+| `SYS_LOGIN` | `UCHECK_STR(user)` + `UCHECK_STR(pass)` |
+| `SYS_SU` | `UCHECK_STR(user)` + `UCHECK_STR(pass)` |
+| `SYS_USERADD` | `uaccess_ok(req, sizeof(useradd_req))` |
+| `SYS_PASSWD` | `uaccess_ok(req, sizeof(passwd_req))` |
+| `SYS_LISTPROC` | `uaccess_ok(req, sizeof(plist_req))` |
+| `SYS_CHMOD` | `UCHECK_STR(path)` |
+| `SYS_CHOWN` | `UCHECK_STR(path)` |
+| `SYS_MEMINFO` | `uaccess_ok(m, sizeof(mem_info))` |
+| `SYS_DFINFO` | `uaccess_ok(d, sizeof(df_info))` |
+| `SYS_DATETIME` | `uaccess_ok(t, sizeof(datetime))` |
+| `SYS_USERLIST` | `uaccess_ok(r, sizeof(user_list_req))` |
+| `SYS_BATTERY` | `uaccess_ok(b, sizeof(battery))` |
+| `SYS_GETGROUPS` | `uaccess_ok(r, sizeof(groups_req))` |
+| `SYS_VFS_FIND` | `uaccess_ok(r, sizeof(find_req))` |
+| `SYS_VFS_TREE` | `uaccess_ok(r, sizeof(tree_req))` |
+| `SYS_RESOLVE` | `UCHECK_STR(path)` + `uaccess_ok(out, max)` |
+| `SYS_TCC_COMPILE` | `UCHECK_STR(src)` |
+| `SYS_SMP_INFO` | `uaccess_ok(out, sizeof(smp_info))` |
+| `SYS_FB_INFO` | `uaccess_ok(out, sizeof(fb_info))` |
+| `SYS_PIPE` | `uaccess_ok(fds, sizeof(int)*2)` |
+
+### 🛑 Señales POSIX básicas
+
+**Se añadió un sistema de señales** inspirado en POSIX:
+
+| Señal | Número | Descripción |
+|---|---|---|
+| `SIGHUP` | 1 | Hangup |
+| `SIGINT` | 2 | Interrupción (Ctrl-C) |
+| `SIGQUIT` | 3 | Quit |
+| `SIGKILL` | 9 | Kill (no capturable) |
+| `SIGTERM` | 15 | Terminación graceful |
+
+**Ctrl-C** ahora mata el proceso foreground:
+
+```sh
+root@trinux:~# sleep 100
+^C
+[sleep] killed by signal 2
+root@trinux:~#
+```
+
+**Implementación**:
+- `process_signal(pid, sig)` marca `signal_pending` en el proceso destino
+- El driver de teclado detecta Ctrl-C (char 3) en el IRQ handler y señala
+  al proceso foreground (PID > 3)
+- El syscall handler verifica `process_check_signal()` antes de retornar a
+  usermode; si hay señal pendiente, mata el proceso con exit code `128 + signo`
+- `kill PID SIGTERM` funciona correctamente
+- `kill PID 0` verifica si el proceso existe (sin señalar)
+
+**Archivos modificados**:
+- `process/process.h` — campos `signal_pending` y `signaled` en `process_t`
+- `process/process.c` — `process_signal()` y `process_check_signal()`
+- `drivers/keyboard.c` — intercepta Ctrl-C en el IRQ handler
+- `cpu/syscall.c` — `SYS_KILL` usa señales; check al final del handler
+
+### 📥 Redirección de stdin (`<`)
+
+**Antes**: la shell soportaba `>` y `>>` (stdout) pero no `<` (stdin).
+
+**Ahora**: puedes redirigir la entrada de un comando desde un archivo:
+
+```sh
+root@trinux:~# echo "hola mundo" > /tmp/test.txt
+root@trinux:~# cat < /tmp/test.txt
+hola mundo
+root@trinux:~# grep hola < /tmp/test.txt
+hola mundo
+```
+
+**Implementación**:
+- Tokenizer de la shell ahora reconoce `<` como operador
+- `run_one()` parsea `< archivo` y establece `spawn_req.stdin_path`
+- El kernel (`SYS_SPAWN_R`) lee el archivo de stdin en un buffer de 4 KiB
+  y activa `keyboard_set_stdin_override()` antes de ejecutar el programa
+- El driver de teclado (`keyboard_getchar`/`keyboard_try_getchar`) consume
+  del buffer override antes de leer del teclado real
+- Al terminar el spawn, se limpia el override con `keyboard_clear_stdin_override()`
+
+**Archivos modificados**:
+- `user/usersh/sh.c` — tokenizer + dispatch con `<`
+- `cpu/syscall.c` — `SYS_SPAWN_R` lee stdin y activa override
+- `drivers/keyboard.c` — `keyboard_set_stdin_override()`/`clear`
+- `drivers/keyboard.h` — API pública de override
+
+### 🔧 Nuevos syscalls (ABI 3.2)
+
+| # | Nombre | Descripción |
+|---|---|---|
+| 67 | `SYS_PIPE` | Crea un pipe en RAM, retorna 2 fds (lectura/escritura) |
+| 68 | `SYS_PIPE_CLOSE` | Cierra un extremo del pipe |
+
+Los pipes en RAM usan un ring buffer circular de 4 KiB (`fs/pipe.c`), soportan
+hasta 16 pipes simultáneos, y el escritor bloquea si el buffer está lleno
+(backpressure). El lector recibe EOF cuando el escritor cierra.
+
+### 📝 Resumen de archivos modificados en v0.3.0
+
+| Archivo | Cambio |
+|---|---|
+| `cpu/syscall.c` | +uaccess en 35 syscalls, +signal check, +stdin redirect en SPAWN_R, +SYS_PIPE/SYS_PIPE_CLOSE, SYS_KILL mejorado |
+| `cpu/uaccess.h` | Sin cambios (ya existía, ahora se usa exhaustivamente) |
+| `user/trinux.h` | +SYS_PIPE (67), +SYS_PIPE_CLOSE (68), +wrappers `pipe_()` y `pipe_close_()` |
+| `process/process.h` | +`signal_pending`, +`signaled` en `process_t`; +`SIGINT`/`SIGTERM`/`SIGKILL`; +`process_signal()`/`process_check_signal()` |
+| `process/process.c` | +implementación de `process_signal()` y `process_check_signal()` |
+| `drivers/keyboard.c` | +Ctrl-C señalización, +stdin override buffer |
+| `drivers/keyboard.h` | +`keyboard_set_stdin_override()`/`clear_stdin_override()` |
+| `user/usersh/sh.c` | +tokenizer para `<`, +dispatch con stdin redirection |
+| `user/usersh/sh_elf.h` | Regenerado con los cambios del shell |
+
+---
+
 ## 🆕 Novedades v0.2.x — Ring 3 real (Fases 1-7)
 
 > **Resumen ultra corto**: el shell y 64 comandos ahora corren en **ring 3 real** (CPL=3),
@@ -2598,13 +2918,17 @@ git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feat
 - [ ] Modo gráfico VBE (640×480+)
 - [ ] Soporte para más de 256 MiB de RAM
 - [ ] Filesystem real (ext2, FAT32)
-- [ ] SMP / multinúcleo
+- [ ] SMP / multinúcleo real (detección funciona, falta IPI + scheduler por-core)
 - [ ] CFS-like fair scheduling
 - [ ] NVMe support
 - [ ] USB keyboard/mouse (HID)
 - [ ] Mejorar TCC (más features C)
-- [ ] **Ring 3 real para ELFs** (ver plan Fase C1-C7)
+- [ ] **Address space por proceso** (infraestructura existe, falta wiring en elf_exec)
 - [ ] Tickless idle
+- [x] ~~Validación de punteros en syscalls~~ (v0.3.0)
+- [x] ~~Señales básicas (Ctrl-C / SIGTERM)~~ (v0.3.0)
+- [x] ~~Redirección stdin `<`~~ (v0.3.0)
+- [x] ~~Pipes en RAM~~ (v0.3.0)
 
 ---
 
@@ -2612,9 +2936,9 @@ git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feat
 
 | Métrica | Valor |
 |---|---|
-| **Líneas de código** | ~12,000 (C + ASM) |
+| **Líneas de código** | ~12,500 (C + ASM) |
 | **Comandos de shell** | 70+ |
-| **Syscalls** | 10 |
+| **Syscalls** | 72 |
 | **Drivers** | 11 (VGA, teclado, timer, RTC, serial, PCI, ATA, AHCI, xHCI, ACPI EC) |
 | **Sistemas de archivos** | 6 (VFS, RAMFS, DISKFS, BLOCKFS, DEVFS, FAT16) |
 | **Fases implementadas** | 18+ |
@@ -2632,3 +2956,81 @@ Por definir (sugerencia: MIT o GPL-2.0).
 *Trinux es un proyecto educativo escrito completamente desde cero.
 Si encuentras un bug o quieres añadir una feature, ¡los pull requests
 son bienvenidos!*
+
+## Mejoras Críticas de Estabilidad (v0.3.2+)
+
+### 1. Prevención de FD Leaks
+
+**Problema**: Cuando un proceso moría sin cerrar sus file descriptors, estos quedaban abiertos para siempre, eventualmente agotando la tabla global de FDs y bloqueando todo el sistema.
+
+**Solución**: 
+- Agregado campo `owner_pid` a la estructura `kfd_t` para rastrear qué proceso abrió cada FD
+- Función `fd_cleanup_process(pid)` cierra automáticamente todos los FDs del proceso al morir
+- Limpieza automática de pipes asociados al proceso
+
+**Archivos modificados**:
+- `cpu/syscall.c`: Estructura `kfd_t` con `owner_pid`, función `fd_cleanup_process()`
+- `process/process.c`: Llamada a `fd_cleanup_process()` en `process_exit()`
+
+### 2. Manejo de Procesos Huérfanos
+
+**Problema**: Si un proceso padre moría antes que sus hijos, estos quedaban huérfanos sin nadie que los esperara con `waitpid()`, causando acumulación de zombies.
+
+**Solución**:
+- Cuando un proceso muere, todos sus hijos son automáticamente adoptados por `init` (PID 1)
+- `init` se encarga de hacer `waitpid()` y limpiar los zombies
+
+**Archivos modificados**:
+- `process/process.c`: Reparenting automático en `process_exit()`
+
+### 3. Prevención de Acumulación de Zombies
+
+**Problema**: Si los padres nunca llamaban `waitpid()`, los procesos zombie se acumulaban hasta llenar la tabla de procesos (MAX_PROCESSES), bloqueando la creación de nuevos procesos.
+
+**Solución**:
+- Auto-reaping cuando la tabla de procesos está >75% llena
+- Limpieza automática de zombies huérfanos (cuyo padre también murió)
+- Logging de advertencia cuando se activa el auto-reaping
+
+**Archivos modificados**:
+- `process/process.c`: Lógica de auto-reaping en `process_exit()`
+
+### 4. Validación de Números de Syscall
+
+**Problema**: Un proceso malicioso o con bugs podía pasar números de syscall inválidos, causando comportamiento indefinido.
+
+**Solución**:
+- Validación de rango al inicio de `syscall_handler()`
+- Syscalls con número > 72 retornan -1 y logean advertencia
+- Previene dispatch a handlers inexistentes
+
+**Archivos modificados**:
+- `cpu/syscall.c`: Validación al inicio de `syscall_handler()`
+
+### 5. Mejoras en Page Fault Handler
+
+**Problema**: Un page fault en ring 3 (user mode) causaba kernel panic, reiniciando todo el sistema.
+
+**Solución**:
+- Page faults en ring 3 ahora envían SIGSEGV al proceso y lo terminan
+- El kernel continúa ejecutándose normalmente
+- Solo page faults en ring 0 (kernel) causan panic (bug real del kernel)
+
+**Archivos modificados**:
+- `mm/vmm.c`: `page_fault_handler()` distingue ring 0 vs ring 3
+- `mm/vmm.c`: Incluye `process/process.h` para acceder a `process_t`
+
+## Resumen de Robustez
+
+Con estas mejoras, Trinux ahora:
+
+✅ **No tiene FD leaks** - Los FDs se limpian automáticamente al morir el proceso  
+✅ **No acumula zombies** - Auto-reaping cuando la tabla se llena  
+✅ **Maneja huérfanos** - Los procesos sin padre son adoptados por init  
+✅ **Sobrevive crashes de usuario** - Page faults en ring 3 no matan el kernel  
+✅ **Valida syscalls** - Números inválidos no causan comportamiento indefinido  
+✅ **Señales POSIX completas** - 15 señales soportadas con handlers personalizables  
+✅ **Fork/waitpid funcional** - Procesos pueden crear y esperar hijos  
+✅ **Pipes seguros** - SIGPIPE en pipes rotos, limpieza automática  
+
+El sistema es ahora significativamente más robusto y puede manejar procesos maliciosos o con bugs sin colapsar.

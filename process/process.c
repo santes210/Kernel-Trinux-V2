@@ -128,6 +128,8 @@ process_t *process_create(const char *name, void (*entry)(void))
 
     memset(p, 0, sizeof(process_t));
     p->pid = next_pid++;
+    /* Track parent PID: current process is the parent (0 for init) */
+    p->parent_pid = current ? current->pid : 0;
     strncpy(p->name, name, PROC_NAME_MAX - 1);
     p->state = PROC_READY;
     p->entry = entry;
@@ -165,6 +167,48 @@ void process_exit(int code)
     if (current) {
         current->exit_code = code;
         current->state = PROC_ZOMBIE;
+
+        /* CRITICAL: Close all file descriptors owned by this process
+         * to prevent FD leaks that would exhaust the global fd table. */
+        extern void fd_cleanup_process(uint32_t pid);
+        fd_cleanup_process(current->pid);
+
+        /* CRITICAL: Reparent orphan children to init (PID 1).
+         * When a parent dies before its children, the children become
+         * orphans. In POSIX, init adopts them and reaps them when they die. */
+        for (uint32_t i = 0; i < proc_count; i++) {
+            if (processes[i].state != PROC_ZOMBIE &&
+                processes[i].parent_pid == current->pid &&
+                processes[i].pid != 1) {
+                processes[i].parent_pid = 1;  /* Adopt by init */
+            }
+        }
+
+        /* Enviar SIGCHLD al padre (si existe y no es init) */
+        if (current->parent_pid > 0) {
+            process_signal(current->parent_pid, SIGCHLD);
+        }
+
+        /* CRITICAL: Auto-reap zombies if table is getting full.
+         * If >75% of process slots are zombies, reap orphaned zombies
+         * (those whose parent is also dead) to prevent table exhaustion. */
+        int zombie_count = 0;
+        for (uint32_t i = 0; i < proc_count; i++) {
+            if (processes[i].state == PROC_ZOMBIE) zombie_count++;
+        }
+        if (zombie_count > (int)(proc_count * 3 / 4) && proc_count > 8) {
+            for (uint32_t i = 0; i < proc_count; i++) {
+                if (processes[i].state == PROC_ZOMBIE && processes[i].pid > 3) {
+                    process_t *parent = process_get(processes[i].parent_pid);
+                    if (!parent || parent->state == PROC_ZOMBIE) {
+                        /* Parent is dead or doesn't exist, safe to reap.
+                         * We mark the name as empty so process_create can
+                         * reuse this slot (memset in process_create clears it). */
+                        processes[i].name[0] = '\0';
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -254,4 +298,137 @@ int process_set_priority(uint32_t pid, int prio)
      * priorities for non-root callers and return -3. */
     p->priority = prio;
     return 0;
+}
+
+/* ---- Signals (v0.3) ---- */
+
+int process_signal(uint32_t pid, int sig)
+{
+    process_t *p = process_get(pid);
+    if (!p) return -1;
+    if (p->state == PROC_ZOMBIE) return -1;
+    p->signal_pending = sig;
+    return 0;
+}
+
+bool process_check_signal(void)
+{
+    process_t *p = process_get_current();
+    if (!p) return false;
+    if (!p->signal_pending) return false;
+
+    int sig = p->signal_pending;
+    p->signal_pending = 0;
+
+    /* Usar el sistema de entrega de señales que soporta handlers */
+    return process_deliver_signal(sig);
+}
+
+/* ---- fork/waitpid (v0.3.1) ---- */
+
+uint32_t process_get_ppid(uint32_t pid)
+{
+    process_t *p = process_get(pid);
+    if (!p) return 0;
+    return p->parent_pid;
+}
+
+/* waitpid: bloquea al proceso actual hasta que un hijo termine.
+ *
+ * pid > 0:  espera a ese hijo específico
+ * pid == -1: espera a cualquier hijo
+ * options & WNOHANG: no bloquea si no hay hijos terminados
+ *
+ * Devuelve: PID del hijo terminado, 0 si WNOHANG y no hay, -1 error.
+ * *status recibe el exit_code del hijo.
+ */
+int process_waitpid(int pid, int *status, int options)
+{
+    process_t *me = process_get_current();
+    if (!me) return -1;
+
+    for (;;) {
+        /* Buscar un hijo zombie que matchee el criterio */
+        for (uint32_t i = 0; i < proc_count; i++) {
+            process_t *child = &processes[i];
+            if (child->parent_pid != me->pid) continue;
+            if (pid > 0 && child->pid != (uint32_t)pid) continue;
+            if (child->state == PROC_ZOMBIE) {
+                int child_pid = (int)child->pid;
+                if (status) *status = child->exit_code;
+                /* El slot será reciclado en el próximo process_create */
+                return child_pid;
+            }
+        }
+
+        /* Si WNOHANG y no encontramos zombie, retornar 0 */
+        if (options & 1) return 0;  /* WNOHANG */
+
+        /* Verificar si tenemos algún hijo vivo */
+        bool has_children = false;
+        for (uint32_t i = 0; i < proc_count; i++) {
+            if (processes[i].parent_pid == me->pid &&
+                processes[i].state != PROC_ZOMBIE) {
+                has_children = true;
+                break;
+            }
+        }
+        if (!has_children) return -1;  /* ECHILD */
+
+        /* Bloquear: yield y reintentar */
+        schedule();
+    }
+}
+
+/* ---- Signal handlers (v0.3.2) ---- */
+
+void (*process_sigaction(int sig, void (*handler)(int)))(int)
+{
+    /* SIGKILL no puede ser capturado */
+    if (sig == SIGKILL || sig <= 0 || sig >= _NSIG)
+        return SIG_DFL;
+
+    process_t *p = process_get_current();
+    if (!p) return SIG_DFL;
+
+    void (*old)(int) = p->sig_handlers[sig];
+    p->sig_handlers[sig] = handler;
+    return old ? old : SIG_DFL;
+}
+
+bool process_deliver_signal(int sig)
+{
+    process_t *p = process_get_current();
+    if (!p) return true;  /* no process = terminate */
+
+    if (sig <= 0 || sig >= _NSIG) return true;
+
+    void (*handler)(int) = p->sig_handlers[sig];
+
+    /* SIG_IGN: ignorar la señal */
+    if (handler == SIG_IGN) return false;
+
+    /* Handler personalizado: llamarlo (será ejecutado en ring 3) */
+    if (handler && handler != SIG_DFL) {
+        /* En un SO completo, aquí haríamos un trampoline que:
+         * 1. Guarda el contexto actual del proceso
+         * 2. Ejecuta el handler en ring 3
+         * 3. Restaura el contexto y vuelve a donde estaba
+         *
+         * Por ahora, registramos que hay un handler pendiente
+         * y el syscall handler lo llamará antes de volver a ring 3.
+         * Esto es simplificado pero funcional. */
+        p->signal_pending = sig;
+        return false;  /* no terminar, hay handler */
+    }
+
+    /* SIG_DFL o NULL: acción por defecto (terminar) */
+    /* SIGCHLD por defecto se ignora */
+    if (sig == SIGCHLD) return false;
+
+    kprintf("\n[%s] terminado por señal %d\n", p->name, sig);
+    p->state = PROC_ZOMBIE;
+    p->exit_code = 128 + sig;
+    p->signaled = true;
+    return true;  /* proceso terminado */
 }
