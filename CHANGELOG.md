@@ -233,3 +233,42 @@ funcionando correctamente.
 [0.2.4]: https://github.com/santes210/Kernel-Trinux-V2/compare/v0.2.0...v0.2.4
 [0.2.0]: https://github.com/santes210/Kernel-Trinux-V2/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/santes210/Kernel-Trinux-V2/releases/tag/v0.1.0
+
+## [0.4.0] - 2026-07-19
+
+### 🛡️ Mejoras Críticas de Estabilidad
+
+#### Prevención de FD Leaks
+- Agregado campo `owner_pid` a `kfd_t` para rastrear propietario de cada FD
+- Función `fd_cleanup_process(pid)` cierra automáticamente todos los FDs al morir el proceso
+- Limpieza automática de pipes asociados al proceso
+- **Impacto**: Previene agotamiento de tabla global de FDs
+
+#### Manejo de Procesos Huérfanos
+- Reparenting automático: hijos de proceso muerto son adoptados por init (PID 1)
+- init se encarga de hacer waitpid() y limpiar zombies
+- **Impacto**: Previene acumulación de zombies eternos
+
+#### Prevención de Acumulación de Zombies
+- Auto-reaping cuando tabla de procesos está >75% llena
+- Limpieza automática de zombies huérfanos
+- Logging de advertencia al activar auto-reaping
+- **Impacto**: Previene bloqueo por tabla de procesos llena
+
+#### Validación de Syscalls
+- Validación de rango al inicio de `syscall_handler()`
+- Syscalls con número > 72 retornan -1 y logean advertencia
+- **Impacto**: Previene dispatch a handlers inexistentes
+
+#### Page Fault Handler Mejorado
+- Page faults en ring 3 envían SIGSEGV al proceso y lo terminan
+- Kernel continúa ejecutándose normalmente
+- Solo page faults en ring 0 causan panic (bug real del kernel)
+- **Impacto**: Sistema sobrevive crashes de procesos de usuario
+
+### Archivos Modificados
+- `cpu/syscall.c`: `owner_pid` en `kfd_t`, `fd_cleanup_process()`, validación syscall
+- `process/process.c`: Reparenting, auto-reaping, fd cleanup en exit
+- `mm/vmm.c`: Page fault handler distingue ring 0 vs ring 3
+- `README.md`: Documentación completa de mejoras de robustez
+
