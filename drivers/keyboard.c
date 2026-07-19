@@ -172,6 +172,16 @@ static void handle_scancode(uint8_t sc)
     if (ctrl_down && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
         c = (char)(c & 0x1F);
 
+    /* Signal delivery: Ctrl-C (char 3) signals the current foreground process.
+     * This is the TTY layer equivalent of Linux's SIGINT delivery. */
+    if (c == 3) {
+        process_t *cur = process_get_current();
+        if (cur && cur->pid > 3) {  /* don't signal init/kthreadd/mysh */
+            process_signal(cur->pid, 2);  /* SIGINT = 2 */
+            return;  /* don't push to buffer, signal was delivered */
+        }
+    }
+
     buf_push((int)(uint8_t)c);
 }
 
@@ -246,8 +256,32 @@ int keyboard_trygetchar(void)
     return buf_pop();
 }
 
+/* Stdin override: when set, keyboard_getchar() reads from this buffer first */
+static const char *stdin_override_buf = NULL;
+static uint32_t stdin_override_len = 0;
+static uint32_t stdin_override_pos = 0;
+
+void keyboard_set_stdin_override(const char *buf, uint32_t len)
+{
+    stdin_override_buf = buf;
+    stdin_override_len = len;
+    stdin_override_pos = 0;
+}
+
+void keyboard_clear_stdin_override(void)
+{
+    stdin_override_buf = NULL;
+    stdin_override_len = 0;
+    stdin_override_pos = 0;
+}
+
 int keyboard_getchar(void)
 {
+    /* Check stdin override first */
+    if (stdin_override_buf && stdin_override_pos < stdin_override_len) {
+        return (int)(uint8_t)stdin_override_buf[stdin_override_pos++];
+    }
+
     int key;
     __asm__ volatile("sti");
     while ((key = buf_pop()) < 0)
@@ -256,7 +290,11 @@ int keyboard_getchar(void)
 }
 
 /* Public: non-blocking variant. Returns -1 if no key is queued. */
-int keyboard_try_getchar(void) { return buf_pop(); }
+int keyboard_try_getchar(void) {
+    if (stdin_override_buf && stdin_override_pos < stdin_override_len)
+        return (int)(uint8_t)stdin_override_buf[stdin_override_pos++];
+    return buf_pop();
+}
 
 int keyboard_readline(char *buffer, int max_len)
 {

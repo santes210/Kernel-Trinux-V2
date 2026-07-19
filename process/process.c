@@ -255,3 +255,30 @@ int process_set_priority(uint32_t pid, int prio)
     p->priority = prio;
     return 0;
 }
+
+/* ---- Signals (v0.3) ---- */
+
+int process_signal(uint32_t pid, int sig)
+{
+    process_t *p = process_get(pid);
+    if (!p) return -1;
+    if (p->state == PROC_ZOMBIE) return -1;
+    p->signal_pending = sig;
+    return 0;
+}
+
+bool process_check_signal(void)
+{
+    process_t *p = process_get_current();
+    if (!p) return false;
+    if (!p->signal_pending) return false;
+
+    int sig = p->signal_pending;
+    p->signal_pending = 0;
+    p->signaled = true;
+
+    kprintf("\n[%s] killed by signal %d\n", p->name, sig);
+    p->state = PROC_ZOMBIE;
+    p->exit_code = 128 + sig;
+    return true;
+}

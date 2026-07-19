@@ -21,6 +21,154 @@ medio de almacenamiento accesible.
 
 ---
 
+## 🆕 Novedades v0.3.0 — Seguridad, Señales y Mejoras
+
+> **Resumen**: validación completa de punteros en syscalls (seguridad), señales
+> POSIX básicas (Ctrl-C / SIGTERM / SIGKILL), redirección de stdin (`<`),
+> y dos nuevos syscalls (PIPE / PIPE_CLOSE).
+
+### 🔒 Seguridad: Validación de punteros en syscalls (uaccess)
+
+**Problema**: muchos syscalls recibían punteros de ring 3 sin validar, lo que
+permitía a un programa malicioso hacer que el kernel leyera o escribiera
+en su propia memoria pasando punteros al espacio del kernel (ej. `0x00100000`).
+
+**Solución**: se añadió validación `uaccess_ok()` y `UCHECK_STR()` a **todos**
+los syscalls que reciben punteros de userland (~35 syscalls). Si un puntero
+apunta fuera del rango de usuario (`0x08000000`–`0x10000000`), el syscall
+retorna `-EFAULT (−14)` sin ejecutar la operación.
+
+| Syscall | Validación añadida |
+|---|---|
+| `SYS_GETLINE` | `uaccess_ok(buf, max)` |
+| `SYS_GETCWD` | `uaccess_ok(buf, max)` |
+| `SYS_HOSTNAME` | `uaccess_ok(buf, max)` |
+| `SYS_GETUSER` | `uaccess_ok(buf, max)` |
+| `SYS_MKDIR` | `UCHECK_STR(path)` |
+| `SYS_RMDIR` | `UCHECK_STR(path)` |
+| `SYS_UNLINK` | `UCHECK_STR(path)` |
+| `SYS_RENAME` | `UCHECK_STR(src)` + `UCHECK_STR(dst)` |
+| `SYS_OPENDIR` | `UCHECK_STR(path)` |
+| `SYS_READDIR` | `uaccess_ok(de, sizeof(dirent))` |
+| `SYS_STAT` | `UCHECK_STR(path)` + `uaccess_ok(st, sizeof(stat))` |
+| `SYS_FILE_OPEN` | `UCHECK_STR(path)` |
+| `SYS_FILE_READ` | `uaccess_ok(buf, len)` |
+| `SYS_FILE_WRITE` | `uaccess_ok(buf, len)` |
+| `SYS_SPAWN` | `UCHECK_STR(path)` |
+| `SYS_SPAWN_R` | `uaccess_ok(req, sizeof(spawn_req))` |
+| `SYS_LOGIN` | `UCHECK_STR(user)` + `UCHECK_STR(pass)` |
+| `SYS_SU` | `UCHECK_STR(user)` + `UCHECK_STR(pass)` |
+| `SYS_USERADD` | `uaccess_ok(req, sizeof(useradd_req))` |
+| `SYS_PASSWD` | `uaccess_ok(req, sizeof(passwd_req))` |
+| `SYS_LISTPROC` | `uaccess_ok(req, sizeof(plist_req))` |
+| `SYS_CHMOD` | `UCHECK_STR(path)` |
+| `SYS_CHOWN` | `UCHECK_STR(path)` |
+| `SYS_MEMINFO` | `uaccess_ok(m, sizeof(mem_info))` |
+| `SYS_DFINFO` | `uaccess_ok(d, sizeof(df_info))` |
+| `SYS_DATETIME` | `uaccess_ok(t, sizeof(datetime))` |
+| `SYS_USERLIST` | `uaccess_ok(r, sizeof(user_list_req))` |
+| `SYS_BATTERY` | `uaccess_ok(b, sizeof(battery))` |
+| `SYS_GETGROUPS` | `uaccess_ok(r, sizeof(groups_req))` |
+| `SYS_VFS_FIND` | `uaccess_ok(r, sizeof(find_req))` |
+| `SYS_VFS_TREE` | `uaccess_ok(r, sizeof(tree_req))` |
+| `SYS_RESOLVE` | `UCHECK_STR(path)` + `uaccess_ok(out, max)` |
+| `SYS_TCC_COMPILE` | `UCHECK_STR(src)` |
+| `SYS_SMP_INFO` | `uaccess_ok(out, sizeof(smp_info))` |
+| `SYS_FB_INFO` | `uaccess_ok(out, sizeof(fb_info))` |
+| `SYS_PIPE` | `uaccess_ok(fds, sizeof(int)*2)` |
+
+### 🛑 Señales POSIX básicas
+
+**Se añadió un sistema de señales** inspirado en POSIX:
+
+| Señal | Número | Descripción |
+|---|---|---|
+| `SIGHUP` | 1 | Hangup |
+| `SIGINT` | 2 | Interrupción (Ctrl-C) |
+| `SIGQUIT` | 3 | Quit |
+| `SIGKILL` | 9 | Kill (no capturable) |
+| `SIGTERM` | 15 | Terminación graceful |
+
+**Ctrl-C** ahora mata el proceso foreground:
+
+```sh
+root@trinux:~# sleep 100
+^C
+[sleep] killed by signal 2
+root@trinux:~#
+```
+
+**Implementación**:
+- `process_signal(pid, sig)` marca `signal_pending` en el proceso destino
+- El driver de teclado detecta Ctrl-C (char 3) en el IRQ handler y señala
+  al proceso foreground (PID > 3)
+- El syscall handler verifica `process_check_signal()` antes de retornar a
+  usermode; si hay señal pendiente, mata el proceso con exit code `128 + signo`
+- `kill PID SIGTERM` funciona correctamente
+- `kill PID 0` verifica si el proceso existe (sin señalar)
+
+**Archivos modificados**:
+- `process/process.h` — campos `signal_pending` y `signaled` en `process_t`
+- `process/process.c` — `process_signal()` y `process_check_signal()`
+- `drivers/keyboard.c` — intercepta Ctrl-C en el IRQ handler
+- `cpu/syscall.c` — `SYS_KILL` usa señales; check al final del handler
+
+### 📥 Redirección de stdin (`<`)
+
+**Antes**: la shell soportaba `>` y `>>` (stdout) pero no `<` (stdin).
+
+**Ahora**: puedes redirigir la entrada de un comando desde un archivo:
+
+```sh
+root@trinux:~# echo "hola mundo" > /tmp/test.txt
+root@trinux:~# cat < /tmp/test.txt
+hola mundo
+root@trinux:~# grep hola < /tmp/test.txt
+hola mundo
+```
+
+**Implementación**:
+- Tokenizer de la shell ahora reconoce `<` como operador
+- `run_one()` parsea `< archivo` y establece `spawn_req.stdin_path`
+- El kernel (`SYS_SPAWN_R`) lee el archivo de stdin en un buffer de 4 KiB
+  y activa `keyboard_set_stdin_override()` antes de ejecutar el programa
+- El driver de teclado (`keyboard_getchar`/`keyboard_try_getchar`) consume
+  del buffer override antes de leer del teclado real
+- Al terminar el spawn, se limpia el override con `keyboard_clear_stdin_override()`
+
+**Archivos modificados**:
+- `user/usersh/sh.c` — tokenizer + dispatch con `<`
+- `cpu/syscall.c` — `SYS_SPAWN_R` lee stdin y activa override
+- `drivers/keyboard.c` — `keyboard_set_stdin_override()`/`clear`
+- `drivers/keyboard.h` — API pública de override
+
+### 🔧 Nuevos syscalls (ABI 3.2)
+
+| # | Nombre | Descripción |
+|---|---|---|
+| 67 | `SYS_PIPE` | Crea un pipe en RAM, retorna 2 fds (lectura/escritura) |
+| 68 | `SYS_PIPE_CLOSE` | Cierra un extremo del pipe |
+
+Los pipes en RAM usan un ring buffer circular de 4 KiB (`fs/pipe.c`), soportan
+hasta 16 pipes simultáneos, y el escritor bloquea si el buffer está lleno
+(backpressure). El lector recibe EOF cuando el escritor cierra.
+
+### 📝 Resumen de archivos modificados en v0.3.0
+
+| Archivo | Cambio |
+|---|---|
+| `cpu/syscall.c` | +uaccess en 35 syscalls, +signal check, +stdin redirect en SPAWN_R, +SYS_PIPE/SYS_PIPE_CLOSE, SYS_KILL mejorado |
+| `cpu/uaccess.h` | Sin cambios (ya existía, ahora se usa exhaustivamente) |
+| `user/trinux.h` | +SYS_PIPE (67), +SYS_PIPE_CLOSE (68), +wrappers `pipe_()` y `pipe_close_()` |
+| `process/process.h` | +`signal_pending`, +`signaled` en `process_t`; +`SIGINT`/`SIGTERM`/`SIGKILL`; +`process_signal()`/`process_check_signal()` |
+| `process/process.c` | +implementación de `process_signal()` y `process_check_signal()` |
+| `drivers/keyboard.c` | +Ctrl-C señalización, +stdin override buffer |
+| `drivers/keyboard.h` | +`keyboard_set_stdin_override()`/`clear_stdin_override()` |
+| `user/usersh/sh.c` | +tokenizer para `<`, +dispatch con stdin redirection |
+| `user/usersh/sh_elf.h` | Regenerado con los cambios del shell |
+
+---
+
 ## 🆕 Novedades v0.2.x — Ring 3 real (Fases 1-7)
 
 > **Resumen ultra corto**: el shell y 64 comandos ahora corren en **ring 3 real** (CPL=3),
@@ -2598,13 +2746,17 @@ git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feat
 - [ ] Modo gráfico VBE (640×480+)
 - [ ] Soporte para más de 256 MiB de RAM
 - [ ] Filesystem real (ext2, FAT32)
-- [ ] SMP / multinúcleo
+- [ ] SMP / multinúcleo real (detección funciona, falta IPI + scheduler por-core)
 - [ ] CFS-like fair scheduling
 - [ ] NVMe support
 - [ ] USB keyboard/mouse (HID)
 - [ ] Mejorar TCC (más features C)
-- [ ] **Ring 3 real para ELFs** (ver plan Fase C1-C7)
+- [ ] **Address space por proceso** (infraestructura existe, falta wiring en elf_exec)
 - [ ] Tickless idle
+- [x] ~~Validación de punteros en syscalls~~ (v0.3.0)
+- [x] ~~Señales básicas (Ctrl-C / SIGTERM)~~ (v0.3.0)
+- [x] ~~Redirección stdin `<`~~ (v0.3.0)
+- [x] ~~Pipes en RAM~~ (v0.3.0)
 
 ---
 
@@ -2612,9 +2764,9 @@ git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feat
 
 | Métrica | Valor |
 |---|---|
-| **Líneas de código** | ~12,000 (C + ASM) |
+| **Líneas de código** | ~12,500 (C + ASM) |
 | **Comandos de shell** | 70+ |
-| **Syscalls** | 10 |
+| **Syscalls** | 68 |
 | **Drivers** | 11 (VGA, teclado, timer, RTC, serial, PCI, ATA, AHCI, xHCI, ACPI EC) |
 | **Sistemas de archivos** | 6 (VFS, RAMFS, DISKFS, BLOCKFS, DEVFS, FAT16) |
 | **Fases implementadas** | 18+ |

@@ -52,6 +52,10 @@ typedef struct process {
     uint32_t      quantum_used;   /* ticks consumed in the CURRENT quantum  */
     uint32_t      consec_full;    /* consecutive times quantum hit the cap  */
     uint32_t      sleep_until;    /* tick at which a sleeper should wake    */
+
+    /* ---- signals (v0.3) ---- */
+    int           signal_pending; /* non-zero: signal number to deliver      */
+    bool          signaled;       /* true if killed by signal (exit=128+sig) */
 } process_t;
 
 void        process_init(void);
@@ -85,5 +89,22 @@ process_t  *process_create_tracking(const char *name);
  * to make a freshly-spawned ELF the active task while it runs, then
  * restore the shell when it returns or longjmps out. */
 void        process_set_current(process_t *p);
+
+/* ---- Signals (v0.3) ---- */
+#define SIGHUP    1
+#define SIGINT    2    /* Ctrl-C */
+#define SIGQUIT   3
+#define SIGKILL   9    /* cannot be caught/ignored */
+#define SIGTERM  15
+
+/* Deliver a signal to a process. Currently the only action is to set
+ * signal_pending; the process will be terminated on the next syscall
+ * return or scheduler tick. Returns 0 on success, -1 if pid invalid. */
+int         process_signal(uint32_t pid, int sig);
+
+/* Check if the current process has a pending signal. If so, terminate it
+ * with exit code 128+signum. Called from syscall return path. Returns
+ * true if a signal was delivered (caller should not return to usermode). */
+bool        process_check_signal(void);
 
 #endif /* PROCESS_PROCESS_H */

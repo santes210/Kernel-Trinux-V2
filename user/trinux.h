@@ -103,6 +103,8 @@ typedef int            int32_t;
 #define SYS_TCC_COMPILE 64 /* ebx=src_path -> 0/-1 (built-in tcc del kernel)   */
 #define SYS_SMP_INFO  65   /* ebx=&smp_info_t -> 0/-1                          */
 #define SYS_FB_INFO   66   /* ebx=&fb_info_t -> 0/-1 (1 si modo grafico)       */
+#define SYS_PIPE       67  /* ecx=int[2] -> 0/-1 (crea pipe, devuelve 2 fds)   */
+#define SYS_PIPE_CLOSE 68  /* ebx=fd -> 0 (cierra un extremo del pipe)         */
 
 typedef struct {
     int  n_cpus;             /* cuantos cores detecto el kernel */
@@ -378,6 +380,8 @@ static inline void vga_clear_(void){ _syscall0(SYS_VGA_CLEAR); }
 static inline int tcc_compile(const char *src){ return _syscall1(SYS_TCC_COMPILE, (int)src); }
 static inline int smp_info(smp_info_t *out){ return _syscall1(SYS_SMP_INFO, (int)out); }
 static inline int fb_info(fb_info_t *out){ return _syscall1(SYS_FB_INFO, (int)out); }
+static inline int pipe_(int fds[2]){ return _syscall1(SYS_PIPE, (int)fds); }
+static inline int pipe_close_(int fd){ return _syscall1(SYS_PIPE_CLOSE, fd); }
 
 /* ============================================================================
  *  Helpers de string puramente ring-3 (no son syscalls)

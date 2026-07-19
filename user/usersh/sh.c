@@ -84,6 +84,12 @@ static int tokenize(char *line, char **argv){
             if (dst < end) *dst++ = 0;
             continue;
         }
+        if (*src == '<') {
+            argv[argc++] = dst;
+            *dst++ = '<'; src++;
+            if (dst < end) *dst++ = 0;
+            continue;
+        }
         if (*src == '|') {
             argv[argc++] = dst;
             *dst++ = '|'; src++;
@@ -95,7 +101,7 @@ static int tokenize(char *line, char **argv){
         while (*src && dst < end) {
             if (*src == '"') { q = !q; src++; continue; }
             if (!q && (*src == ' ' || *src == '\t')) break;
-            if (!q && (*src == '>' || *src == '|')) break;
+            if (!q && (*src == '>' || *src == '<' || *src == '|')) break;
             *dst++ = *src++;
         }
         if (dst < end) *dst++ = 0;
@@ -107,6 +113,7 @@ static int tokenize(char *line, char **argv){
 static int run_one(int argc, char **argv){
     if (argc == 0) return 0;
     const char *redir_out = 0;
+    const char *redir_in = 0;
     int append = 0;
     for (int i = 0; i < argc; i++) {
         if (argv[i][0] == '>' && argv[i][1] == 0) {
@@ -119,6 +126,11 @@ static int run_one(int argc, char **argv){
             append = 1; redir_out = argv[i+1];
             for (int j = i; j+2 <= argc; j++) argv[j] = argv[j+2];
             argc -= 2; i--;
+        } else if (argv[i][0] == '<' && argv[i][1] == 0) {
+            if (i+1 >= argc) { print("syntax: < needs filename\n"); return 2; }
+            redir_in = argv[i+1];
+            for (int j = i; j+2 <= argc; j++) argv[j] = argv[j+2];
+            argc -= 2; i--;
         }
     }
     if (argc == 0) return 0;
@@ -129,10 +141,10 @@ static int run_one(int argc, char **argv){
         strcpy_(path, "/bin/");
         str_append(path, argv[0]);
     }
-    if (redir_out) {
+    if (redir_out || redir_in) {
         spawn_req_t r;
         r.path = path; r.argv = argv;
-        r.stdin_path = 0; r.stdout_path = redir_out; r.append = append;
+        r.stdin_path = redir_in; r.stdout_path = redir_out; r.append = append;
         return spawn_r(&r);
     }
     return spawn(path, argv, SPAWN_F_WAIT);
@@ -158,7 +170,7 @@ static int dispatch(int argc, char **argv){
     if (streq(argv[0], "help")) {
         print("Built-ins: cd exit help history clear\n");
         print("Comandos en /bin/<nombre>  (ring 3 reales)\n");
-        print("Redir:  cmd > file   cmd >> file\n");
+        print("Redir:  cmd > file   cmd >> file   cmd < file\n");
         print("Pipes:  cmd1 | cmd2 | cmd3  (max 8 stages)\n");
         print("Try:    top, edit FILE, tcc src.c, ringtest\n");
         return 0;
