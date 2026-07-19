@@ -40,10 +40,11 @@ void pmm_init(uint32_t total_memory_bytes)
     }
     used_frames = 0;
 
-    /* Reserve the first 1 MiB (BIOS/IVT/VGA) and the kernel + heap region.
-     * Kernel lives at 1 MiB; reserve up to 256 MiB to cover kernel + the
-     * static 96 MiB heap arena conservatively. */
-    pmm_reserve_region(0x00000000, 256 * 1024 * 1024);
+    /* Reserve the first 128 MiB for BIOS/IVT/VGA + kernel + heap.
+     * Kernel lives at 1 MiB; heap is 32 MiB; we add margin for safety.
+     * The rest of the identity-mapped 1 GiB (128 MiB - 1 GiB) is available
+     * for user processes and dynamic allocations. */
+    pmm_reserve_region(0x00000000, 128 * 1024 * 1024);
 }
 
 void pmm_reserve_region(uint32_t addr, uint32_t len)
