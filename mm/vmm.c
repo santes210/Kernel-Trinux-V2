@@ -5,11 +5,14 @@
  * page-aligned tables to avoid bootstrap ordering issues.
  *
  * Memory layout:
- *   0x00000000 - 0x00100000: BIOS/IVT/VGA (reserved, first 1 MiB)
- *   0x00100000 - ~0x03000000: Kernel code + data (~32 MiB)
- *   ~0x03000000 - ~0x05000000: Kernel heap (32 MiB)
- *   0x05000000 - 0x40000000: Available for user processes (944 MiB)
+ *   0x00000000 - 0x00100000: BIOS/IVT/VGA (reserved, first 1 MiB)        [KERNEL, U/S=0]
+ *   0x00100000 - ~0x03000000: Kernel code + data (~32 MiB)               [KERNEL, U/S=0]
+ *   ~0x03000000 - ~0x05000000: Kernel heap (32 MiB)                      [KERNEL, U/S=0]
+ *   0x05000000 - 0x40000000: Available for user processes (944 MiB)      [USER,   U/S=1]
  *   Total identity-mapped: 1 GiB
+ *
+ * KERNEL_END (0x05000000 = 80 MiB) marks the boundary: pages below are
+ * supervisor-only (U/S=0), pages at or above are user-accessible (U/S=1).
  */
 #include "vmm.h"
 #include "../lib/string.h"
@@ -21,6 +24,13 @@
 #define PAGES_PER_TABLE 1024
 #define TABLES_PER_DIR  1024
 #define IDENTITY_TABLES 256             /* 256 tables * 4 MiB = 1024 MiB = 1 GiB */
+
+/* Kernel/user boundary: pages < KERNEL_END_VIRT are supervisor-only (U/S=0).
+ * This covers BIOS (1 MB) + kernel code/data (~32 MB) + kernel heap (~32 MB) = ~80 MB.
+ * 0x05000000 = 80 MiB = 20480 pages = 20 page tables (0-19).
+ * We use a generous boundary to ensure all kernel structures are protected. */
+#define KERNEL_END_VIRT  0x05000000U    /* 80 MiB */
+#define KERNEL_END_TABLE (KERNEL_END_VIRT >> 22)  /* 20 = page table index */
 
 /* Extra page tables for on-demand MMIO mappings (AHCI ABAR, etc.).
  * These cover addresses above the 1 GiB identity-mapped region.
@@ -34,6 +44,7 @@ static uint32_t page_tables[IDENTITY_TABLES][PAGES_PER_TABLE]
 static uint32_t extra_tables[EXTRA_TABLES][PAGES_PER_TABLE]
     __attribute__((aligned(4096)));
 static uint32_t extra_used;   /* how many extra tables have been allocated */
+
 
 
 
@@ -67,7 +78,7 @@ static void page_fault_handler(registers_t *regs)
     if (user) {
         process_t *cur = process_get_current();
         if (cur) {
-            kprintf("\n*** PAGE FAULT en ring 3 (proceso %d: %s) ***\n", 
+            kprintf("\n*** PAGE FAULT en ring 3 (proceso %d: %s) ***\n",
                     cur->pid, cur->name);
             kprintf("  addr=%08x  %s %s\n", faulting_address,
                     present ? "protection" : "not-present",
@@ -94,20 +105,29 @@ void vmm_init(void)
 {
     memset(page_directory, 0, sizeof(page_directory));
 
-    /* Identity-map the first 256 MiB (covers kernel + the heap).
-     *
-     * We add PAGE_USER so ring-3 (userspace) code can execute and access its
-     * own stack/data, which live in this same identity-mapped region (this is
-     * a single-address-space kernel: privilege is enforced by the CPL of the
-     * code segment, not by separate page tables per process). The kernel still
-     * runs at CPL 0 and userspace at CPL 3 via the GDT selectors. */
+    /* Identity-map the first 1 GiB.
+     * Pages below KERNEL_END_VIRT (80 MiB) are supervisor-only (U/S=0):
+     *   - BIOS/IVT/VGA (0-1 MB)
+     *   - Kernel code + data (~32 MB)
+     *   - Kernel heap (~32 MB)
+     * Pages at or above KERNEL_END_VIRT are user-accessible (U/S=1):
+     *   - User program code/data/stack/heap
+     */
     for (int t = 0; t < IDENTITY_TABLES; t++) {
+        bool is_kernel_table = (t < KERNEL_END_TABLE);
         for (int p = 0; p < PAGES_PER_TABLE; p++) {
             uint32_t phys = (t * PAGES_PER_TABLE + p) * 0x1000;
-            page_tables[t][p] = phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+            uint32_t flags = PAGE_PRESENT | PAGE_RW;
+            if (!is_kernel_table) {
+                flags |= PAGE_USER;  /* user-accessible above kernel boundary */
+            }
+            page_tables[t][p] = phys | flags;
         }
-        page_directory[t] = ((uint32_t)page_tables[t])
-                            | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+        uint32_t pd_flags = PAGE_PRESENT | PAGE_RW;
+        if (!is_kernel_table) {
+            pd_flags |= PAGE_USER;
+        }
+        page_directory[t] = ((uint32_t)page_tables[t]) | pd_flags;
     }
 
     isr_register_handler(14, page_fault_handler);
@@ -178,12 +198,17 @@ uint32_t vmm_create_address_space(void) {
     extern uint32_t pmm_alloc_frame(void);
     uint32_t pd_phys = pmm_alloc_frame();
     if (!pd_phys) return 0;
-    
+
     uint32_t* pd = (uint32_t*)(pd_phys);
-    /* copy kernel identity mapping (first 256MB) */
+    /* copy kernel identity mapping (first 1 GiB) with kernel/user split */
     for (int i = 0; i < 1024; i++) {
         if (i < IDENTITY_TABLES) {
-            pd[i] = page_directory[i];
+            /* For tables 0-19 (kernel), strip PAGE_USER; for 20+, keep it */
+            if (i < KERNEL_END_TABLE) {
+                pd[i] = page_directory[i] & ~PAGE_USER;  /* supervisor-only */
+            } else {
+                pd[i] = page_directory[i];  /* user-accessible */
+            }
         } else {
             pd[i] = 0;
         }

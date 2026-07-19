@@ -3,6 +3,7 @@
 #include "../lib/printf.h"
 #include "../mm/kheap.h"
 #include "../drivers/timer.h"   /* for timer_get_ticks() (start_tick) */
+#include "../mm/vmm.h"         /* for vmm_create/free/switch_address_space */
 
 static process_t  processes[MAX_PROCESSES];
 static uint32_t   proc_count;
@@ -118,6 +119,7 @@ process_t *process_create(const char *name, void (*entry)(void))
         if (processes[i].state == PROC_ZOMBIE) {
             p = &processes[i];
             if (p->kstack) kfree(p->kstack);
+            if (p->page_dir) vmm_free_address_space(p->page_dir);
             break;
         }
     }
@@ -146,6 +148,13 @@ process_t *process_create(const char *name, void (*entry)(void))
     p->sleep_until    = 0;
     p->start_tick     = timer_get_ticks();
     strcpy(p->cwd, "/");
+
+    /* Create a new address space for this process */
+    p->page_dir = vmm_create_address_space();
+    if (!p->page_dir) {
+        kprintf("[process] WARNING: failed to create address space for PID %u\n", p->pid);
+        /* Continue without dedicated address space (will use kernel's) */
+    }
 
     p->kstack = kmalloc_aligned(8192);
     uint32_t* stack = (uint32_t*)((uint32_t)p->kstack + 8192);
@@ -208,6 +217,12 @@ void process_exit(int code)
                     }
                 }
             }
+        }
+
+        /* Free the process's address space (will be fully freed when slot is reused) */
+        if (current->page_dir) {
+            vmm_free_address_space(current->page_dir);
+            current->page_dir = 0;
         }
     }
 }

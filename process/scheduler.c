@@ -39,7 +39,7 @@
 #include "../lib/types.h"
 #include "../drivers/timer.h"
 
-extern void context_switch(context_t *old, context_t *new);
+extern void context_switch(context_t *old, context_t *new, uint32_t new_page_dir);
 extern void process_set_current(process_t* p);
 extern process_t* process_get_current(void);
 
@@ -306,7 +306,7 @@ void schedule(void)
     if (p->kstack)
         tss_set_kernel_stack((uint32_t)p->kstack + 8192);
 
-    context_switch(prev ? &prev->context : NULL, &p->context);
+    context_switch(prev ? &prev->context : NULL, &p->context, p->page_dir);
 }
 
 /* Force a reschedule at the next IRQ.  Called by wakeup paths (keyboard,
