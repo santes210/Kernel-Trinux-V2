@@ -13,6 +13,26 @@ typedef enum {
 #define PROC_NAME_MAX 32
 #define MAX_PROCESSES 128
 
+/* ---- Signals (v0.3) ---- */
+#define SIGHUP    1
+#define SIGINT    2    /* Ctrl-C */
+#define SIGQUIT   3
+#define SIGILL    4    /* illegal instruction */
+#define SIGTRAP   5    /* breakpoint */
+#define SIGABRT   6    /* abort */
+#define SIGBUS    7    /* bus error */
+#define SIGFPE    8    /* floating point exception */
+#define SIGKILL   9    /* cannot be caught/ignored */
+#define SIGSEGV  11    /* segmentation fault */
+#define SIGPIPE  13    /* write to broken pipe */
+#define SIGALRM  14    /* alarm clock */
+#define SIGTERM  15    /* termination */
+#define SIGCHLD  17    /* child status changed */
+
+#define _NSIG    32    /* max signal number + 1 */
+#define SIG_DFL  ((void (*)(int))0)   /* default action */
+#define SIG_IGN  ((void (*)(int))1)   /* ignore signal */
+
 /* Priority range — same convention as Unix `nice`:
  *     -20 = highest priority   (gets CPU first, can starve others)
  *       0 = default
@@ -57,6 +77,12 @@ typedef struct process {
     int           signal_pending; /* non-zero: signal number to deliver      */
     bool          signaled;       /* true if killed by signal (exit=128+sig) */
 
+    /* ---- signal handlers (v0.3.2) ---- */
+    /* Array de handlers por señal. NULL = default (terminar proceso).
+     * SIG_IGN = ignorar. Función = handler en userspace.
+     * Nota: la dirección es virtual en userspace (ring 3). */
+    void        (*sig_handlers[_NSIG])(int);
+
     /* ---- fork/waitpid (v0.3.1) ---- */
     uint32_t      parent_pid;     /* PID del proceso padre (0 si init)       */
 } process_t;
@@ -93,14 +119,6 @@ process_t  *process_create_tracking(const char *name);
  * restore the shell when it returns or longjmps out. */
 void        process_set_current(process_t *p);
 
-/* ---- Signals (v0.3) ---- */
-#define SIGHUP    1
-#define SIGINT    2    /* Ctrl-C */
-#define SIGQUIT   3
-#define SIGKILL   9    /* cannot be caught/ignored */
-#define SIGPIPE  13    /* write to broken pipe */
-#define SIGTERM  15
-
 /* Deliver a signal to a process. Currently the only action is to set
  * signal_pending; the process will be terminated on the next syscall
  * return or scheduler tick. Returns 0 on success, -1 if pid invalid. */
@@ -119,5 +137,15 @@ uint32_t    process_get_ppid(uint32_t pid);
  * sets *status to the exit code. If WNOHANG is set and no child has
  * exited, returns 0 immediately. Returns -1 if no children or error. */
 int         process_waitpid(int pid, int *status, int options);
+
+/* Register a signal handler for the current process.
+ * Returns the previous handler, or SIG_DFL if none.
+ * SIGKILL and SIGSTOP cannot be caught. */
+void      (*process_sigaction(int sig, void (*handler)(int)))(int);
+
+/* Deliver a signal to the current process. If a handler is registered,
+ * it will be called. Otherwise, the default action (terminate) is taken.
+ * Returns true if the process was terminated, false if a handler was called. */
+bool        process_deliver_signal(int sig);
 
 #endif /* PROCESS_PROCESS_H */

@@ -107,6 +107,7 @@ typedef int            int32_t;
 #define SYS_PIPE_CLOSE 68  /* ebx=fd -> 0 (cierra un extremo del pipe)         */
 #define SYS_FORK       69  /* -> pid del hijo al padre, 0 al hijo, -1 error    */
 #define SYS_GETPPID    70  /* -> ppid del proceso actual                       */
+#define SYS_SIGNAL     71  /* ebx=sig, ecx=handler -> old_handler              */
 
 /* Opciones para waitpid */
 #define WNOHANG        1   /* no bloquear si no hay hijos terminados           */
@@ -394,6 +395,15 @@ static inline int waitpid_(int pid, int *status, int opts){
     return _syscall3(SYS_WAITPID, pid, (int)status, opts);
 }
 static inline int getppid_(void){ return _syscall0(SYS_GETPPID); }
+
+/* signal(): registra un handler para una señal.
+ * handler puede ser SIG_DFL (default), SIG_IGN (ignorar), o una función. */
+#define SIG_DFL_U  ((void (*)(int))0)
+#define SIG_IGN_U  ((void (*)(int))1)
+typedef void (*sighandler_t)(int);
+static inline sighandler_t signal_(int sig, sighandler_t handler){
+    return (sighandler_t)_syscall2(SYS_SIGNAL, sig, (int)handler);
+}
 
 /* Macros para waitpid */
 #define WIFEXITED(s)   (((s) & 0x7f) == 0)

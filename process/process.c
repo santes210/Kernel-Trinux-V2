@@ -167,6 +167,11 @@ void process_exit(int code)
     if (current) {
         current->exit_code = code;
         current->state = PROC_ZOMBIE;
+
+        /* Enviar SIGCHLD al padre (si existe y no es init) */
+        if (current->parent_pid > 0) {
+            process_signal(current->parent_pid, SIGCHLD);
+        }
     }
 }
 
@@ -277,12 +282,9 @@ bool process_check_signal(void)
 
     int sig = p->signal_pending;
     p->signal_pending = 0;
-    p->signaled = true;
 
-    kprintf("\n[%s] killed by signal %d\n", p->name, sig);
-    p->state = PROC_ZOMBIE;
-    p->exit_code = 128 + sig;
-    return true;
+    /* Usar el sistema de entrega de señales que soporta handlers */
+    return process_deliver_signal(sig);
 }
 
 /* ---- fork/waitpid (v0.3.1) ---- */
@@ -339,4 +341,57 @@ int process_waitpid(int pid, int *status, int options)
         /* Bloquear: yield y reintentar */
         schedule();
     }
+}
+
+/* ---- Signal handlers (v0.3.2) ---- */
+
+void (*process_sigaction(int sig, void (*handler)(int)))(int)
+{
+    /* SIGKILL no puede ser capturado */
+    if (sig == SIGKILL || sig <= 0 || sig >= _NSIG)
+        return SIG_DFL;
+
+    process_t *p = process_get_current();
+    if (!p) return SIG_DFL;
+
+    void (*old)(int) = p->sig_handlers[sig];
+    p->sig_handlers[sig] = handler;
+    return old ? old : SIG_DFL;
+}
+
+bool process_deliver_signal(int sig)
+{
+    process_t *p = process_get_current();
+    if (!p) return true;  /* no process = terminate */
+
+    if (sig <= 0 || sig >= _NSIG) return true;
+
+    void (*handler)(int) = p->sig_handlers[sig];
+
+    /* SIG_IGN: ignorar la señal */
+    if (handler == SIG_IGN) return false;
+
+    /* Handler personalizado: llamarlo (será ejecutado en ring 3) */
+    if (handler && handler != SIG_DFL) {
+        /* En un SO completo, aquí haríamos un trampoline que:
+         * 1. Guarda el contexto actual del proceso
+         * 2. Ejecuta el handler en ring 3
+         * 3. Restaura el contexto y vuelve a donde estaba
+         *
+         * Por ahora, registramos que hay un handler pendiente
+         * y el syscall handler lo llamará antes de volver a ring 3.
+         * Esto es simplificado pero funcional. */
+        p->signal_pending = sig;
+        return false;  /* no terminar, hay handler */
+    }
+
+    /* SIG_DFL o NULL: acción por defecto (terminar) */
+    /* SIGCHLD por defecto se ignora */
+    if (sig == SIGCHLD) return false;
+
+    kprintf("\n[%s] terminado por señal %d\n", p->name, sig);
+    p->state = PROC_ZOMBIE;
+    p->exit_code = 128 + sig;
+    p->signaled = true;
+    return true;  /* proceso terminado */
 }

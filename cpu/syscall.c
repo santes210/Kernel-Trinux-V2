@@ -1121,6 +1121,14 @@ void syscall_handler(registers_t *regs)
         break;
     }
 
+    case SYS_SIGNAL: {
+        int sig = (int)a1;
+        void (*handler)(int) = (void (*)(int))a2;
+        void (*old)(int) = process_sigaction(sig, handler);
+        regs->eax = (uint32_t)old;
+        break;
+    }
+
         default:
         kprintf("\n[syscall] unknown syscall %u\n", num);
         regs->eax = (uint32_t)-1;

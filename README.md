@@ -21,6 +21,131 @@ medio de almacenamiento accesible.
 
 ---
 
+## 🆕 Novedades v0.3.2 — Aislamiento de memoria avanzado y signal handlers
+
+> **Resumen**: page faults en ring 3 ahora matan el proceso en lugar de hacer
+> panic del kernel, signal handlers en userspace con `signal()`, SIGCHLD para
+> notificar al padre cuando un hijo termina, y más señales POSIX.
+
+### 🛡️ Aislamiento de memoria real
+
+**Antes**: un page fault en ring 3 causaba kernel panic y reiniciaba todo el sistema.
+**Ahora**: un page fault en ring 3 mata solo el proceso que lo causó con SIGSEGV.
+
+```sh
+root@trinux:~# ringtest
+[ringtest] Intentando acceder memoria inválida...
+
+*** PAGE FAULT en ring 3 (proceso 10: ringtest) ***
+  addr=deadbeef  not-present read
+  eip=080480d5
+  Terminando proceso con SIGSEGV (11)
+root@trinux:~#
+```
+
+El kernel continúa funcionando normalmente después de matar el proceso.
+
+### 🎯 Signal handlers en userspace
+
+Los procesos ahora pueden registrar handlers para capturar señales:
+
+```c
+#include "../trinux.h"
+
+void mi_handler(int sig) {
+    print("Recibí señal ");
+    print_num(sig);
+    print("\n");
+}
+
+void main() {
+    signal_(SIGINT, mi_handler);   /* Capturar Ctrl-C */
+    signal_(SIGTERM, SIG_IGN_U);   /* Ignorar SIGTERM */
+    
+    while (1) {
+        msleep(1000);
+        print("sigo vivo\n");
+    }
+}
+```
+
+**Syscall añadido**: `SYS_SIGNAL` (71) - registra handlers de señales
+
+### 👶 SIGCHLD - Notificación de hijos terminados
+
+Cuando un proceso hijo termina, el padre recibe automáticamente `SIGCHLD` (17).
+Esto permite implementar waitpid() no-bloqueante y limpieza de zombies:
+
+```c
+volatile int child_exited = 0;
+
+void sigchld_handler(int sig) {
+    child_exited = 1;
+}
+
+void main() {
+    signal_(SIGCHLD, sigchld_handler);
+    
+    int pid = fork_();
+    if (pid == 0) {
+        /* hijo */
+        exit(0);
+    }
+    
+    /* padre espera notificación */
+    while (!child_exited) {
+        msleep(100);
+    }
+    
+    int status;
+    waitpid_(pid, &status, 0);
+}
+```
+
+### 📋 Señales POSIX soportadas
+
+| Señal | Número | Descripción | Capturable |
+|-------|--------|-------------|------------|
+| SIGHUP | 1 | Hangup | ✅ |
+| SIGINT | 2 | Ctrl-C | ✅ |
+| SIGQUIT | 3 | Quit | ✅ |
+| SIGILL | 4 | Instrucción ilegal | ✅ |
+| SIGTRAP | 5 | Breakpoint | ✅ |
+| SIGABRT | 6 | Abort | ✅ |
+| SIGBUS | 7 | Bus error | ✅ |
+| SIGFPE | 8 | Excepción punto flotante | ✅ |
+| **SIGKILL** | **9** | **Kill (no capturable)** | ❌ |
+| SIGSEGV | 11 | Segmentation fault | ✅ |
+| SIGPIPE | 13 | Pipe roto | ✅ |
+| SIGALRM | 14 | Alarma | ✅ |
+| SIGTERM | 15 | Terminación | ✅ |
+| SIGCHLD | 17 | Hijo terminó | ✅ |
+
+### 🎮 API de signal handlers
+
+```c
+typedef void (*sighandler_t)(int);
+
+/* Registrar handler para señal */
+sighandler_t signal_(int sig, sighandler_t handler);
+
+/* Valores especiales de handler */
+#define SIG_DFL_U  ((sighandler_t)0)  /* Acción por defecto (terminar) */
+#define SIG_IGN_U  ((sighandler_t)1)  /* Ignorar señal */
+```
+
+### Archivos modificados
+
+| Archivo | Cambio |
+|---------|--------|
+| `mm/vmm.c` | Page fault handler distingue ring 0 vs ring 3, envía SIGSEGV |
+| `process/process.h` | +15 señales POSIX, +sig_handlers[_NSIG], +process_sigaction(), +process_deliver_signal() |
+| `process/process.c` | +process_sigaction(), +process_deliver_signal(), SIGCHLD en process_exit() |
+| `cpu/syscall.c` | +SYS_SIGNAL handler |
+| `user/trinux.h` | +SYS_SIGNAL (71), +signal_() wrapper, +SIG_DFL_U, +SIG_IGN_U |
+
+---
+
 ## 🆕 Novedades v0.3.1 — Fork real, waitpid y SIGPIPE
 
 > **Resumen**: fork() real con address space copiado, waitpid() con blocking,
@@ -2813,7 +2938,7 @@ git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feat
 |---|---|
 | **Líneas de código** | ~12,500 (C + ASM) |
 | **Comandos de shell** | 70+ |
-| **Syscalls** | 71 |
+| **Syscalls** | 72 |
 | **Drivers** | 11 (VGA, teclado, timer, RTC, serial, PCI, ATA, AHCI, xHCI, ACPI EC) |
 | **Sistemas de archivos** | 6 (VFS, RAMFS, DISKFS, BLOCKFS, DEVFS, FAT16) |
 | **Fases implementadas** | 18+ |

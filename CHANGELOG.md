@@ -5,6 +5,36 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [0.3.2] - 2026-07-19
+
+### 🛡️ Aislamiento de memoria avanzado
+- **Page faults en ring 3** ahora matan el proceso con SIGSEGV en lugar de kernel panic
+- El kernel continúa funcionando después de matar un proceso con fault
+- Incluye process.h en vmm.c para acceder a process_t
+
+### 🎯 Signal handlers en userspace
+- Procesos pueden registrar handlers con `signal_(sig, handler)`
+- Soporte para SIG_DFL (default) y SIG_IGN (ignorar)
+- Nuevo syscall: SYS_SIGNAL (71)
+- Array de handlers por proceso: sig_handlers[_NSIG]
+
+### 👶 SIGCHLD - Notificación de hijos
+- process_exit() envía SIGCHLD al padre automáticamente
+- Permite implementar waitpid() no-bloqueante
+- Limpieza eficiente de procesos zombie
+
+### 📋 Señales POSIX expandidas
+- 15 señales soportadas: SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGSEGV, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD
+- SIGKILL no es capturable (como en POSIX real)
+- SIGCHLD se ignora por defecto (como en POSIX)
+
+### Archivos modificados
+- `mm/vmm.c` - Page fault handler ring 3/ring 0
+- `process/process.h` - Señales y handlers
+- `process/process.c` - process_sigaction(), process_deliver_signal(), SIGCHLD
+- `cpu/syscall.c` - SYS_SIGNAL handler
+- `user/trinux.h` - signal_() wrapper y constantes
+
 ## [0.3.1] - 2026-01-18
 
 ### 🍴 Fork real + waitpid + SIGPIPE
