@@ -5,7 +5,7 @@
 
 /* Global kernel identity. */
 #define KERNEL_NAME      "Trinux"
-#define KERNEL_VERSION   "0.2.0"
+#define KERNEL_VERSION   "0.5.3"   /* debe coincidir con CHANGELOG.md */
 #define KERNEL_ARCH      "i686"
 #define KERNEL_BUILD     "x86 32-bit protected mode"
 #define DEFAULT_USER     "user"

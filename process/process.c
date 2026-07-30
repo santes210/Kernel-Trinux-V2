@@ -11,6 +11,10 @@ static uint32_t   proc_count;
 static uint32_t   next_pid = 1;
 process_t *current;
 
+/* FIX (v0.5.3): schedule() se usaba en process_waitpid() sin declaración
+ * (implicit-declaration warning). */
+extern void schedule(void);
+
 /* `nice <prio> <cmd>` stashes a value here; the next process_create()
  * picks it up and resets it back to "none" (INT32_MIN). */
 #define NICE_NONE  (-0x80000000)
@@ -225,6 +229,10 @@ void process_exit(int code)
             vmm_free_address_space(current->page_dir);
             current->page_dir = 0;
         }
+
+        /* Liberar frames que fork() remapeó en las page tables compartidas
+         * y restaurar PTEs identidad (v0.5.3; idempotente). */
+        vmm_restore_user_identity();
     }
 }
 

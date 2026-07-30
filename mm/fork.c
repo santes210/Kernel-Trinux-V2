@@ -49,6 +49,10 @@ void vmm_copy_region(uint32_t child_pd, uint32_t start, uint32_t end)
          * leer de `addr` directamente y escribir en `new_frame`). */
         memcpy((void *)new_frame, (void *)addr, PAGE_SIZE);
 
+        /* SECURITY (v0.5.3): retirar el alias identity-mapped del frame del
+         * alcance de ring 3 — el hijo accede a su copia SOLO por su VA. */
+        vmm_deprivilege_identity_page(new_frame);
+
         /* Mapear en el page directory del hijo */
         vmm_map_page_in(child_pd, addr, new_frame,
                         PAGE_PRESENT | PAGE_RW | PAGE_USER);
@@ -77,6 +81,32 @@ void process_free_address_space(process_t *p)
  * completos y un scheduler que gestione múltiples page directories. */
 int process_fork(void)
 {
+    /* ==================================================================
+     * FORK DESHABILITADO (fail-safe, v0.5.3) — ver AUDITORIA.md.
+     *
+     * La implementación anterior era PELIGROSA: el hijo se creaba con
+     * context.eip = 0; quedaba READY en la run queue y al ser elegido por
+     * el scheduler, context_switch() saltaba a EIP=0 -> page fault en
+     * RING 0 -> KERNEL PANIC. fork_() desde ring 3 = botón de apagado.
+     *
+     * Bosquejo para implementarlo bien:
+     *   1. En SYS_FORK, copiar el trap frame COMPLETO del int 0x80 en
+     *      curso (ds, pusha, int/err, eip/cs/eflags/useresp/ss) a la cima
+     *      del kstack del hijo.
+     *   2. eax=0 en la copia (retorno de fork en el hijo).
+     *   3. child->context = { .eip = fork_child_entry, .esp = &copia },
+     *      donde fork_child_entry (asm) hace jmp a la cola de retorno a
+     *      ring 3 de syscall_stub (pop ds / popa / iret).
+     *   4. Deep-copy de las page TABLES de usuario (hoy los PDs de proceso
+     *      son shallow copies de las mismas tablas: padre e hijo seguirían
+     *      compartiendo memoria física pese a los frames copiados).
+     *   5. Cargar CR3=child_pd al entrar a ring 3 (hoy todo ring-3 corre
+     *      sobre el CR3 del kernel, ver usermode_save_and_enter).
+     * ================================================================== */
+    kprintf("[fork] fork() no está implementado todavía (ver AUDITORIA.md)\n");
+    return -1;
+
+#if 0  /* --- implementación anterior (insegura), conservada de referencia --- */
     /* 1. Crear nuevo address space clonando el kernel identity-map */
     uint32_t child_pd = vmm_create_address_space();
     if (!child_pd) {
@@ -135,4 +165,5 @@ int process_fork(void)
     vmm_switch_address_space(parent_pd);
 
     return child_pid;
+#endif /* 0 — implementación anterior (insegura) */
 }

@@ -281,7 +281,7 @@ int editor_run(const char *path)
 
     /* Status message to show after next render */
     const char *status_msg = NULL;
-    uint8_t    status_col;
+    uint8_t    status_col = 0x07;   /* FIX (v0.5.3): warning maybe-uninitialized */
 
     for (;;) {
         render(path);
@@ -292,7 +292,7 @@ int editor_run(const char *path)
 
         /* ---- Read ONE key (blocking) ---- */
         int k = keyboard_getchar();
-        int dirty_batch = 0;
+        
 
         /* ---- Process first key ---- */
         if (k == 19 || k == 15) {            /* Ctrl-S / Ctrl-O = save */
@@ -309,7 +309,7 @@ int editor_run(const char *path)
                 save_file(path);
             break;
         } else if (k == 11) {                /* Ctrl-K = cut line */
-            cut_line(); dirty_batch = 1;
+            cut_line();
         } else if (k == KEY_UP) {
             if (cy > 0) { cy--; if (cx > (int)line_len[cy]) cx = (int)line_len[cy]; }
         } else if (k == KEY_DOWN) {
@@ -325,13 +325,13 @@ int editor_run(const char *path)
         } else if (k == KEY_END) {
             cx = (int)line_len[cy];
         } else if (k == '\n') {
-            insert_newline(); dirty_batch = 1;
+            insert_newline();
         } else if (k == '\b') {
-            delete_back(); dirty_batch = 1;
+            delete_back();
         } else if (k == '\t') {
-            insert_char(' '); insert_char(' '); dirty_batch = 1;
+            insert_char(' '); insert_char(' ');
         } else if (k >= 32 && k < 127) {
-            insert_char((char)k); dirty_batch = 1;
+            insert_char((char)k);
         }
 
         /* ---- Batch: drain ALL pending keys.
@@ -345,10 +345,10 @@ int editor_run(const char *path)
                 if (k < 0) break;
                 batch++;
 
-                if (k == '\n')        { insert_newline(); dirty_batch = 1; }
-                else if (k == '\b')   { delete_back();    dirty_batch = 1; }
-                else if (k == '\t')   { insert_char(' '); insert_char(' '); dirty_batch = 1; }
-                else if (k >= 32 && k < 127) { insert_char((char)k); dirty_batch = 1; }
+                if (k == '\n')        { insert_newline(); }
+                else if (k == '\b')   { delete_back();    }
+                else if (k == '\t')   { insert_char(' '); insert_char(' '); }
+                else if (k >= 32 && k < 127) { insert_char((char)k); }
                 /* Ignore ALL other keys during paste (arrows, ctrl-*, etc.) */
             }
             /* After a paste burst, modifier scancodes may have been lost and
@@ -360,7 +360,6 @@ int editor_run(const char *path)
         }
         /* Loop back → render() shows everything at once */
     }
-ed_exit:
 
     /* restore a clean screen for the shell */
     vga_set_color(s->color);

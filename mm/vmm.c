@@ -85,9 +85,16 @@ static void page_fault_handler(registers_t *regs)
                     write ? "write" : "read");
             kprintf("  eip=%08x\n", regs->eip);
             kprintf("  Terminando proceso con SIGSEGV (11)\n");
-            /* Enviar SIGSEGV al proceso */
-            process_signal(cur->pid, 11);  /* SIGSEGV = 11 */
-            return;  /* El syscall handler detectará la señal y matará el proceso */
+            /* FIX (v0.5.3): antes solo se marcaba signal_pending=SIGSEGV y
+             * se retornaba, así que el iret re-ejecutaba LA MISMA
+             * instrucción -> page fault -> return -> page fault... bucle
+             * infinito que colgaba el SO (la señal pendiente solo se
+             * procesaba al salir de un syscall, y este fault no venía de
+             * ninguno). Terminar el proceso AHORA, como hace el manejador
+             * genérico de excepciones de isr.c. */
+            extern bool usermode_fault_kill(int signal_code);
+            usermode_fault_kill(-14);   /* 14 = page fault */
+            return;  /* inalcanzable con jump buffer armado; defensivo */
         }
     }
 
@@ -181,6 +188,52 @@ void vmm_unmap_page(uint32_t virt)
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }
 
+/* Quita el bit PAGE_USER de la página identity-mapped que contiene `phys`
+ * (solo frames dentro del 1 GiB identity-mapped).
+ *
+ * SECURITY (v0.5.3): las tablas 20-255 del identity-map tienen U/S=1, así
+ * que cualquier frame dinámico del PMM (>= 256 MiB tras el fix del PMM)
+ * era accesible directamente desde ring 3 por su VA idéntica — incluidos
+ * los page directories y page tables: un proceso podía editar las
+ * estructuras de paginación del kernel. Toda estructura interna alojada
+ * en un frame dinámico debe llamar a esto tras allocarlo. */
+void vmm_deprivilege_identity_page(uint32_t phys)
+{
+    if (phys >= ((uint32_t)IDENTITY_TABLES << 22))
+        return;
+    uint32_t t = phys >> 22;
+    uint32_t p = (phys >> 12) & 0x3FF;
+    if (page_tables[t][p] & PAGE_PRESENT) {
+        page_tables[t][p] &= ~PAGE_USER;
+        __asm__ volatile("invlpg (%0)" : : "r"(phys) : "memory");
+    }
+}
+
+/* Restaura la identidad (virt==phys, USER) de las páginas de usuario que
+ * fork() remapeó a frames copiados en las page tables COMPARTIDAS, y libera
+ * esos frames. Sin esto, al morir un hijo de fork sus PTEs quedaban
+ * apuntando a frames liberados al PMM: frames dangling visibles (y
+ * escribibles) desde ring 3. Idempotente. */
+void vmm_restore_user_identity(void)
+{
+    uint32_t first = 0x08000000u >> 22;   /* tablas 32.. */
+    uint32_t last  = 0x10000000u >> 22;   /* ..63 (exclusivo) */
+    extern void pmm_free_frame(uint32_t);
+    for (uint32_t t = first; t < last && t < IDENTITY_TABLES; t++) {
+        for (uint32_t p = 0; p < PAGES_PER_TABLE; p++) {
+            uint32_t e = page_tables[t][p];
+            if (!(e & PAGE_PRESENT)) continue;
+            uint32_t virt = (t * PAGES_PER_TABLE + p) * 0x1000u;
+            uint32_t phys = e & ~0xFFFu;
+            if (phys != virt) {
+                pmm_free_frame(phys);
+                page_tables[t][p] = virt | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+                __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
+            }
+        }
+    }
+}
+
 bool vmm_is_enabled(void) { return paging_enabled; }
 
 
@@ -198,6 +251,8 @@ uint32_t vmm_create_address_space(void) {
     extern uint32_t pmm_alloc_frame(void);
     uint32_t pd_phys = pmm_alloc_frame();
     if (!pd_phys) return 0;
+    /* Page directory = estructura del kernel: fuera del alcance de ring 3. */
+    vmm_deprivilege_identity_page(pd_phys);
 
     uint32_t* pd = (uint32_t*)(pd_phys);
     /* copy kernel identity mapping (first 1 GiB) with kernel/user split */
@@ -225,6 +280,8 @@ void vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t fl
     if (!(pd[dir_idx] & PAGE_PRESENT)) {
         uint32_t pt_phys = pmm_alloc_frame();
         if (!pt_phys) return;
+        /* Nueva page table = estructura del kernel: fuera de ring 3. */
+        vmm_deprivilege_identity_page(pt_phys);
         uint32_t* pt = (uint32_t*)pt_phys;
         for (int i = 0; i < 1024; i++) pt[i] = 0;
         pd[dir_idx] = pt_phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;

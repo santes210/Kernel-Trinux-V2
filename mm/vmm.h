@@ -24,4 +24,11 @@ void     vmm_free_address_space(uint32_t pd_phys);
 void     vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t flags);
 uint32_t vmm_get_current_dir(void);
 
+/* Quita PAGE_USER de la página identity-mapped de un frame (para
+ * estructuras internas del kernel alojadas en frames del PMM). */
+void     vmm_deprivilege_identity_page(uint32_t phys);
+/* Restaura las PTEs identidad de la región de usuario y libera frames
+ * remapeados por fork() en las page tables compartidas (al morir un proc). */
+void     vmm_restore_user_identity(void);
+
 #endif /* MM_VMM_H */

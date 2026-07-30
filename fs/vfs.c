@@ -235,6 +235,12 @@ int vfs_delete(const char *path, vfs_node_t *cwd)
     if (!node)
         return -1;
 
+    /* FIX UAF (v0.5.3): no borrar nodos con descriptores abiertos (ver
+     * fd_node_is_open() en cpu/syscall.c). */
+    extern bool fd_node_is_open(vfs_node_t *n);
+    if (fd_node_is_open(node))
+        return -5;   /* busy */
+
     vfs_node_t *parent = node->parent;
     if (parent) {
         /* need write permission on the parent directory to unlink */

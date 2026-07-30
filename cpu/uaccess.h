@@ -30,7 +30,12 @@ static inline bool uaccess_ok(const void *ptr, uint32_t len)
     /* Verificar que el rango no se desborde y esté en zona de usuario. */
     if (addr < USER_SPACE_START)       return false;
     if (addr >= USER_SPACE_END)        return false;
-    if (len > 0 && (addr + len) > USER_SPACE_END) return false;
+    /* SECURITY FIX (v0.5.3): la forma ingenua `addr + len > END` era
+     * vulnerable a wrap-around 32 bits (ej. addr=0x0F000000, len=0xF1000000
+     * daba 0 y pasaba), dejando que un syscall leyera/escribiera TODA la
+     * memoria, incluido el espacio del kernel. Comparar la longitud contra
+     * el espacio restante nunca puede desbordar. */
+    if (len > USER_SPACE_END - addr)   return false;
     return true;
 }
 

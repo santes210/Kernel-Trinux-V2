@@ -5,6 +5,11 @@
 #define MAX_FRAMES   (1024 * 1024)        /* up to 4 GiB / 4 KiB */
 #define BITMAP_WORDS (MAX_FRAMES / 32)
 
+/* El VMM solo identity-mapea el primer 1 GiB físico. Nunca entregar frames
+ * por encima: kheap/vmm/fork escriben a phys como si fuera virt (phys==virt)
+ * y un frame > 1 GiB causaría un page fault en ring 0. */
+#define MAX_MAPPED_FRAMES  (0x40000000u / PMM_FRAME_SIZE)   /* 1 GiB */
+
 static uint32_t frame_bitmap[BITMAP_WORDS];
 static uint32_t total_frames;
 static uint32_t used_frames;
@@ -29,6 +34,8 @@ void pmm_init(uint32_t total_memory_bytes)
     total_frames = total_memory_bytes / PMM_FRAME_SIZE;
     if (total_frames > MAX_FRAMES)
         total_frames = MAX_FRAMES;
+    if (total_frames > MAX_MAPPED_FRAMES)
+        total_frames = MAX_MAPPED_FRAMES;
 
     /* Mark everything used initially, then free what's available. */
     memset(frame_bitmap, 0xFF, sizeof(frame_bitmap));
@@ -40,11 +47,19 @@ void pmm_init(uint32_t total_memory_bytes)
     }
     used_frames = 0;
 
-    /* Reserve the first 128 MiB for BIOS/IVT/VGA + kernel + heap.
-     * Kernel lives at 1 MiB; heap is 32 MiB; we add margin for safety.
-     * The rest of the identity-mapped 1 GiB (128 MiB - 1 GiB) is available
-     * for user processes and dynamic allocations. */
-    pmm_reserve_region(0x00000000, 128 * 1024 * 1024);
+    /* Reserve los primeros 256 MiB: BIOS/kernel/heap + TODA la región de
+     * usuario identity-mapped (ELFs a 0x08048000, stacks 0x0E800000-
+     * 0x0F000000, heaps vía SYS_BRK hasta 0x0E000000).
+     *
+     * CRITICAL FIX (v0.5.3): antes solo se reservaban 128 MiB, así que los
+     * frames físicos que respaldan código/stack/heap de los procesos de
+     * usuario quedaban marcados LIBRES y pmm_alloc_frame() podía entregarlos
+     * a page directories, page tables o a vmm_copy_region() de fork —
+     * sobrescribiendo procesos vivos. Los frames dinámicos ahora provienen
+     * exclusivamente de >= 256 MiB, región que ningún proceso usa como VA
+     * (USER_SPACE_END = 0x10000000). En máquinas con <= 256 MiB
+     * pmm_alloc_frame devuelve 0 y los callers degradan con gracia. */
+    pmm_reserve_region(0x00000000, 256 * 1024 * 1024);
 }
 
 void pmm_reserve_region(uint32_t addr, uint32_t len)

@@ -130,6 +130,24 @@ static int alloc_fd(void) {
     return -1;
 }
 
+/* FIX UAF (v0.5.3): true si algún fd VFS o dir-handle abierto apunta a
+ * `n`. vfs_delete() lo consulta antes de liberar el nodo: los kfds/dh
+ * guardan punteros crudos a vfs_node_t y ramfs_remove_node() hace kfree()
+ * — open(); unlink(); read() era un use-after-free trivial desde ring 3.
+ * (POSIX: el inode sobrevive al último close; aquí sin refcount la
+ * política práctica es EBUSY.) */
+bool fd_node_is_open(vfs_node_t *n)
+{
+    if (!n) return false;
+    for (int i = 3; i < FD_MAX; i++)
+        if (kfds[i].used && kfds[i].node == n)
+            return true;
+    for (int i = 1; i < DH_MAX; i++)
+        if (dh_table[i] == n)
+            return true;
+    return false;
+}
+
 /* CRITICAL: Clean up all file descriptors owned by a dying process.
  * Called from process_exit() to prevent FD leaks that would eventually
  * exhaust the global fd table and prevent any new files from being opened. */

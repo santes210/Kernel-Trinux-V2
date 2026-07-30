@@ -38,7 +38,7 @@ int smp_boot_aps(void);
 
 /* Callback que llama cada AP tras inicializarse.
  * Registra el AP en el scheduler y entra al loop de ejecución de tareas. */
-void ap_main(uint32_t ap_id);
+void ap_main(void);   /* el AP lee su APIC ID del LAPIC (sin args cdecl) */
 
 /* Devuelve cuántos APs están corriendo (además del BSP). */
 int smp_aps_online(void);

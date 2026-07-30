@@ -28,6 +28,15 @@
 #include "../lib/printf.h"
 #include "../drivers/serial.h"
 
+/* FIX (v0.5.3): declaración a nivel de archivo (antes se declaraba dentro
+ * de una función DESPUÉS de usarse -> implicit-declaration warning). */
+extern void tss_set_kernel_stack(uint32_t esp0);
+
+/* Dirección mínima aceptable para un PT_LOAD de un ELF de usuario. Todo
+ * lo inferior es espacio del kernel: un ELF con PT_LOAD en 0x00100000
+ * haría que el loader (ring 0) sobrescribiera el propio kernel. */
+#define ELF_MIN_USER_VADDR  0x08000000U
+
 /* Where we allocate the user stack (within identity-mapped 1 GiB). */
 /* Cada nivel de anidamiento usa un user stack en VA distinta para no
  * pisar el stack del padre. Aún sin address space por proceso real, esto
@@ -231,6 +240,18 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
         return -4;
     }
 
+    /* SECURITY FIX (v0.5.3): validar que la tabla de program headers cabe
+     * dentro del archivo leído (antes: OOB read en el heap con un ELF
+     * corrupto con e_phnum/e_phoff grandes). */
+    if (ehdr->e_phentsize < sizeof(elf32_phdr_t) ||
+        (uint64_t)ehdr->e_phoff +
+        (uint64_t)ehdr->e_phnum * ehdr->e_phentsize > got) {
+        kfree(buf);
+        kprintf("exec: %s: program header table out of bounds\n", path);
+        if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -2; }
+        return -2;
+    }
+
     serial_printf("[elf] loading %s: entry=%08x phnum=%u (pid=%u pd=%08x)\n",
                   path, entry, ehdr->e_phnum, proc ? proc->pid : 0, proc ? proc->page_dir : 0);
 
@@ -264,6 +285,22 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
             kprintf("exec: segment at %08x exceeds 1 GiB identity-mapped region\n", vaddr);
             if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -3; }
             return -3;
+        }
+        /* SECURITY FIX (v0.5.3): el memcpy de abajo corre en ring 0; un
+         * vaddr bajo sobrescribiría el kernel/BIOS con datos del ELF. */
+        if (vaddr < ELF_MIN_USER_VADDR) {
+            kfree(buf);
+            kprintf("exec: segment at %08x is below user space (kernel range)\n", vaddr);
+            if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -3; }
+            return -3;
+        }
+        /* FIX: un segmento fuera del archivo antes solo se "saltaba" la
+         * copia (ejecutando basura); ahora es error duro. */
+        if ((uint64_t)offset + filesz2 > got) {
+            kfree(buf);
+            kprintf("exec: segment at %08x out of file bounds\n", vaddr);
+            if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -2; }
+            return -2;
         }
         if (vaddr + memsz > max_end)
             max_end = vaddr + memsz;
@@ -447,6 +484,14 @@ int elf_execve(const char *path, vfs_node_t *cwd, int argc, char **argv,
      * se escribe todavía -- esto es lo que hace seguro fallar: si algún
      * segmento es inválido, salimos sin haber tocado un solo byte de la
      * memoria del proceso que llamó. ---- */
+    /* SECURITY FIX (v0.5.3): validar primero que la tabla de phdrs cabe en
+     * el archivo (mismo OOB read que en elf_exec_argv_inner). */
+    if (ehdr->e_phentsize < sizeof(elf32_phdr_t) ||
+        (uint64_t)ehdr->e_phoff +
+        (uint64_t)ehdr->e_phnum * ehdr->e_phentsize > got) {
+        kfree(buf);
+        return -2;
+    }
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         elf32_phdr_t *phdr = (elf32_phdr_t *)(buf + ehdr->e_phoff +
                                                (uint32_t)i * ehdr->e_phentsize);
@@ -454,6 +499,12 @@ int elf_execve(const char *path, vfs_node_t *cwd, int argc, char **argv,
             continue;
         uint64_t end = (uint64_t)phdr->p_vaddr + phdr->p_memsz;
         if (end > 0x40000000ULL) {
+            kfree(buf);
+            return -3;
+        }
+        /* SECURITY FIX (v0.5.3): el pase 2 hace memcpy a p_vaddr en ring 0
+         * — un vaddr dentro del rango del kernel sobrescribiría el SO. */
+        if (phdr->p_vaddr < ELF_MIN_USER_VADDR) {
             kfree(buf);
             return -3;
         }

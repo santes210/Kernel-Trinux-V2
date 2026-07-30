@@ -52,7 +52,10 @@ static uint32_t diskfile_read(vfs_node_t *node, uint32_t off, uint32_t size,
     if (size > avail)
         size = avail;
 
-    uint8_t blk[BLOCK_SIZE];
+    /* FIX (v0.5.3): 4 KiB en el stack del kernel (kstacks de 8 KiB) era
+       demasiado: int 0x80 -> syscall -> vfs -> blockfs casi lo desbordaba.
+       Estático: este driver no es reentrante (un solo flujo de kernel). */
+    static uint8_t blk[BLOCK_SIZE];
     uint32_t done = 0;
     while (done < size) {
         uint32_t pos    = off + done;
@@ -77,7 +80,10 @@ static uint32_t diskfile_write(vfs_node_t *node, uint32_t off, uint32_t size,
     if (!ensure_blocks(node, nblocks))
         return 0;
 
-    uint8_t blk[BLOCK_SIZE];
+    /* FIX (v0.5.3): 4 KiB en el stack del kernel (kstacks de 8 KiB) era
+       demasiado: int 0x80 -> syscall -> vfs -> blockfs casi lo desbordaba.
+       Estático: este driver no es reentrante (un solo flujo de kernel). */
+    static uint8_t blk[BLOCK_SIZE];
     uint32_t done = 0;
     while (done < size) {
         uint32_t pos    = off + done;

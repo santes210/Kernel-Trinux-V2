@@ -153,6 +153,18 @@ static void serialize_node(buffer_t *b, vfs_node_t *node, int32_t parent_idx,
     for (uint32_t i = 0; i < node->child_count; i++) {
         if (*count >= (int32_t)DISKFS_MAX_NODES)
             return;
+        /* FIX (v0.5.3): no persistir contenido que se regenera en boot:
+         *  - /dev: los nodos restaurados llegan sin handlers y devfs_init
+         *    los re-anima/recrea de todas formas.
+         *  - /fat: es la vista EN VIVO del volumen FAT16; guardarla
+         *    congelaba una copia estática en el árbol RAM y al bootear se
+         *    remonta encima (duplicados y datos viejos).
+         * Solo se saltan los hijos directos de la raíz con esos nombres. */
+        if (node->parent == NULL) {
+            const char *cn = node->children[i]->name;
+            if (strcmp(cn, "dev") == 0 || strcmp(cn, "fat") == 0)
+                continue;
+        }
         serialize_node(b, node->children[i], my_idx, order, count);
     }
 }
@@ -293,6 +305,12 @@ static void wipe_children(vfs_node_t *node)
         wipe_children(c);
         if (c->data)
             kfree(c->data);
+        /* FIX (v0.5.3): faltaba liberar la lista de bloques de archivos
+         * disk-backed (leak por archivo en cada boot con imagen en disco).
+         * NO liberamos los bloques del disco: la imagen a punto de cargarse
+         * los referencia de nuevo. */
+        if (c->blocks)
+            kfree(c->blocks);
         kfree(c);
     }
     node->child_count = 0;

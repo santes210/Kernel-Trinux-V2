@@ -171,7 +171,22 @@ static vfs_node_t *make_dev(vfs_node_t *dev_dir, const char *name,
                             read_fn r, write_fn w, uint32_t size,
                             uint32_t perms)
 {
-    vfs_node_t *n = ramfs_create_node(dev_dir, name, VFS_DEVICE);
+    /* FIX (v0.5.3): tras un `sync` + reboot, diskfs podía restaurar nodos
+     * de /dev "muertos" (sin handlers) y devfs_init creaba OTRO nodo con
+     * el mismo nombre; finddir devuelve el primero (el muerto) y los
+     * dispositivos dejaban de funcionar. Si ya existe, lo re-animamos. */
+    vfs_node_t *n = vfs_finddir(dev_dir, name);
+    if (n) {
+        n->read        = r;
+        n->write       = w;
+        n->type        = VFS_DEVICE;
+        n->size        = size;
+        n->permissions = perms;
+        n->owner_uid   = 0;
+        n->owner_gid   = 0;
+        return n;
+    }
+    n = ramfs_create_node(dev_dir, name, VFS_DEVICE);
     if (!n) return NULL;
     n->read        = r;
     n->write       = w;
@@ -184,9 +199,12 @@ static vfs_node_t *make_dev(vfs_node_t *dev_dir, const char *name,
 
 void devfs_init(void)
 {
-    /* /dev was created by ramfs_init(); just look it up. */
+    /* /dev lo crea ramfs_init(), pero diskfs ya no lo persiste (v0.5.3):
+     * si el árbol viene de un sync nuevo puede no existir. */
     vfs_node_t *root = vfs_get_root();
     vfs_node_t *dev  = vfs_finddir(root, "dev");
+    if (!dev)
+        dev = ramfs_create_node(root, "dev", VFS_DIRECTORY);
     if (!dev) return;
 
     /* world-readable pseudo devices */
