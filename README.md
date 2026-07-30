@@ -2138,19 +2138,37 @@ salida del programa.
 `users_login`...  Todas son llamadas C normales que solo funcionan
 en ring 0.  En ring 3 cada una debe pasar por un syscall.
 
-#### 3. Solo hay 10 syscalls; faltan ~30
+#### 3. ~~Solo hay 10 syscalls; faltan ~30~~ (ACTUALIZADO — mayoría ya implementada)
 
-Lo que el shell necesita y NO tiene como syscall:
+> **Nota de auditoría (2026-07-29)**: esta tabla quedó desactualizada.
+> Hoy Trinux tiene **72 syscalls** (`user/trinux.h`), y casi todo lo
+> que se listaba aquí como "faltante" ya está en `cpu/syscall.c` desde
+> hace varias fases. Se deja la tabla corregida para que el roadmap no
+> mienta:
 
-| Categoría | Syscalls que faltan |
+| Categoría | Estado real |
 |---|---|
-| Directorios | `SYS_OPENDIR`, `SYS_READDIR`, `SYS_CLOSEDIR`, `SYS_CHDIR`, `SYS_GETCWD` |
-| Ficheros | `SYS_STAT`, `SYS_UNLINK`, `SYS_MKDIR`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_CHMOD`, `SYS_CHOWN` |
-| Procesos | `SYS_FORK`, `SYS_EXECVE`, `SYS_WAIT`, `SYS_KILL`, `SYS_PS_AT`, `SYS_PS_COUNT` |
-| Usuarios | `SYS_GETUID`, `SYS_SETUID`, `SYS_GETPWENT`, `SYS_USERADD`, `SYS_PASSWD` |
-| Memoria | `SYS_BRK`, `SYS_MMAP`, `SYS_MUNMAP` |
-| Terminal | `SYS_TCGETATTR`, `SYS_TCSETATTR`, `SYS_IOCTL` |
-| Pipes/redir | `SYS_PIPE`, `SYS_DUP2`, `SYS_CLOSE` |
+| Directorios | ✅ `SYS_OPENDIR`, `SYS_READDIR`, `SYS_CLOSEDIR`, `SYS_CHDIR`, `SYS_GETCWD` — todos implementados |
+| Ficheros | ✅ `SYS_STAT`, `SYS_UNLINK`, `SYS_MKDIR`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_CHMOD`, `SYS_CHOWN` — todos implementados |
+| Procesos | ✅ `SYS_FORK`, `SYS_WAITPID`, `SYS_KILL`, `SYS_LISTPROC` (ps). ❌ **`SYS_EXECVE` real sigue sin existir** — `SYS_SPAWN` sigue creando un proceso nuevo en vez de reemplazar el actual |
+| Usuarios | ✅ `SYS_GETUID`, `SYS_USERADD`, `SYS_PASSWD`, `SYS_GETUSER`, `SYS_USERLIST`, `SYS_GETGROUPS`. ❌ falta `SYS_SETUID` / `SYS_GETPWENT` estilo POSIX |
+| Memoria | ✅ `SYS_BRK` (72) existe pero es un **placeholder** (dirección de heap fija `0x08100000`, no trackea por proceso — ver limitaciones de v0.5.1 más abajo). ❌ `SYS_MMAP`/`SYS_MUNMAP` no existen |
+| Terminal | ❌ `SYS_TCGETATTR`, `SYS_TCSETATTR`, `SYS_IOCTL` siguen sin existir |
+| Pipes/redir | ✅ `SYS_PIPE`, `SYS_PIPE_CLOSE`, `SYS_FILE_CLOSE`. ❌ `SYS_DUP2_FD` (34) sigue siendo un placeholder sin usar |
+
+> **🔒 Bug de seguridad encontrado y corregido en esta auditoría**: varios
+> de los syscalls de arriba (`SYS_READFILE`, `SYS_FILE_OPEN`, `SYS_RENAME`,
+> `SYS_OPENDIR`) **no llamaban a `vfs_check_access()`**, a pesar de que el
+> kernel sí implementa permisos Unix (`fs/vfs.c`) y los aplica en el shell.
+> En la práctica esto significaba que cualquier usuario sin privilegios
+> podía leer `/etc/shadow` con `cat /etc/shadow` (o `readfile()` directo
+> desde un programa ELF propio), listar `/root` (0700), o pisar archivos
+> ajenos con `writefile()`. También `/etc/shadow` se creaba con el 0644
+> por defecto de ramfs en lugar de 0600. Ya está arreglado: los cuatro
+> syscalls ahora respetan `ACC_READ`/`ACC_WRITE`, `vfs_create()` valida
+> permisos también al sobrescribir un archivo existente (no solo al
+> crear uno nuevo), y `/etc/shadow` se fuerza a 0600 al escribirse.
+> Root sigue con bypass total, como debe ser.
 
 #### 4. No hay aislamiento de memoria por proceso
 

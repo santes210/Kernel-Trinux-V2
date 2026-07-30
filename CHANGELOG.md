@@ -5,6 +5,37 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [Unreleased] - 2026-07-29
+
+### 🐛 Fix crítico de build
+- `user/coreutils/hdrs/reboot.h` estaba vacío (el binario embebido de
+  `reboot` no se había regenerado tras el último merge), lo que rompía
+  la compilación completa del kernel (`kernel/kernel.c` fallaba con
+  `error: 'u_reboot' undeclared`). Este era el motivo real por el que
+  `build.yml` y `ci.yml` llevaban 10 días en rojo. Regenerado.
+
+### 🔒 Seguridad — permisos Unix no aplicados en varios syscalls
+- `SYS_READFILE`, `SYS_FILE_OPEN`, `SYS_RENAME`, `SYS_OPENDIR` ahora
+  llaman a `vfs_check_access()` antes de leer/listar. Antes, cualquier
+  proceso sin privilegios podía leer `/etc/shadow` con `cat` o
+  `readfile()`, listar directorios `0700` como `/root`, o pisar
+  archivos ajenos con `writefile()`.
+- `vfs_create()` ahora valida `ACC_WRITE` también al **sobrescribir**
+  un archivo ya existente (antes solo lo validaba al crear uno nuevo).
+- `/etc/shadow` se fuerza a permisos `0600` al escribirse (antes
+  heredaba el `0644` por defecto de `ramfs`, dejándolo legible por
+  cualquier usuario).
+- Root conserva el bypass total de permisos, sin cambios de comportamiento
+  para el usuario administrador.
+
+### 📝 Documentación
+- Corregida la sección "Solo hay 10 syscalls; faltan ~30" del README:
+  estaba desactualizada — la mayoría de esos syscalls (directorios,
+  stat, chmod/chown, fork/waitpid/kill, uid/passwd) ya estaban
+  implementados desde hace varias fases. Se dejó una tabla con el
+  estado real y lo que sigue faltando de verdad (`SYS_EXECVE` real,
+  `SYS_MMAP`/`SYS_MUNMAP`, `SYS_DUP2`, `SYS_IOCTL`/termios).
+
 ## [0.3.2] - 2026-07-19
 
 ### 🛡️ Aislamiento de memoria avanzado
