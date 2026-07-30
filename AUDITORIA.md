@@ -197,7 +197,37 @@
 
 ---
 
-## 4. Notas de verificación
+## 4. Estado de CI/CD (diagnóstico extra)
+
+- ✅ **`ci.yml` (compilación en PRs) funciona y pasa con esta rama**
+  (35 s, `make clean && make` con nasm, artifact >100 KiB).
+- ❌ **`build.yml` (build + ISO + USB + release) está roto desde que se
+  introdujo** — todos los runs fallan al instante ("workflow file issue",
+  0 s, sin jobs siquiera). Causa más probable detectada en auditoría:
+
+  ```yaml
+  env:
+    USB_SIZE: ${{ github.event.inputs.usb_size_mb || '512' }}
+  ```
+
+  El contexto `github.event.inputs` **solo existe en `workflow_dispatch`**;
+  en eventos `push` el workflow muere durante el registro. Arreglo sugerido
+  (no pudimos empujarlo: el token de la app no tiene permiso `workflows`,
+  aplícalo tú):
+
+  ```yaml
+  env:
+    USB_SIZE: '512'   # y leer el input dentro del step cuando sea dispatch
+  ```
+
+  o resolver el tamaño dentro del step de la imagen USB con
+  `${{ github.event.inputs.usb_size_mb || '512' }}` (los `run:` sí tienen
+  acceso al fallback en cualquier evento).
+- **No se pudo empujar ningún cambio a `.github/workflows/` desde aquí**
+  (HTTP 403: el GitHub App no tiene scope `workflows`) — los cambios de
+  código de esta rama no tocan workflows.
+
+## 5. Notas de verificación
 
 - Todo el código C compila sin errores con los flags del Makefile
   (`-Wall -Wextra`, gcc 12, `-m32`). Los asm no se pudieron ensamblar en
