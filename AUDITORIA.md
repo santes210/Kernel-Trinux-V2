@@ -201,31 +201,52 @@
 
 - ✅ **`ci.yml` (compilación en PRs) funciona y pasa con esta rama**
   (35 s, `make clean && make` con nasm, artifact >100 KiB).
-- ❌ **`build.yml` (build + ISO + USB + release) está roto desde que se
-  introdujo** — todos los runs fallan al instante ("workflow file issue",
-  0 s, sin jobs siquiera). Causa más probable detectada en auditoría:
+- ❌ **`build.yml` (build + ISO + USB + release) estaba roto desde que se
+  introdujo** — todos los runs fallaban al instante con
+  `Invalid workflow file: .github/workflows/build.yml#L121`
+  ("workflow file issue", 0 s, sin jobs). **Causa real (confirmada con el
+  mensaje de GitHub): el heredoc `GRUBEOF` del step "Generar ISO" estaba
+  escrito a columna 0:**
 
   ```yaml
-  env:
-    USB_SIZE: ${{ github.event.inputs.usb_size_mb || '512' }}
+        run: |
+          cat > iso/boot/grub/grub.cfg << 'GRUBEOF'
+  set timeout=5        ← ¡columna 0! CIERRA el bloque escalar run: |
+  ...                  ← YAML intenta parsear esto como nodo nuevo → error
+  GRUBEOF
   ```
 
-  El contexto `github.event.inputs` **solo existe en `workflow_dispatch`**;
-  en eventos `push` el workflow muere durante el registro. Arreglo sugerido
-  (no pudimos empujarlo: el token de la app no tiene permiso `workflows`,
-  aplícalo tú):
+  En YAML, todo el contenido de un bloque `run: |` debe ir indentado más
+  que la clave; al encontrarse `set timeout=5` a columna 0, el bloque
+  termina y el parser muere exactamente en la **línea 121**. El segundo
+  heredoc (`SUMEOF`) sí estaba indentado y por eso no fallaba.
+  El `env: USB_SIZE: ${{ github.event.inputs.usb_size_mb || '512' }}`
+  resultó ser **válido** (en eventos `push` el input es `null` y el
+  `|| '512'` resuelve) — el diagnóstico inicial apuntaba ahí por error.
 
-  ```yaml
-  env:
-    USB_SIZE: '512'   # y leer el input dentro del step cuando sea dispatch
+  **Corregido y validado localmente:** cuerpo y delimitador del heredoc
+  indentados a la altura del bloque, verificado extrayendo los 12 bloques
+  escalares del archivo y pasando cada `run:` por `bash -n`, más una
+  simulación real del paso que genera un `grub.cfg` idéntico al esperado.
+  De paso se eliminó `truncate` de la lista `apt-get install` (no existe
+  como paquete en Ubuntu — viene en `coreutils` — y habría sido el
+  siguiente fallo del workflow con "Unable to locate package truncate").
+- **El push del fix lo tienes que hacer tú** (GitHub rechaza subidas de
+  workflows desde la GitHub App de Arena: `refusing ... without
+  \`workflows\` permission`). El fix listo para aplicar está en la raíz
+  del repo como **`fix-build-yml.patch`**:
+
+  ```bash
+  git apply fix-build-yml.patch
+  git commit -am "ci: fix build.yml heredoc GRUBEOF (error L121)"
+  git push
   ```
 
-  o resolver el tamaño dentro del step de la imagen USB con
-  `${{ github.event.inputs.usb_size_mb || '512' }}` (los `run:` sí tienen
-  acceso al fallback en cualquier evento).
-- **No se pudo empujar ningún cambio a `.github/workflows/` desde aquí**
-  (HTTP 403: el GitHub App no tiene scope `workflows`) — los cambios de
-  código de esta rama no tocan workflows.
+  O desde la web de GitHub, editando `.github/workflows/build.yml`:
+  1. Añade 10 espacios a cada línea del cuerpo del heredoc `GRUBEOF`
+     (líneas 121-129 aprox.) y a la línea `GRUBEOF` que lo cierra, de
+     modo que queden alineadas con el `cat > ... << 'GRUBEOF'`.
+  2. Borra la línea `truncate \` de la lista `apt-get install`.
 
 ## 5. Notas de verificación
 
