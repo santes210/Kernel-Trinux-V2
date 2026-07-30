@@ -248,6 +248,10 @@ void syscall_handler(registers_t *regs)
         if (maxsz > 0 && !uaccess_ok(buf, maxsz)) { regs->eax = (uint32_t)-14; break; }
         vfs_node_t *n = vfs_resolve(path, cwd_of_caller());
         if (!n || n->type != VFS_FILE) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: sin esto, cualquier proceso sin privilegios podía leer
+         * /etc/shadow (o cualquier archivo 0600 de otro usuario) llamando
+         * a readfile() directo, sin pasar por los checks del shell. */
+        if (!vfs_check_access(n, ACC_READ)) { regs->eax = (uint32_t)-1; break; }
         uint32_t want = n->size < maxsz ? n->size : maxsz;
         regs->eax = vfs_read(n, 0, want, buf);
         break;
@@ -322,6 +326,10 @@ void syscall_handler(registers_t *regs)
         UCHECK_STR(dst);
         vfs_node_t *sn = vfs_resolve(src, cwd_of_caller());
         if (!sn) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: leer el contenido de src para copiarlo a dst requiere
+         * permiso de lectura sobre src (antes se podía "rename" un archivo
+         * ajeno y leer su contenido sin ningún check). */
+        if (!vfs_check_access(sn, ACC_READ)) { regs->eax = (uint32_t)-1; break; }
         /* implementación simple: leer src, escribir dst, borrar src.
          * No conserva metadata fina, pero suficiente para mv simple. */
         if (sn->type == VFS_FILE) {
@@ -346,6 +354,10 @@ void syscall_handler(registers_t *regs)
         UCHECK_STR(p);
         vfs_node_t *n = vfs_resolve(p, cwd_of_caller());
         if (!n || n->type != VFS_DIRECTORY) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: listar un directorio requiere permiso de lectura sobre
+         * él (p.ej. /root es 0700: sin este check, un usuario normal podía
+         * hacer opendir("/root")+readdir() y enumerar sus archivos). */
+        if (!vfs_check_access(n, ACC_READ)) { regs->eax = (uint32_t)-1; break; }
         int slot = -1;
         for (int i = 1; i < DH_MAX; i++) if (!dh_table[i]) { slot = i; break; }
         if (slot < 0) { regs->eax = (uint32_t)-1; break; }
@@ -484,6 +496,18 @@ void syscall_handler(registers_t *regs)
         if (!n && (flags & O_CREAT))
             n = vfs_create(path, cwd_of_caller());
         if (!n) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: open() con O_RDONLY/O_WRONLY/O_RDWR debe respetar los
+         * permisos rwx del nodo, igual que readfile()/writefile(). Sin esto
+         * SYS_FILE_OPEN + SYS_FILE_READ era una vía alterna para leer
+         * archivos ajenos (p.ej. /etc/shadow) sin pasar por ningún check. */
+        int acc_mode = flags & 0x3;   /* O_RDONLY=0, O_WRONLY=1, O_RDWR=2 */
+        if (acc_mode == O_RDONLY && !vfs_check_access(n, ACC_READ)) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        if ((acc_mode == O_WRONLY || acc_mode == O_RDWR) &&
+            !vfs_check_access(n, ACC_WRITE)) {
+            regs->eax = (uint32_t)-1; break;
+        }
         int fd = alloc_fd();
         if (fd < 0) { regs->eax = (uint32_t)-1; break; }
         kfds[fd].node = n;

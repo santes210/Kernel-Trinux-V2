@@ -206,8 +206,17 @@ vfs_node_t *vfs_create(const char *path, vfs_node_t *cwd)
     if (!parent || parent->type != VFS_DIRECTORY)
         return NULL;
     vfs_node_t *existing = vfs_finddir(parent, name);
-    if (existing)
+    if (existing) {
+        /* SECURITY: overwriting an existing file (e.g. via writefile()/
+         * SYS_WRITEFILE, or SYS_FILE_OPEN with O_CREAT|O_TRUNC) requires
+         * write permission on the file itself, same as real Unix open(2).
+         * Before this check, any user could truncate/overwrite files they
+         * don't own (e.g. /etc/passwd, another user's files) just by
+         * naming them, bypassing the whole permission model. */
+        if (!vfs_check_access(existing, ACC_WRITE))
+            return NULL;   /* permission denied */
         return existing;
+    }
     if (!vfs_check_access(parent, ACC_WRITE))
         return NULL;   /* permission denied */
     vfs_node_t *n = ramfs_create_node(parent, name, VFS_FILE);
