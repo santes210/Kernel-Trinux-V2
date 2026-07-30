@@ -2138,19 +2138,37 @@ salida del programa.
 `users_login`...  Todas son llamadas C normales que solo funcionan
 en ring 0.  En ring 3 cada una debe pasar por un syscall.
 
-#### 3. Solo hay 10 syscalls; faltan ~30
+#### 3. ~~Solo hay 10 syscalls; faltan ~30~~ (ACTUALIZADO — mayoría ya implementada)
 
-Lo que el shell necesita y NO tiene como syscall:
+> **Nota de auditoría (2026-07-29)**: esta tabla quedó desactualizada.
+> Hoy Trinux tiene **73 syscalls** (`user/trinux.h`), y casi todo lo
+> que se listaba aquí como "faltante" ya está en `cpu/syscall.c` desde
+> hace varias fases. Se deja la tabla corregida para que el roadmap no
+> mienta:
 
-| Categoría | Syscalls que faltan |
+| Categoría | Estado real |
 |---|---|
-| Directorios | `SYS_OPENDIR`, `SYS_READDIR`, `SYS_CLOSEDIR`, `SYS_CHDIR`, `SYS_GETCWD` |
-| Ficheros | `SYS_STAT`, `SYS_UNLINK`, `SYS_MKDIR`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_CHMOD`, `SYS_CHOWN` |
-| Procesos | `SYS_FORK`, `SYS_EXECVE`, `SYS_WAIT`, `SYS_KILL`, `SYS_PS_AT`, `SYS_PS_COUNT` |
-| Usuarios | `SYS_GETUID`, `SYS_SETUID`, `SYS_GETPWENT`, `SYS_USERADD`, `SYS_PASSWD` |
-| Memoria | `SYS_BRK`, `SYS_MMAP`, `SYS_MUNMAP` |
-| Terminal | `SYS_TCGETATTR`, `SYS_TCSETATTR`, `SYS_IOCTL` |
-| Pipes/redir | `SYS_PIPE`, `SYS_DUP2`, `SYS_CLOSE` |
+| Directorios | ✅ `SYS_OPENDIR`, `SYS_READDIR`, `SYS_CLOSEDIR`, `SYS_CHDIR`, `SYS_GETCWD` — todos implementados |
+| Ficheros | ✅ `SYS_STAT`, `SYS_UNLINK`, `SYS_MKDIR`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_CHMOD`, `SYS_CHOWN` — todos implementados |
+| Procesos | ✅ `SYS_FORK`, `SYS_WAITPID`, `SYS_KILL`, `SYS_LISTPROC` (ps). ❌ **`SYS_EXECVE` real sigue sin existir** — `SYS_SPAWN` sigue creando un proceso nuevo en vez de reemplazar el actual |
+| Usuarios | ✅ `SYS_GETUID`, `SYS_USERADD`, `SYS_PASSWD`, `SYS_GETUSER`, `SYS_USERLIST`, `SYS_GETGROUPS`. ❌ falta `SYS_SETUID` / `SYS_GETPWENT` estilo POSIX |
+| Memoria | ✅ `SYS_BRK` (72) existe pero es un **placeholder** (dirección de heap fija `0x08100000`, no trackea por proceso — ver limitaciones de v0.5.1 más abajo). ❌ `SYS_MMAP`/`SYS_MUNMAP` no existen |
+| Terminal | ❌ `SYS_TCGETATTR`, `SYS_TCSETATTR`, `SYS_IOCTL` siguen sin existir |
+| Pipes/redir | ✅ `SYS_PIPE`, `SYS_PIPE_CLOSE`, `SYS_FILE_CLOSE`. ❌ `SYS_DUP2_FD` (34) sigue siendo un placeholder sin usar |
+
+> **🔒 Bug de seguridad encontrado y corregido en esta auditoría**: varios
+> de los syscalls de arriba (`SYS_READFILE`, `SYS_FILE_OPEN`, `SYS_RENAME`,
+> `SYS_OPENDIR`) **no llamaban a `vfs_check_access()`**, a pesar de que el
+> kernel sí implementa permisos Unix (`fs/vfs.c`) y los aplica en el shell.
+> En la práctica esto significaba que cualquier usuario sin privilegios
+> podía leer `/etc/shadow` con `cat /etc/shadow` (o `readfile()` directo
+> desde un programa ELF propio), listar `/root` (0700), o pisar archivos
+> ajenos con `writefile()`. También `/etc/shadow` se creaba con el 0644
+> por defecto de ramfs en lugar de 0600. Ya está arreglado: los cuatro
+> syscalls ahora respetan `ACC_READ`/`ACC_WRITE`, `vfs_create()` valida
+> permisos también al sobrescribir un archivo existente (no solo al
+> crear uno nuevo), y `/etc/shadow` se fuerza a 0600 al escribirse.
+> Root sigue con bypass total, como debe ser.
 
 #### 4. No hay aislamiento de memoria por proceso
 
@@ -2938,7 +2956,7 @@ git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feat
 |---|---|
 | **Líneas de código** | ~12,500 (C + ASM) |
 | **Comandos de shell** | 70+ |
-| **Syscalls** | 72 |
+| **Syscalls** | 73 |
 | **Drivers** | 11 (VGA, teclado, timer, RTC, serial, PCI, ATA, AHCI, xHCI, ACPI EC) |
 | **Sistemas de archivos** | 6 (VFS, RAMFS, DISKFS, BLOCKFS, DEVFS, FAT16) |
 | **Fases implementadas** | 18+ |
@@ -3001,7 +3019,7 @@ son bienvenidos!*
 
 **Solución**:
 - Validación de rango al inicio de `syscall_handler()`
-- Syscalls con número > 72 retornan -1 y logean advertencia
+- Syscalls con número > 73 retornan -1 y logean advertencia
 - Previene dispatch a handlers inexistentes
 
 **Archivos modificados**:
@@ -3250,13 +3268,48 @@ bin  dev  etc  home  root  tmp  var
 ### ⚠️ Limitaciones actuales
 
 1. **`fork()` hace full-copy** del page directory (no COW). Lento para procesos grandes.
-2. **No hay `execve()` real** — `SYS_SPAWN` sigue usando el mecanismo `setjmp/longjmp` + `elf_exec_argv()`.
-3. **`brk()` tracking por proceso** es placeholder (usa `0x08100000` fijo).
+2. ~~No hay `execve()` real~~ **Implementado (v0.5.2)** — `SYS_EXECVE` (73)
+   reemplaza la imagen del proceso llamador in-place (mismo PID), como
+   el `execve(2)` real de Unix. `SYS_SPAWN` (usado por `exec`/el shell)
+   sigue creando un proceso nuevo y esperándolo — ambos mecanismos
+   coexisten, cada uno para su caso de uso. Ver `kernel/elf.c:elf_execve()`.
+3. ~~`brk()` tracking por proceso es placeholder~~ **Implementado (v0.5.2)** —
+   cada `process_t` trackea su propio `heap_start`/`heap_brk`, calculado
+   al cargar el ELF (justo después del último segmento `PT_LOAD`). `SYS_BRK`
+   ya no usa una dirección fija compartida por todos los procesos.
 4. **Kernel stacks** siguen en identity-map global (accesibles si se conoce la dirección, pero requieren `CR3` del kernel).
+5. **`SYS_BRK` no desmapea páginas al encoger** — reducir el break solo
+   mueve el puntero lógico; los frames físicos quedan mapeados hasta que
+   el proceso termina. Conservador pero no libera memoria activamente.
+
+### 🆕 v0.5.2 — `SYS_EXECVE` real y `brk()` por proceso
+
+- **`SYS_EXECVE` (73)**: reemplaza la imagen del proceso que llama (mismo
+  PID, mismo `page_dir`, mismos fds/cwd) con un ELF nuevo, en dos pasadas:
+  primero valida el ELF completo (magic, arquitectura, cada segmento
+  `PT_LOAD` dentro del 1 GiB identity-mapped y del archivo) SIN tocar la
+  memoria del proceso; solo si todo es válido empieza a sobrescribir
+  (`elf_execve()` en `kernel/elf.c`). Si algo falla, el proceso original
+  sigue corriendo intacto — la wrapper `execve_()` en `user/trinux.h`
+  documenta los códigos de error (`-1`..`-5`). También valida el bit
+  `ACC_EXEC` del binario destino (a diferencia de `SYS_SPAWN`, alcanzable
+  hoy solo desde el shell de confianza).
+  Programa de prueba: `exec /bin/execvetest` (compara el PID antes/después
+  para demostrar que es el MISMO proceso).
+- **`brk()` real por proceso**: `process_t` ahora tiene `heap_start` /
+  `heap_brk`. `kernel/elf.c` calcula `heap_start` al cargar cualquier ELF
+  (vía `elf_exec_argv_inner()` o `elf_execve()`) como el final del último
+  segmento `PT_LOAD`, redondeado a página + una página de guarda. `SYS_BRK`
+  ya no acepta bajar de `heap_start`, y `fork()` hereda `heap_start`/`heap_brk`
+  del padre (las páginas de heap ya fueron copiadas físicamente por
+  `vmm_copy_region()`).
+  Programa de prueba: `exec /bin/brktest` (crece el heap, escribe/lee un
+  patrón para confirmar el mapeo real, y verifica que encoger por debajo
+  de `heap_start` se rechaza).
 
 ### 🎯 Próximos pasos (Fase 2 del plan)
 
 1. **COW en `fork()`** — marcar páginas como copy-on-write (bit `PAGE_COW` personalizado o usar `PAGE_RW=0` + page fault handler).
-2. **`SYS_EXECVE`** — reemplazar address space del proceso actual en lugar de crear uno nuevo.
-3. **`brk` real por proceso** — campo `heap_brk` en `process_t`, actualizado por `SYS_BRK`.
+2. ~~`SYS_EXECVE`~~ ✅ hecho arriba.
+3. ~~`brk` real por proceso~~ ✅ hecho arriba.
 4. **Shell como proceso ring 3** — `kernel_main()` → `execve("/bin/mysh")`.

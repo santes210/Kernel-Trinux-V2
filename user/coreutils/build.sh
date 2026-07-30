@@ -18,6 +18,7 @@ declare -A PROGS=(
   [sleep]=sleep_u.c [yes]=yes_u.c [true]=true_u.c [false]=false_u.c
   [id]=id_u.c [reboot]=reboot_u.c [shutdown]=shutdown_u.c
   [sync]=sync_u.c [kill]=kill_u.c [ringtest]=ringtest.c
+  [execvetest]=execvetest_u.c [brktest]=brktest_u.c
   [cp]=cp_u.c [mv]=mv_u.c [stat]=stat_u.c
   [chmod]=chmod_u.c [chown]=chown_u.c
   [date]=date_u.c [free]=free_u.c [df]=df_u.c

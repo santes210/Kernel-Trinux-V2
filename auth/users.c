@@ -25,11 +25,28 @@ static user_t *cur_user;
 
 static void write_file(const char *path, const char *text)
 {
-    vfs_node_t *n = vfs_create(path, vfs_get_root());
+    /* Kernel-internal account storage (passwd/shadow). This runs as part
+     * of an already-authorized operation (users_save() is only reached
+     * after the syscall layer verified the caller may change their own
+     * password, or is root for useradd/etc). It must bypass the regular
+     * VFS permission check on overwrite: /etc/shadow is 0600 owned by
+     * root, so a non-root user changing their *own* password would
+     * otherwise be blocked by vfs_create()'s ACC_WRITE check below. */
+    vfs_node_t *n = vfs_resolve(path, vfs_get_root());
+    if (!n)
+        n = vfs_create(path, vfs_get_root());
     if (!n)
         return;
     n->size = 0;
     vfs_write(n, 0, (uint32_t)strlen(text), (uint8_t *)text);
+    /* SECURITY: /etc/shadow contiene los hashes SHA-256 de las contraseñas.
+     * ramfs crea archivos nuevos con 0644 (world-readable) por defecto, lo
+     * cual anula por completo el propósito de tener un shadow file: hasta
+     * ahora CUALQUIER usuario podía hacer `cat /etc/shadow` y llevarse los
+     * hashes para crackearlos offline. En Linux real /etc/shadow es 0600
+     * (o 0640 root:shadow). Lo forzamos aquí cada vez que se (re)escribe. */
+    if (strcmp(path, "/etc/shadow") == 0)
+        n->permissions = 0600;
 }
 
 static int read_file(const char *path, char *buf, uint32_t cap)

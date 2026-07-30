@@ -109,6 +109,7 @@ typedef int            int32_t;
 #define SYS_GETPPID    70  /* -> ppid del proceso actual                       */
 #define SYS_SIGNAL     71  /* ebx=sig, ecx=handler -> old_handler              */
 #define SYS_BRK        72  /* ebx=new_brk -> old_brk (0 on error)              */
+#define SYS_EXECVE     73  /* ebx=path, ecx=argv -> no regresa si éxito, -1/-2/-3/-4/-5 si falla */
 
 /* Opciones para waitpid */
 #define WNOHANG        1   /* no bloquear si no hay hijos terminados           */
@@ -337,6 +338,18 @@ static inline int waitpid(int pid, int *exit_code){
 }
 static inline int spawn_r(spawn_req_t *req){
     return _syscall1(SYS_SPAWN_R, (int)req);
+}
+
+/* execve(): reemplaza la imagen del proceso actual (mismo pid) con el
+ * ELF en `path`, en lugar de crear un proceso nuevo como spawn()/exec().
+ * Si tiene éxito, NUNCA RETORNA (el propio kernel salta directo al
+ * entry point nuevo al volver del int 0x80). Si falla, retorna un
+ * código negativo y el proceso llamador sigue corriendo intacto,
+ * exactamente como el execve(2) real de Unix:
+ *   -1 no encontrado, -2 ELF inválido, -3 sin memoria / segmento fuera
+ *   de rango, -4 entry point 0, -5 permiso de ejecución denegado. */
+static inline int execve_(const char *path, char **argv){
+    return _syscall2(SYS_EXECVE, (int)path, (int)argv);
 }
 
 /* --- IO con fd --- */

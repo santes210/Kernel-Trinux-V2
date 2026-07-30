@@ -52,6 +52,8 @@
 #include "hdrs/tail.h"
 #include "hdrs/kill.h"
 #include "hdrs/ringtest.h"
+#include "hdrs/execvetest.h"
+#include "hdrs/brktest.h"
 #include "hdrs/chown.h"
 #include "hdrs/wc.h"
 #include "hdrs/uname.h"
@@ -121,6 +123,8 @@ static user_bin_t user_bins[] = {
     { "tail", u_tail, &u_tail_len },
     { "kill", u_kill, &u_kill_len },
     { "ringtest", u_ringtest, &u_ringtest_len },
+    { "execvetest", u_execvetest, &u_execvetest_len },
+    { "brktest", u_brktest, &u_brktest_len },
     { "chown", u_chown, &u_chown_len },
     { "wc", u_wc, &u_wc_len },
     { "uname", u_uname, &u_uname_len },

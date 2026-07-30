@@ -5,6 +5,104 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [0.5.2] - 2026-07-29
+
+### 🚀 `SYS_EXECVE` real (execve() de verdad)
+- Nuevo syscall `SYS_EXECVE` (73): reemplaza la imagen del proceso QUE
+  LLAMA (mismo PID, mismo `page_dir`, mismos fds/cwd) con un ELF nuevo,
+  en lugar de crear un proceso nuevo como hace `SYS_SPAWN`/`exec`.
+- Implementado en dos pasadas en `kernel/elf.c:elf_execve()`: primero se
+  valida el ELF completo (magic/arquitectura/cada segmento `PT_LOAD`
+  dentro del 1 GiB identity-mapped y del archivo) sin tocar la memoria
+  del proceso llamador; solo si todo pasa se empieza a sobrescribir. Si
+  cualquier validación falla, el proceso original sigue corriendo
+  intacto — exactamente la semántica de fallo de `execve(2)` en Unix.
+- Valida el bit `ACC_EXEC` del binario destino (a diferencia de
+  `SYS_SPAWN`, hoy solo alcanzable desde el shell de confianza).
+- `cpu/syscall.c`: en éxito, el handler parchea `regs->eip`/`regs->useresp`
+  del propio trap frame del `int 0x80` en curso, así que el `iret` que ya
+  iba a ejecutar el retorno del syscall salta directo al programa nuevo
+  sin necesitar ningún mecanismo de contexto adicional.
+- Nuevo wrapper `execve_(path, argv)` en `user/trinux.h`.
+- Programa de prueba: `exec /bin/execvetest` — compara su propio PID
+  antes y después de hacer `execve_()` sobre sí mismo; el PID debe ser
+  idéntico, demostrando que es el mismo proceso reemplazado in-place
+  (y no uno nuevo).
+
+### 🚀 `brk()` real por proceso
+- `process_t` (`process/process.h`) gana dos campos: `heap_start` (break
+  inicial, fijado al cargar el ELF) y `heap_brk` (break actual).
+- `kernel/elf.c` calcula `heap_start` en ambos cargadores de ELF
+  (`elf_exec_argv_inner()` y el nuevo `elf_execve()`) como el final del
+  último segmento `PT_LOAD`, redondeado a página + una página de guarda.
+- `SYS_BRK` en `cpu/syscall.c` ya no usa una dirección fija compartida
+  (`0x08100000`) por todos los procesos — ahora lee/escribe
+  `heap_start`/`heap_brk` del proceso actual, rechaza bajar de
+  `heap_start`, y mapea solo las páginas nuevas necesarias al crecer.
+- `mm/fork.c`: el hijo hereda `heap_start`/`heap_brk` del padre (las
+  páginas de heap ya se copian físicamente en `vmm_copy_region()`).
+- Programa de prueba: `exec /bin/brktest` — crece el heap 8 KiB,
+  escribe/lee un patrón de bytes para confirmar que las páginas están
+  de verdad mapeadas, y verifica que un intento de encoger por debajo de
+  `heap_start` se rechaza sin tocar el break.
+
+### 📝 Documentación
+- README: sección "Limitaciones actuales" de v0.5.1 actualizada — ambos
+  puntos (`execve()` real, `brk()` por proceso) que decían "no
+  implementado" ahora están marcados como resueltos con referencia al
+  código correspondiente.
+
+## [Unreleased] - 2026-07-29
+
+### 🔒 Seguridad — DoS trivial vía `nice`/`renice` sin privilegios
+- `process_set_priority()` (usada por `renice`, el comando `nice`, y el
+  syscall `SYS_RENICE`) no verificaba credenciales antes de bajar la
+  prioridad numérica de un proceso (es decir, subirle prioridad real de
+  CPU). El propio comentario en el código decía *"we don't have proper
+  credentials/uid plumbing yet, so any caller can change priority"*.
+  Esto significaba que **cualquier usuario sin privilegios** podía correr
+  `nice -20 exec algo` o `renice -20 <pid>` (incluso sobre PID 1) y
+  monopolizar la CPU vía el scheduler MLFQ — una denegación de servicio
+  trivial de un solo comando, sin necesitar exploit alguno.
+- Ahora bajar la prioridad numérica (`prio < PRIO_DEFAULT`, i.e. pedir
+  *más* CPU) requiere `uid == 0`, igual que el `nice`/`renice` reales de
+  Unix. Subir tu propia prioridad numérica (ser más "amable", ceder CPU)
+  sigue sin restricción para cualquier usuario.
+- El bug existía en **dos rutas separadas** que había que arreglar por
+  separado: `process_set_priority()` (usada por `renice` y por
+  `SYS_RENICE` desde ring 3) y el mecanismo distinto de `nice <prio> <cmd>`
+  en el shell (`process_set_next_priority()`), que no pasaba por el
+  primer check en absoluto.
+
+### 🐛 Fix crítico de build
+- `user/coreutils/hdrs/reboot.h` estaba vacío (el binario embebido de
+  `reboot` no se había regenerado tras el último merge), lo que rompía
+  la compilación completa del kernel (`kernel/kernel.c` fallaba con
+  `error: 'u_reboot' undeclared`). Este era el motivo real por el que
+  `build.yml` y `ci.yml` llevaban 10 días en rojo. Regenerado.
+
+### 🔒 Seguridad — permisos Unix no aplicados en varios syscalls
+- `SYS_READFILE`, `SYS_FILE_OPEN`, `SYS_RENAME`, `SYS_OPENDIR` ahora
+  llaman a `vfs_check_access()` antes de leer/listar. Antes, cualquier
+  proceso sin privilegios podía leer `/etc/shadow` con `cat` o
+  `readfile()`, listar directorios `0700` como `/root`, o pisar
+  archivos ajenos con `writefile()`.
+- `vfs_create()` ahora valida `ACC_WRITE` también al **sobrescribir**
+  un archivo ya existente (antes solo lo validaba al crear uno nuevo).
+- `/etc/shadow` se fuerza a permisos `0600` al escribirse (antes
+  heredaba el `0644` por defecto de `ramfs`, dejándolo legible por
+  cualquier usuario).
+- Root conserva el bypass total de permisos, sin cambios de comportamiento
+  para el usuario administrador.
+
+### 📝 Documentación
+- Corregida la sección "Solo hay 10 syscalls; faltan ~30" del README:
+  estaba desactualizada — la mayoría de esos syscalls (directorios,
+  stat, chmod/chown, fork/waitpid/kill, uid/passwd) ya estaban
+  implementados desde hace varias fases. Se dejó una tabla con el
+  estado real y lo que sigue faltando de verdad (`SYS_EXECVE` real,
+  `SYS_MMAP`/`SYS_MUNMAP`, `SYS_DUP2`, `SYS_IOCTL`/termios).
+
 ## [0.3.2] - 2026-07-19
 
 ### 🛡️ Aislamiento de memoria avanzado
