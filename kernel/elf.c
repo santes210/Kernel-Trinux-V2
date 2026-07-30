@@ -1,26 +1,27 @@
 /* kernel/elf.c  -  ELF32 executable loader.
  *
  * Reads an ELF32 executable from the VFS, loads its PT_LOAD segments into
- * memory, and jumps to the entry point in ring 3 (userspace).
+ * FRAMES FRESCOS del PMM dentro del address space PRIVADO del proceso
+ * (v0.6.0), and jumps to the entry point in ring 3 (userspace) con el
+ * CR3 del propio proceso.
  *
- * The user program communicates with the kernel ONLY via int 0x80 syscalls
- * (same as the built-in `usertest` demo).  When it calls SYS_EXIT, control
- * returns here.
+ * The user program communicates with the kernel ONLY via int 0x80 syscalls.
+ * When it calls SYS_EXIT, control returns here (setjmp/longjmp con dueño).
  *
  * Memory layout for user programs:
- *   - Code/data loaded at the addresses specified in the ELF program headers
- *     (typically starting at 0x08048000 for a standard i386 executable, but
- *     we also support lower addresses within the identity-mapped 1 GiB).
- *   - A user stack is allocated at a fixed high address within the
- *     identity-mapped region.
- *   - Each process has its own address space (page directory) created by
- *     process_create(). The ELF is loaded into that process's address space.
- *     The kernel's identity-mapped page tables are shared for the first 1 GiB
- *     (shallow copy), so loading via virtual addresses works in both contexts.
+ *   - Cada proceso vive en su PROPIO address space: su page directory
+ *     tiene page tables PRIVADAS para la región de usuario
+ *     0x08000000-0x10000000 (tablas 32-63).  Kernel, physmap y MMIO se
+ *     comparten con el page directory del kernel (vmm.c).
+ *   - El código/datos del ELF se cargan en frames PMM nuevos; el stack
+ *     de usuario vive siempre en la misma VA (0x0F000000) pero en
+ *     frames físicos distintos por proceso.  Anidar spawns ya NO
+ *     requiere backups de 736 KiB ni stacks por nivel de anidamiento.
  */
 #include "elf.h"
 #include "../fs/vfs.h"
 #include "../mm/kheap.h"
+#include "../mm/pmm.h"
 #include "../mm/vmm.h"
 #include "../cpu/syscall.h"
 #include "../process/process.h"
@@ -34,47 +35,20 @@ extern void tss_set_kernel_stack(uint32_t esp0);
 
 /* Dirección mínima aceptable para un PT_LOAD de un ELF de usuario. Todo
  * lo inferior es espacio del kernel: un ELF con PT_LOAD en 0x00100000
- * haría que el loader (ring 0) sobrescribiera el propio kernel. */
+ * haría que el loader sobrescribiera el propio kernel. */
 #define ELF_MIN_USER_VADDR  0x08000000U
 
-/* Where we allocate the user stack (within identity-mapped 1 GiB). */
-/* Cada nivel de anidamiento usa un user stack en VA distinta para no
- * pisar el stack del padre. Aún sin address space por proceso real, esto
- * basta para shell->hijo->nieto (3 niveles). Cada nivel reserva 64 KB.
- *
- * Nivel 0 (shell)    : 0x0F000000  (256 KiB hacia abajo)
- * Nivel 1 (cmd)      : 0x0EE00000
- * Nivel 2 (sub-cmd)  : 0x0EC00000
- *
- * Las VAs estan dentro del identity-map de 1 GiB, asi que el CPU las ve
- * en cualquier momento. La proteccion de aislamiento depende del bit User
- * de las paginas (ya activado en vmm_init para el identity map). */
-#define USER_STACK_SIZE     0x10000   /* 64 KiB por nivel */
-#define USER_STACK_TOP_L0   0x0F000000U
-#define USER_STACK_TOP_L1   0x0EE00000U
-#define USER_STACK_TOP_L2   0x0EC00000U
-#define USER_STACK_TOP_L3   0x0EA00000U   /* por si acaso */
-#define USER_STACK_TOP_FALLBACK 0x0E800000U
+/* Y máxima: la región privada de usuario termina en 0x10000000
+ * (USER_SPACE_END). Antes se aceptaba hasta 1 GiB, pero con las tablas
+ * 64-255 cerradas a ring 3 (physmap supervisor) un segmento ahí ya no
+ * es ejecutable: límites coherentes con uaccess. */
+#define ELF_MAX_USER_VADDR  0x10000000U
 
-/* Rebase del segundo nivel de recursion (cuando un ELF ring-3 hace
- * SPAWN de otro ELF): cargamos al hijo a OFFSET arriba de donde linkeo,
- * para no pisar el codigo del padre que vive en 0x08048000.
- *
- * Es una "reubicación a mano" pre-padding del p_vaddr: cada PT_LOAD se
- * carga en (p_vaddr + g_elf_rebase) y el entry point se ajusta.
- *
- * Limitacion: SOLO funciona si el ELF es position-independent O si el
- * tamaño total cabe sin que se referencien direcciones absolutas.
- * Nuestros coreutils estan enlazados a 0x08048000 fijo, asi que un
- * rebase romperia sus accesos absolutos.
- *
- * Alternativa mas simple y correcta: GUARDAR Y RESTAURAR la region
- * 0x08048000..0x08100000 (768 KB) alrededor del spawn anidado.
- * Eso es lo que hacemos abajo, con un kmalloc temporal. */
-static uint8_t *g_padre_backup;
-static uint32_t g_padre_backup_size;
-#define PADRE_SAVE_BASE  0x08048000
-#define PADRE_SAVE_SIZE  0x000B8000   /* 736 KB -- cubre code+data+bss del shell */
+/* User stack: una sola cima canónica (64 KiB hacia abajo) en las tablas
+ * PRIVADAS de cada proceso. No existen niveles L0..L3 ni backups del
+ * padre: el aislamiento por proceso los hizo innecesarios. */
+#define USER_STACK_SIZE     0x10000u          /* 64 KiB */
+#define USER_STACK_TOP      0x0F000000u
 
 /* Validate an ELF32 header. */
 static bool elf_validate(const elf32_ehdr_t *hdr)
@@ -102,59 +76,238 @@ static bool elf_validate(const elf32_ehdr_t *hdr)
     return true;
 }
 
+/* ============================================================================
+ * Carga de segmentos en FRAMES FRESCHOS (v0.6.0)
+ *
+ * Mapea en las tablas PRIVADAS de `proc` las páginas [vaddr, vaddr+memsz)
+ * con un frame PMM nuevo por página (ceros), copiando la parte file-backed
+ * dentro de cada frame. El frame se toca por su VA identidad (>= 256 MiB,
+ * physmap supervisor escribible en ring 0 con cualquier CR3 activo).
+ * ==========================================================================*/
+static int map_segment_pages(process_t *proc,
+                             uint32_t vaddr,
+                             const uint8_t *file_data, uint32_t filesz,
+                             uint32_t memsz)
+{
+    for (uint32_t pg = vaddr & ~0xFFFu; pg < vaddr + memsz; pg += 0x1000) {
+        uint32_t fr = pmm_alloc_frame();
+        if (!fr) return -3;   /* sin memoria física */
+        memset((void *)fr, 0, 4096);
+
+        /* Tile de solapamiento página vs parte file-backed del segmento */
+        uint32_t lo = (pg > vaddr) ? pg : vaddr;
+        uint32_t hi = vaddr + filesz;
+        if (hi > pg + 0x1000u) hi = pg + 0x1000u;
+        if (file_data && lo < hi)
+            memcpy((void *)(fr + (lo - pg)), file_data + (lo - vaddr), hi - lo);
+
+        vmm_map_page_in(proc->page_dir, pg, fr,
+                        PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    }
+    return 0;
+}
+
+/* Mapea el stack de usuario canónico (frame fresco por página, ceros). */
+static int map_user_stack(process_t *proc)
+{
+    return map_segment_pages(proc, USER_STACK_TOP - USER_STACK_SIZE,
+                             NULL, 0, USER_STACK_SIZE);
+}
+
+/* ============================================================================
+ * Construcción de argc/argv/en la cima del user stack del proceso.
+ *
+ * Misma disposición System-V que siempre: strings descendentes desde
+ * USER_STACK_TOP-16, punteros, y [esp]=0,[esp+4]=argc,[esp+8]=argv.
+ * Se construye en un staging de kheap y se copia con vmm_copy_to_user(),
+ * porque las VAs destino viven en las tablas PRIVADAS del proceso.
+ * ==========================================================================*/
+static int build_user_stack(process_t *proc, int argc, char **argv,
+                            uint32_t *out_esp)
+{
+    *out_esp = 0;
+
+    if (argc <= 0 || !argv) {
+        /* Stack vacío con 3 dwords dummy (compat con _start legacy). */
+        uint32_t zeros[3] = {0, 0, 0};
+        uint32_t esp = USER_STACK_TOP - 16 - 12;
+        if (vmm_copy_to_user(proc->page_dir, esp, zeros, sizeof(zeros)))
+            return -3;
+        *out_esp = esp;
+        return 0;
+    }
+
+    if (argc > 32) argc = 32;
+
+    uint32_t total = 0;
+    for (int i = 0; i < argc; i++) {
+        int sl = 0; while (argv[i][sl]) sl++;
+        total += (uint32_t)sl + 1;
+    }
+    if (total + 4u * (argc + 1) + 32 > USER_STACK_SIZE / 2)
+        return -3;   /* argv monstruoso: no construir un stack inseguro */
+
+    /* Calcular layout sobre VAs absolutas (como siempre). */
+    uint32_t str_top  = USER_STACK_TOP - 16;
+    uint32_t first_va = str_top;       /* VA más baja que tocaremos */
+    /* strings (descendente) */
+    for (int i = argc - 1; i >= 0; i--) {
+        int sl = 0; while (argv[i][sl]) sl++;
+        str_top -= (uint32_t)sl + 1;
+        if (str_top < first_va) first_va = str_top;
+    }
+    uint32_t arr = (str_top & ~0x3u) - 4u * (uint32_t)(argc + 1);
+    uint32_t esp = arr - 12;
+    if (esp < first_va) first_va = esp;
+
+    /* Staging: imagen del intervalo [esp, USER_STACK_TOP -16). Nota: el
+     * hueco [USER_STACK_TOP-16, USER_STACK_TOP) no se toca (padding). */
+    uint32_t span = (USER_STACK_TOP - 16) - esp;
+    uint8_t *stg = (uint8_t *)kmalloc(span);
+    if (!stg) return -3;
+    memset(stg, 0, span);
+
+    uint32_t cur = USER_STACK_TOP - 16;
+    uint32_t str_ptrs[32];
+    for (int i = argc - 1; i >= 0; i--) {
+        int sl = 0; while (argv[i][sl]) sl++;
+        cur -= (uint32_t)sl + 1;
+        memcpy(stg + (cur - esp), argv[i], (uint32_t)sl + 1);
+        str_ptrs[i] = cur;
+    }
+    for (int i = 0; i < argc; i++)
+        ((uint32_t *)(stg + (arr - esp)))[i] = str_ptrs[i];
+    ((uint32_t *)(stg + (arr - esp)))[argc] = 0;
+
+    /* [esp]=0, [esp+4]=argc, [esp+8]=arr */
+    ((uint32_t *)stg)[1] = (uint32_t)argc;
+    ((uint32_t *)stg)[2] = arr;
+
+    int rc = vmm_copy_to_user(proc->page_dir, esp, stg, span);
+    kfree(stg);
+    if (rc) return -3;
+    *out_esp = esp;
+    return 0;
+}
+
+/* ============================================================================
+ * Lectura + validación completa del ELF (sin tocar memoria del proceso).
+ * Devuelve 0 ok y deja entry/max_end; o código de error negativo:
+ *   -1 not found, -2 no-ELF/bounds, -3 oom/rango, -4 entry 0
+ * ==========================================================================*/
+static int read_elf(const char *path, vfs_node_t *cwd,
+                    uint8_t **out_buf, uint32_t *out_got)
+{
+    vfs_node_t *file = vfs_resolve(path, cwd);
+    if (!file || file->type != VFS_FILE) {
+        kprintf("exec: %s: not found\n", path);
+        return -1;
+    }
+    uint32_t filesz = file->size;
+    if (filesz < sizeof(elf32_ehdr_t)) {
+        kprintf("exec: %s: too small to be an ELF\n", path);
+        return -2;
+    }
+    uint8_t *buf = (uint8_t *)kmalloc(filesz);
+    if (!buf) {
+        kprintf("exec: out of memory (%u bytes)\n", filesz);
+        return -3;
+    }
+    uint32_t got = vfs_read(file, 0, filesz, buf);
+    if (got < sizeof(elf32_ehdr_t)) {
+        kfree(buf);
+        kprintf("exec: %s: read error\n", path);
+        return -2;
+    }
+    *out_buf = buf;
+    *out_got = got;
+    return 0;
+}
+
+static int validate_phdrs(const uint8_t *buf, uint32_t got,
+                          const elf32_ehdr_t *ehdr)
+{
+    /* SECURITY FIX (v0.5.3): la tabla de program headers debe caber en
+     * el archivo leído (antes: OOB read con e_phnum/e_phoff corruptos). */
+    if (ehdr->e_phentsize < sizeof(elf32_phdr_t) ||
+        (uint64_t)ehdr->e_phoff +
+        (uint64_t)ehdr->e_phnum * ehdr->e_phentsize > got)
+        return -2;
+
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const elf32_phdr_t *phdr = (const elf32_phdr_t *)(buf + ehdr->e_phoff +
+                                                (uint32_t)i * ehdr->e_phentsize);
+        if (phdr->p_type != PT_LOAD)
+            continue;
+        uint64_t end = (uint64_t)phdr->p_vaddr + phdr->p_memsz;
+        if (end > ELF_MAX_USER_VADDR)
+            return -3;
+        if (phdr->p_vaddr < ELF_MIN_USER_VADDR)
+            return -3;
+        if ((uint64_t)phdr->p_offset + phdr->p_filesz > got)
+            return -2;
+    }
+    return 0;
+}
+
+/* Copia alta/baja entre dos VAs: end del último segmento para brk(). */
+static void track_max_end(const elf32_ehdr_t *ehdr, const uint8_t *buf,
+                          uint32_t *max_end)
+{
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const elf32_phdr_t *phdr = (const elf32_phdr_t *)(buf + ehdr->e_phoff +
+                                                (uint32_t)i * ehdr->e_phentsize);
+        if (phdr->p_type != PT_LOAD) continue;
+        if (phdr->p_vaddr + phdr->p_memsz > *max_end)
+            *max_end = phdr->p_vaddr + phdr->p_memsz;
+    }
+}
+
+static int load_segments(process_t *proc, const uint8_t *buf,
+                         const elf32_ehdr_t *ehdr)
+{
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const elf32_phdr_t *phdr = (const elf32_phdr_t *)(buf + ehdr->e_phoff +
+                                                (uint32_t)i * ehdr->e_phentsize);
+        if (phdr->p_type != PT_LOAD)
+            continue;
+        serial_printf("[elf] segment: vaddr=%08x filesz=%u memsz=%u\n",
+                      phdr->p_vaddr, phdr->p_filesz, phdr->p_memsz);
+        int rc = map_segment_pages(proc, phdr->p_vaddr,
+                                   buf + phdr->p_offset,
+                                   phdr->p_filesz, phdr->p_memsz);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+/* Seed del brk() justo después del último segmento (alineado a página). */
+static void seed_brk(process_t *proc, uint32_t max_end)
+{
+    if (proc && max_end > 0) {
+        uint32_t heap_start = (max_end + 0x1000u) & ~0xFFFu;
+        proc->heap_start = heap_start;
+        proc->heap_brk   = heap_start;
+    }
+}
+
+static void proc_dies(process_t *proc, int code)
+{
+    if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = code; }
+}
+
 int elf_exec(const char *path, vfs_node_t *cwd)
 {
     return elf_exec_argv(path, cwd, 0, NULL);
 }
 
-/* Profundidad de anidamiento de elf_exec: 0 = primer ELF, 1 = ELF lanzado
- * desde otro ELF (caso del shell ring-3 que hace SPAWN).  Necesario para
- * saber cuando respaldar el codigo del padre. */
-static int g_nest = 0;
+static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd,
+                               int argc, char **argv, process_t *proc);
 
-/* Forward declaration for the inner function that does the actual work */
-static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char **argv, process_t *proc);
-
-/* Wrapper that handles nesting, backup/restore, and process creation */
+/* Wrapper: crea el proceso y lo ejecuta SIN backups ni niveles de
+ * anidamiento (v0.6.0 — el aislamiento por address space los reemplaza). */
 int elf_exec_argv(const char *path, vfs_node_t *cwd, int argc, char **argv)
 {
-    /* Si vamos a entrar a un nivel >=1, guardamos la region de codigo
-     * del padre porque el hijo se cargara en la misma VA. */
-    uint8_t *backup = NULL;
-    char   **argv_copy = NULL;
-    int      did_save = 0;
-    if (g_nest >= 1) {
-        backup = (uint8_t *)kmalloc(PADRE_SAVE_SIZE);
-        if (backup) {
-            memcpy(backup, (void *)PADRE_SAVE_BASE, PADRE_SAVE_SIZE);
-            did_save = 1;
-        }
-        /* Tambien argv vive en el espacio del padre (su stack/scratch).
-         * Lo copiamos a kheap antes de que el ELF nuevo lo pise. */
-        if (argc > 0 && argv) {
-            uint32_t total = 0;
-            for (int i = 0; i < argc; i++) {
-                int sl = 0; while (argv[i][sl]) sl++;
-                total += sl + 1;
-            }
-            uint8_t *blob = (uint8_t *)kmalloc(total + (argc+1) * sizeof(char *));
-            if (blob) {
-                argv_copy = (char **)blob;
-                char *str = (char *)(blob + (argc+1) * sizeof(char *));
-                for (int i = 0; i < argc; i++) {
-                    argv_copy[i] = str;
-                    int j = 0;
-                    while (argv[i][j]) { *str++ = argv[i][j]; j++; }
-                    *str++ = 0;
-                }
-                argv_copy[argc] = NULL;
-                argv = argv_copy;
-            }
-        }
-    }
-    g_nest++;
-
-    /* Create the process FIRST (which creates its address space) */
     char name[32];
     const char *slash = path;
     for (const char *p = path; *p; p++)
@@ -171,17 +324,8 @@ int elf_exec_argv(const char *path, vfs_node_t *cwd, int argc, char **argv)
         rc = elf_exec_argv_inner(path, cwd, argc, argv, proc);
     }
 
-    g_nest--;
-    if (did_save && backup) {
-        memcpy((void *)PADRE_SAVE_BASE, backup, PADRE_SAVE_SIZE);
-        kfree(backup);
-    }
-    if (argv_copy) kfree(argv_copy);
-
-    /* Restore previous current */
+    /* Restore previous current + TSS del flujo que sigue. */
     if (prev_current) process_set_current(prev_current);
-
-    /* Restore TSS.esp0 to the now-current task's kernel stack */
     process_t *now = process_get_current();
     if (now && now->kstack)
         tss_set_kernel_stack((uint32_t)now->kstack + 8192);
@@ -189,46 +333,21 @@ int elf_exec_argv(const char *path, vfs_node_t *cwd, int argc, char **argv)
     return rc;
 }
 
-/* Inner function: loads ELF into the given process's address space and runs it */
-static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char **argv, process_t *proc)
+/* Inner function: loads the ELF into the process's PRIVATE address space
+ * and runs it in ring 3 with the process's CR3. */
+static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd,
+                               int argc, char **argv, process_t *proc)
 {
-    /* ---- Read the file ---- */
-    vfs_node_t *file = vfs_resolve(path, cwd);
-    if (!file || file->type != VFS_FILE) {
-        kprintf("exec: %s: not found\n", path);
-        if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -1; }
-        return -1;
-    }
+    uint8_t *buf = NULL;
+    uint32_t got = 0;
+    int rc = read_elf(path, cwd, &buf, &got);
+    if (rc) { proc_dies(proc, rc); return rc; }
 
-    uint32_t filesz = file->size;
-    if (filesz < sizeof(elf32_ehdr_t)) {
-        kprintf("exec: %s: too small to be an ELF\n", path);
-        if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -2; }
-        return -2;
-    }
-
-    /* Read entire file into a temporary buffer. */
-    uint8_t *buf = (uint8_t *)kmalloc(filesz);
-    if (!buf) {
-        kprintf("exec: out of memory (%u bytes)\n", filesz);
-        if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -3; }
-        return -3;
-    }
-
-    uint32_t got = vfs_read(file, 0, filesz, buf);
-    if (got < sizeof(elf32_ehdr_t)) {
-        kfree(buf);
-        kprintf("exec: %s: read error\n", path);
-        if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -2; }
-        return -2;
-    }
-
-    /* ---- Validate ELF header ---- */
     elf32_ehdr_t *ehdr = (elf32_ehdr_t *)buf;
     if (!elf_validate(ehdr)) {
         kfree(buf);
         kprintf("exec: %s: not a valid ELF32 i386 executable\n", path);
-        if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -2; }
+        proc_dies(proc, -2);
         return -2;
     }
 
@@ -236,242 +355,118 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
     if (entry == 0) {
         kfree(buf);
         kprintf("exec: %s: entry point is 0\n", path);
-        if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -4; }
+        proc_dies(proc, -4);
         return -4;
     }
 
-    /* SECURITY FIX (v0.5.3): validar que la tabla de program headers cabe
-     * dentro del archivo leído (antes: OOB read en el heap con un ELF
-     * corrupto con e_phnum/e_phoff grandes). */
-    if (ehdr->e_phentsize < sizeof(elf32_phdr_t) ||
-        (uint64_t)ehdr->e_phoff +
-        (uint64_t)ehdr->e_phnum * ehdr->e_phentsize > got) {
+    rc = validate_phdrs(buf, got, ehdr);
+    if (rc) {
         kfree(buf);
-        kprintf("exec: %s: program header table out of bounds\n", path);
-        if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -2; }
-        return -2;
+        kprintf("exec: %s: invalid program headers (rc=%d)\n", path, rc);
+        proc_dies(proc, rc);
+        return rc;
     }
 
     serial_printf("[elf] loading %s: entry=%08x phnum=%u (pid=%u pd=%08x)\n",
-                  path, entry, ehdr->e_phnum, proc ? proc->pid : 0, proc ? proc->page_dir : 0);
+                  path, entry, ehdr->e_phnum, proc ? proc->pid : 0,
+                  proc ? proc->page_dir : 0);
 
-    /* Tracks the highest (vaddr + memsz) across all PT_LOAD segments, so
-     * we can seed the process's brk() heap right after the ELF's BSS --
-     * exactly where a real libc's initial program break sits. */
+    /* ---- Cargar la imagen en frames frescos del address space privado ---- */
     uint32_t max_end = 0;
+    track_max_end(ehdr, buf, &max_end);
 
-    /* ---- Load PT_LOAD segments into the process's address space ---- */
-    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-        elf32_phdr_t *phdr = (elf32_phdr_t *)(buf + ehdr->e_phoff +
-                                               i * ehdr->e_phentsize);
-        if (phdr->p_type != PT_LOAD)
-            continue;
-
-        uint32_t vaddr  = phdr->p_vaddr;
-        uint32_t memsz  = phdr->p_memsz;
-        uint32_t filesz2 = phdr->p_filesz;
-        uint32_t offset = phdr->p_offset;
-
-        serial_printf("[elf] segment: vaddr=%08x filesz=%u memsz=%u\n",
-                      vaddr, filesz2, memsz);
-
-        /* For the first 1 GiB (identity-mapped region), pages are already
-         * mapped in both kernel and process page directories (shallow copy).
-         * We just need to ensure the data is copied to the virtual address.
-         * Since the page tables are shared for this region, a simple memcpy
-         * works and is visible in both address spaces. */
-        if (vaddr + memsz > 1024 * 1024 * 1024) {
-            kfree(buf);
-            kprintf("exec: segment at %08x exceeds 1 GiB identity-mapped region\n", vaddr);
-            if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -3; }
-            return -3;
-        }
-        /* SECURITY FIX (v0.5.3): el memcpy de abajo corre en ring 0; un
-         * vaddr bajo sobrescribiría el kernel/BIOS con datos del ELF. */
-        if (vaddr < ELF_MIN_USER_VADDR) {
-            kfree(buf);
-            kprintf("exec: segment at %08x is below user space (kernel range)\n", vaddr);
-            if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -3; }
-            return -3;
-        }
-        /* FIX: un segmento fuera del archivo antes solo se "saltaba" la
-         * copia (ejecutando basura); ahora es error duro. */
-        if ((uint64_t)offset + filesz2 > got) {
-            kfree(buf);
-            kprintf("exec: segment at %08x out of file bounds\n", vaddr);
-            if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -2; }
-            return -2;
-        }
-        if (vaddr + memsz > max_end)
-            max_end = vaddr + memsz;
-
-        /* Map pages in the process's address space if not already present.
-         * For identity-mapped region, they should already be present from
-         * vmm_create_address_space(), but we ensure USER flag is set. */
-        if (proc && proc->page_dir) {
-            for (uint32_t pg = vaddr & ~0xFFF; pg < vaddr + memsz; pg += 0x1000) {
-                uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
-                vmm_map_page_in(proc->page_dir, pg, pg, flags);
-            }
-        }
-
-        /* Copy file data into memory at vaddr. */
-        if (filesz2 > 0 && offset + filesz2 <= got)
-            memcpy((void *)vaddr, buf + offset, filesz2);
-
-        /* Zero the BSS portion (memsz > filesz). */
-        if (memsz > filesz2)
-            memset((void *)(vaddr + filesz2), 0, memsz - filesz2);
+    rc = load_segments(proc, buf, ehdr);
+    if (rc) {
+        kfree(buf);
+        kprintf("exec: %s: out of physical memory\n", path);
+        proc_dies(proc, rc);
+        return rc;
     }
-
     kfree(buf);
 
-    /* Seed brk(): the heap starts right after the last loaded segment
-     * (page-aligned up, with one guard page of slack so a slightly-off
-     * BSS end never overlaps the first heap page). SYS_BRK grows it from
-     * here. See cpu/syscall.c's SYS_BRK handler for the actual mapping. */
-    if (proc && max_end > 0) {
-        uint32_t heap_start = (max_end + 0x1000) & ~0xFFFu;
-        proc->heap_start = heap_start;
-        proc->heap_brk   = heap_start;
+    seed_brk(proc, max_end);
+
+    /* ---- User stack (frames frescos) + argv ---- */
+    rc = map_user_stack(proc);
+    if (rc) {
+        kprintf("exec: %s: out of memory for user stack\n", path);
+        proc_dies(proc, rc);
+        return rc;
     }
 
-    /* ---- Set up user stack in the process's address space ---- */
-    uint32_t USER_STACK_TOP;
-    switch (g_nest) {
-        case 1:  USER_STACK_TOP = USER_STACK_TOP_L0; break;
-        case 2:  USER_STACK_TOP = USER_STACK_TOP_L1; break;
-        case 3:  USER_STACK_TOP = USER_STACK_TOP_L2; break;
-        case 4:  USER_STACK_TOP = USER_STACK_TOP_L3; break;
-        default: USER_STACK_TOP = USER_STACK_TOP_FALLBACK; break;
-    }
-    uint32_t stack_base = USER_STACK_TOP - USER_STACK_SIZE;
-
-    /* Ensure stack pages are mapped in process's address space */
-    if (proc && proc->page_dir) {
-        for (uint32_t pg = stack_base & ~0xFFF; pg < USER_STACK_TOP; pg += 0x1000) {
-            uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
-            vmm_map_page_in(proc->page_dir, pg, pg, flags);
-        }
-    }
-
-    memset((void *)stack_base, 0, USER_STACK_SIZE);
-    uint32_t user_esp = USER_STACK_TOP - 16;   /* leave a little room */
-    /* deja 12 bytes con dummy/0/0 por si argv==NULL */
-    user_esp -= 12;
-    ((uint32_t *)user_esp)[0] = 0;
-    ((uint32_t *)user_esp)[1] = 0;
-    ((uint32_t *)user_esp)[2] = 0;
-
-    /* ---- Push argv/argc onto the user stack (System-V style) ---- */
-    if (argc > 0 && argv) {
-        user_esp = USER_STACK_TOP - 16;
-        uint32_t str_top = user_esp;
-        uint32_t str_ptrs[32];
-        if (argc > 32) argc = 32;
-        for (int i = argc - 1; i >= 0; i--) {
-            int slen = 0; while (argv[i][slen]) slen++;
-            slen++;
-            str_top -= slen;
-            memcpy((void *)str_top, argv[i], slen);
-            str_ptrs[i] = str_top;
-        }
-        str_top &= ~0x3u;
-        uint32_t arr = str_top - 4 * (argc + 1);
-        for (int i = 0; i < argc; i++)
-            ((uint32_t *)arr)[i] = str_ptrs[i];
-        ((uint32_t *)arr)[argc] = 0;
-
-        user_esp = arr;
-        user_esp -= 12;
-        ((uint32_t *)user_esp)[0] = 0;
-        ((uint32_t *)user_esp)[1] = (uint32_t)argc;
-        ((uint32_t *)user_esp)[2] = arr;
+    uint32_t user_esp = 0;
+    rc = build_user_stack(proc, argc, argv, &user_esp);
+    if (rc) {
+        kprintf("exec: %s: argv too big\n", path);
+        proc_dies(proc, rc);
+        return rc;
     }
 
     serial_printf("[elf] jumping to ring 3 at %08x (stack %08x)\n",
                   entry, user_esp);
 
-    /* ---- Drop to ring 3 using save/restore mechanism ---- */
-    extern void tss_set_kernel_stack(uint32_t esp0);
-    extern int  usermode_save_and_enter(uint32_t entry, uint32_t user_stack,
-                                        uint32_t *save_esp);
-    extern void elf_arm_exit_jmp(void);
-    extern void elf_disarm_exit_jmp(void);
-    extern int  elf_get_exit_code(void);
+    /* ---- Entrar a ring 3 con el CR3 del proceso (v0.6.0) ---- */
+    extern int      usermode_save_and_enter(uint32_t entry, uint32_t user_stack,
+                                            uint32_t *save_esp);
+    extern int      elf_arm_exit_jmp(void);     /* 0 primera pasada */
+    extern void     elf_disarm_exit_jmp(void);
+    extern bool     elf_jmp_still_armed(void);
+    extern uint32_t elf_jmp_saved_cr3(void);
+    extern int      elf_get_exit_code(void);
 
-    elf_arm_exit_jmp();
+    int arm_rc = elf_arm_exit_jmp();
+    if (arm_rc < 0) {           /* sin slots: demasiados niveles */
+        proc_dies(proc, -5);
+        return -5;
+    }
 
     uint32_t saved_esp = 0;
-    if (proc && proc->kstack) {
-        tss_set_kernel_stack((uint32_t)proc->kstack + 8192);
-    } else {
-        uint8_t *kstack = (uint8_t *)kmalloc(4096);
-        if (kstack)
-            tss_set_kernel_stack((uint32_t)(kstack + 4096));
+    if (arm_rc == 0 && elf_jmp_still_armed()) {
+        /* PRIMERA PASADA (guard redundante contra el retorno del longjmp) */
+        if (proc->kstack)
+            tss_set_kernel_stack((uint32_t)proc->kstack + 8192);
+        vmm_switch_address_space(proc->page_dir);
+        (void)usermode_save_and_enter(entry, user_esp, &saved_esp);
     }
 
-    (void)usermode_save_and_enter(entry, user_esp, &saved_esp);
-
-    /* ---- Program has exited (via SYS_EXIT longjmp or fault) ---- */
+    /* ---- El programa salió (SYS_EXIT/fault → longjmp al arm) ---- */
+    vmm_switch_address_space(elf_jmp_saved_cr3());
     int exit_code = elf_get_exit_code();
     elf_disarm_exit_jmp();
-    if (proc) {
-        proc->state     = PROC_ZOMBIE;
-        proc->exit_code = exit_code;
-    }
+    proc_dies(proc, exit_code);
 
     return exit_code;
 }
 
 /* ============================================================================
  * elf_execve() — execve() real: reemplaza la imagen del proceso QUE LLAMA
- * (mismo PID) en lugar de crear uno nuevo, tal como el execve(2) de Unix.
+ * (mismo PID). Llamada DESDE el manejador de SYS_EXECVE con el int 0x80 del
+ * proceso en curso: no salta nada; prepara la imagen nueva y devuelve
+ * (entry, esp) para que el `iret` que ya iba a ejecutar el int 0x80 salte
+ * directo al programa nuevo. La salida posterior (SYS_EXIT) usa el mismo
+ * jump buffer armado para este PID desde su lanzamiento original — el
+ * owner del buffer es el pid, y execve() NO cambia el pid. ✓
  *
- * A diferencia de elf_exec_argv_inner() (usado por `exec`/SYS_SPAWN, que
- * crea un proceso NUEVO y entra a ring 3 de forma anidada vía
- * usermode_save_and_enter + setjmp/longjmp), esta función es llamada
- * DESDE el manejador de SYS_EXECVE mientras se procesa el int 0x80 de un
- * proceso ring-3 ya existente.  No hace ningún salto: solo prepara la
- * nueva imagen y devuelve el (entry, esp) nuevos para que el propio
- * `iret` que ya iba a ejecutar el `int 0x80` salte directo al programa
- * nuevo.  Así, cuando el programa nuevo eventualmente llame SYS_EXIT,
- * usa exactamente el mismo mecanismo (setjmp/longjmp ya armado para
- * este PID desde que fue lanzado originalmente) sin nada especial.
- *
- * Semántica de fallo: si CUALQUIER validación falla, el proceso que
- * llamó NO se toca — sigue corriendo con su imagen original intacta,
- * igual que un execve() real que falla.  Por eso se valida el ELF
- * COMPLETO (incluyendo cada segmento PT_LOAD) antes de sobrescribir un
- * solo byte de la memoria del proceso.
- * ============================================================================ */
+ * Semántica de fallo: si CUALQUIER validación falla, el proceso llamador
+ * sigue corriendo con su imagen intacta (execve(2) real).
+ * ==========================================================================*/
 int elf_execve(const char *path, vfs_node_t *cwd, int argc, char **argv,
                uint32_t *out_eip, uint32_t *out_esp)
 {
     process_t *proc = process_get_current();
     if (!proc) return -1;
 
-    /* ---- Resolver y validar el ELF destino SIN tocar la memoria del
-     * proceso que llama.  Real execve(): si falla, el llamador sigue
-     * corriendo intacto. ---- */
     vfs_node_t *file = vfs_resolve(path, cwd);
     if (!file || file->type != VFS_FILE) return -1;
 
-    /* SECURITY: a diferencia del exec()/SYS_SPAWN existente (solo
-     * alcanzable desde el shell de confianza resolviendo /bin/<cmd>),
-     * SYS_EXECVE se invoca directamente desde ring 3, así que SÍ debe
-     * respetar el bit de ejecución -- un binario 0700 de otro usuario
-     * no debería poder "execve-arse" desde un proceso sin privilegios. */
+    /* SECURITY: SYS_EXECVE se invoca desde ring 3, así que SÍ respeta el
+     * bit de ejecución (un binario 0700 ajeno no debe ser ejecutable). */
     if (!vfs_check_access(file, ACC_EXEC)) return -5;
 
-    uint32_t filesz = file->size;
-    if (filesz < sizeof(elf32_ehdr_t)) return -2;
-
-    uint8_t *buf = (uint8_t *)kmalloc(filesz);
-    if (!buf) return -3;
-
-    uint32_t got = vfs_read(file, 0, filesz, buf);
-    if (got < sizeof(elf32_ehdr_t)) { kfree(buf); return -2; }
+    uint8_t *buf = NULL;
+    uint32_t got = 0;
+    int rc = read_elf(path, cwd, &buf, &got);
+    if (rc) return rc;
 
     elf32_ehdr_t *ehdr = (elf32_ehdr_t *)buf;
     if (!elf_validate(ehdr)) { kfree(buf); return -2; }
@@ -479,45 +474,11 @@ int elf_execve(const char *path, vfs_node_t *cwd, int argc, char **argv,
     uint32_t entry = ehdr->e_entry;
     if (entry == 0) { kfree(buf); return -4; }
 
-    /* ---- Pase 1 (solo validación): cada segmento PT_LOAD debe caber en
-     * el 1 GiB identity-mapped y estar dentro del archivo leído.  Nada
-     * se escribe todavía -- esto es lo que hace seguro fallar: si algún
-     * segmento es inválido, salimos sin haber tocado un solo byte de la
-     * memoria del proceso que llamó. ---- */
-    /* SECURITY FIX (v0.5.3): validar primero que la tabla de phdrs cabe en
-     * el archivo (mismo OOB read que en elf_exec_argv_inner). */
-    if (ehdr->e_phentsize < sizeof(elf32_phdr_t) ||
-        (uint64_t)ehdr->e_phoff +
-        (uint64_t)ehdr->e_phnum * ehdr->e_phentsize > got) {
-        kfree(buf);
-        return -2;
-    }
-    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-        elf32_phdr_t *phdr = (elf32_phdr_t *)(buf + ehdr->e_phoff +
-                                               (uint32_t)i * ehdr->e_phentsize);
-        if (phdr->p_type != PT_LOAD)
-            continue;
-        uint64_t end = (uint64_t)phdr->p_vaddr + phdr->p_memsz;
-        if (end > 0x40000000ULL) {
-            kfree(buf);
-            return -3;
-        }
-        /* SECURITY FIX (v0.5.3): el pase 2 hace memcpy a p_vaddr en ring 0
-         * — un vaddr dentro del rango del kernel sobrescribiría el SO. */
-        if (phdr->p_vaddr < ELF_MIN_USER_VADDR) {
-            kfree(buf);
-            return -3;
-        }
-        if ((uint64_t)phdr->p_offset + phdr->p_filesz > got) {
-            kfree(buf);
-            return -2;
-        }
-    }
+    rc = validate_phdrs(buf, got, ehdr);
+    if (rc) { kfree(buf); return rc; }
 
-    /* ---- argv vive en la memoria del PROPIO llamador, que el Pase 2 de
-     * abajo está a punto de sobrescribir -- copiarlo (con sus strings) a
-     * kheap primero, igual que ya hace elf_exec_argv() para spawns
-     * anidados. ---- */
+    /* argv vive en la memoria del PROPIO llamador, que vmm_reset_user_region
+     * está a punto de liberar — copiarlo (con strings) a kheap primero. */
     char **argv_copy = NULL;
     if (argc > 0 && argv) {
         uint32_t total = 0;
@@ -542,113 +503,32 @@ int elf_execve(const char *path, vfs_node_t *cwd, int argc, char **argv,
     serial_printf("[execve] pid=%u reemplazando imagen con %s: entry=%08x phnum=%u\n",
                   proc->pid, path, entry, ehdr->e_phnum);
 
-    /* ---- Pase 2 (commit): a partir de aquí sobrescribimos la memoria
-     * del propio proceso -- ya no hay vuelta atrás, igual que el
-     * execve() real empieza a desmapear el address space viejo justo
-     * antes de mapear el nuevo. ---- */
+    /* ---- Commit: libera la imagen vieja y carga la nueva ---- */
     uint32_t max_end = 0;
-    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-        elf32_phdr_t *phdr = (elf32_phdr_t *)(buf + ehdr->e_phoff +
-                                               (uint32_t)i * ehdr->e_phentsize);
-        if (phdr->p_type != PT_LOAD)
-            continue;
+    track_max_end(ehdr, buf, &max_end);
 
-        uint32_t vaddr   = phdr->p_vaddr;
-        uint32_t memsz   = phdr->p_memsz;
-        uint32_t filesz2 = phdr->p_filesz;
-        uint32_t offset  = phdr->p_offset;
+    if (proc->page_dir)
+        vmm_reset_user_region(proc->page_dir);   /* libera frames viejos */
 
-        if (vaddr + memsz > max_end)
-            max_end = vaddr + memsz;
+    /* NOTA: a partir de aquí el código/datos/stack viejos están
+     * desmapeados. Seguimos a salvo en ring 0 (kstack + kernel tables
+     * compartidas) y antes del iret todo lo nuevo queda mapeado. */
 
-        if (proc->page_dir) {
-            for (uint32_t pg = vaddr & ~0xFFF; pg < vaddr + memsz; pg += 0x1000) {
-                uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
-                vmm_map_page_in(proc->page_dir, pg, pg, flags);
-            }
-        }
-
-        if (filesz2 > 0)
-            memcpy((void *)vaddr, buf + offset, filesz2);
-        if (memsz > filesz2)
-            memset((void *)(vaddr + filesz2), 0, memsz - filesz2);
-    }
-
+    rc = load_segments(proc, buf, ehdr);
+    if (rc == 0) rc = map_user_stack(proc);
+    uint32_t user_esp = 0;
+    if (rc == 0) rc = build_user_stack(proc, argc, argv, &user_esp);
     kfree(buf);
-
-    /* SECURITY/CORRECTNESS: execve() reemplaza por completo el heap del
-     * proceso, igual que en Unix real -- cualquier puntero que el
-     * programa anterior tuviera hacia SU heap deja de tener sentido con
-     * el ELF nuevo mapeado encima. Sin este reset, un proceso podría
-     * heredar el heap_brk del programa viejo (potencialmente MÁS ALTO
-     * que el final del BSS del programa nuevo) y SYS_BRK aceptaría
-     * `new_brk` menores a ese valor heredado como "encoger", dejando
-     * mapeadas páginas de heap del programa anterior visibles para el
-     * nuevo -- una fuga de datos entre programas ejecutados vía execve()
-     * en el mismo proceso. */
-    if (max_end > 0) {
-        uint32_t heap_start = (max_end + 0x1000) & ~0xFFFu;
-        proc->heap_start = heap_start;
-        proc->heap_brk   = heap_start;
-    }
-
-    /* ---- Stack de usuario nuevo, reusando el MISMO nivel de anidamiento
-     * en el que ya corría el proceso llamador (ver USER_STACK_TOP_L* más
-     * arriba): execve() reemplaza el programa en su lugar, no añade un
-     * nivel nuevo de anidamiento. ---- */
-    uint32_t USER_STACK_TOP;
-    switch (g_nest) {
-        case 1:  USER_STACK_TOP = USER_STACK_TOP_L0; break;
-        case 2:  USER_STACK_TOP = USER_STACK_TOP_L1; break;
-        case 3:  USER_STACK_TOP = USER_STACK_TOP_L2; break;
-        case 4:  USER_STACK_TOP = USER_STACK_TOP_L3; break;
-        default: USER_STACK_TOP = USER_STACK_TOP_FALLBACK; break;
-    }
-    uint32_t stack_base = USER_STACK_TOP - USER_STACK_SIZE;
-
-    if (proc->page_dir) {
-        for (uint32_t pg = stack_base & ~0xFFF; pg < USER_STACK_TOP; pg += 0x1000) {
-            uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
-            vmm_map_page_in(proc->page_dir, pg, pg, flags);
-        }
-    }
-    memset((void *)stack_base, 0, USER_STACK_SIZE);
-
-    uint32_t user_esp = USER_STACK_TOP - 16;
-    user_esp -= 12;
-    ((uint32_t *)user_esp)[0] = 0;
-    ((uint32_t *)user_esp)[1] = 0;
-    ((uint32_t *)user_esp)[2] = 0;
-
-    if (argc > 0 && argv) {
-        user_esp = USER_STACK_TOP - 16;
-        uint32_t str_top = user_esp;
-        uint32_t str_ptrs[32];
-        if (argc > 32) argc = 32;
-        for (int i = argc - 1; i >= 0; i--) {
-            int slen = 0; while (argv[i][slen]) slen++;
-            slen++;
-            str_top -= (uint32_t)slen;
-            memcpy((void *)str_top, argv[i], (uint32_t)slen);
-            str_ptrs[i] = str_top;
-        }
-        str_top &= ~0x3u;
-        uint32_t arr = str_top - 4 * (uint32_t)(argc + 1);
-        for (int i = 0; i < argc; i++)
-            ((uint32_t *)arr)[i] = str_ptrs[i];
-        ((uint32_t *)arr)[argc] = 0;
-
-        user_esp = arr;
-        user_esp -= 12;
-        ((uint32_t *)user_esp)[0] = 0;
-        ((uint32_t *)user_esp)[1] = (uint32_t)argc;
-        ((uint32_t *)user_esp)[2] = arr;
-    }
-
     if (argv_copy) kfree(argv_copy);
+    if (rc) {
+        /* No hay vuelta atrás: terminar el proceso (exit code de error). */
+        proc_dies(proc, rc);
+        return rc;
+    }
 
-    /* Renombrar el proceso para reflejar el programa nuevo -- mismo PID,
-     * mismo padre, mismos fds/cwd, exactamente como un execve() real. */
+    seed_brk(proc, max_end);
+
+    /* Renombrar el proceso (mismo PID, como execve real). */
     const char *slash = path;
     for (const char *p = path; *p; p++)
         if (*p == '/') slash = p + 1;

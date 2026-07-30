@@ -32,6 +32,16 @@
 #define KERNEL_END_VIRT  0x05000000U    /* 80 MiB */
 #define KERNEL_END_TABLE (KERNEL_END_VIRT >> 22)  /* 20 = page table index */
 
+/* Región de usuario (VA 0x08000000-0x10000000) = tablas 32..63.
+ * En el PD del kernel quedan identity-mapped (legado, inerte), pero en
+ * cada proceso viven en page tables PRIVADAS (v0.6.0). */
+#define USER_TABLE_FIRST  32
+#define USER_TABLE_LAST   64             /* exclusivo */
+
+/* PMM reserva los primeros 256 MiB: todo frame entregado por
+ * pmm_alloc_frame() es >= 0x10000000 (ver mm/pmm.c). */
+#define PMM_FRAME_MIN     0x10000000U
+
 /* Extra page tables for on-demand MMIO mappings (AHCI ABAR, etc.).
  * These cover addresses above the 1 GiB identity-mapped region.
  * We keep a small pool of 8 tables — enough for mapping a handful of
@@ -112,26 +122,30 @@ void vmm_init(void)
 {
     memset(page_directory, 0, sizeof(page_directory));
 
-    /* Identity-map the first 1 GiB.
-     * Pages below KERNEL_END_VIRT (80 MiB) are supervisor-only (U/S=0):
-     *   - BIOS/IVT/VGA (0-1 MB)
-     *   - Kernel code + data (~32 MB)
-     *   - Kernel heap (~32 MB)
-     * Pages at or above KERNEL_END_VIRT are user-accessible (U/S=1):
-     *   - User program code/data/stack/heap
-     */
+    /* Identity-map the first 1 GiB, con politica por rangos (v0.6.0):
+     *   tablas  0-19  (0-80 MiB)      : kernel — supervisor solo
+     *   tablas 20-31  (80-128 MiB)    : reservado PMM — supervisor solo
+     *   tablas 32-63  (128-256 MiB)   : region de VA de USUARIO (U/S=1)
+     *   tablas 64-255 (256 MiB-1 GiB) : physmap de frames PMM dinamicos
+     *                                   — SUPERVISOR SOLO (cerrado en
+     *                                   v0.6.0: ver vmm.c y AUDITORIA).
+     *
+     * Antes todo lo >= 80 MiB era accesible desde ring 3: cualquier
+     * proceso podia leer/escribir CUALQUIER frame fisico del sistema
+     * usando la direccion fisica como VA.  Ahora ring 3 solo puede
+     * tocar su region privada (32-63) via sus propias page tables. */
     for (int t = 0; t < IDENTITY_TABLES; t++) {
-        bool is_kernel_table = (t < KERNEL_END_TABLE);
+        bool is_user_table = (t >= USER_TABLE_FIRST && t < USER_TABLE_LAST);
         for (int p = 0; p < PAGES_PER_TABLE; p++) {
             uint32_t phys = (t * PAGES_PER_TABLE + p) * 0x1000;
             uint32_t flags = PAGE_PRESENT | PAGE_RW;
-            if (!is_kernel_table) {
-                flags |= PAGE_USER;  /* user-accessible above kernel boundary */
+            if (is_user_table) {
+                flags |= PAGE_USER;
             }
             page_tables[t][p] = phys | flags;
         }
         uint32_t pd_flags = PAGE_PRESENT | PAGE_RW;
-        if (!is_kernel_table) {
+        if (is_user_table) {
             pd_flags |= PAGE_USER;
         }
         page_directory[t] = ((uint32_t)page_tables[t]) | pd_flags;
@@ -248,27 +262,122 @@ void vmm_switch_address_space(uint32_t pd_phys) {
 }
 
 uint32_t vmm_create_address_space(void) {
+    /* v0.6.0 — address space REAL:
+     *   - tablas 0-31  : compartidas con el kernel (supervisor)
+     *   - tablas 32-63 : PRIVADAS (page tables nuevas, vacías) — aquí
+     *     vive todo el mundo del proceso (code/data/bss/heap/stack)
+     *   - tablas 64-255: compartidas (physmap supervisor de frames PMM)
+     *   - tablas 256+  : snapshot de las PDEs del kernel (MMIO: AHCI,
+     *     xHCI, APIC...) para que los drivers sigan funcionando cuando
+     *     una syscall corra con CR3 = este page directory.
+     */
     extern uint32_t pmm_alloc_frame(void);
+    extern void     pmm_free_frame(uint32_t);
     uint32_t pd_phys = pmm_alloc_frame();
     if (!pd_phys) return 0;
     /* Page directory = estructura del kernel: fuera del alcance de ring 3. */
     vmm_deprivilege_identity_page(pd_phys);
 
-    uint32_t* pd = (uint32_t*)(pd_phys);
-    /* copy kernel identity mapping (first 1 GiB) with kernel/user split */
-    for (int i = 0; i < 1024; i++) {
-        if (i < IDENTITY_TABLES) {
-            /* For tables 0-19 (kernel), strip PAGE_USER; for 20+, keep it */
-            if (i < KERNEL_END_TABLE) {
-                pd[i] = page_directory[i] & ~PAGE_USER;  /* supervisor-only */
-            } else {
-                pd[i] = page_directory[i];  /* user-accessible */
-            }
-        } else {
-            pd[i] = 0;
+    uint32_t *pd = (uint32_t *)pd_phys;   /* frames PMM: identity VA ok en ring 0 */
+    for (int i = 0; i < 1024; i++)
+        pd[i] = page_directory[i];
+
+    for (int i = USER_TABLE_FIRST; i < USER_TABLE_LAST; i++) {
+        uint32_t pt_phys = pmm_alloc_frame();
+        if (!pt_phys) {
+            /* rollback de las page tables ya creadas */
+            for (int k = USER_TABLE_FIRST; k < i; k++)
+                pmm_free_frame(pd[k] & ~0xFFFu);
+            pmm_free_frame(pd_phys);
+            return 0;
         }
+        vmm_deprivilege_identity_page(pt_phys);
+        memset((void *)pt_phys, 0, 4096);   /* región privada arranca VACÍA */
+        pd[i] = pt_phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
     }
     return pd_phys;
+}
+
+uint32_t vmm_kernel_dir(void) { return (uint32_t)page_directory; }
+
+/* Devuelve la page table PRIVADA (32-63) que cubre `virt`, o NULL. */
+static uint32_t *user_pt(uint32_t *pd, uint32_t virt)
+{
+    uint32_t dir_idx = virt >> 22;
+    if (dir_idx < USER_TABLE_FIRST || dir_idx >= USER_TABLE_LAST) return 0;
+    if (!(pd[dir_idx] & PAGE_PRESENT)) return 0;
+    return (uint32_t *)(pd[dir_idx] & ~0xFFFu);
+}
+
+int vmm_copy_to_user(uint32_t pd_phys, uint32_t va, const void *src, uint32_t len)
+{
+    uint32_t *pd = (uint32_t *)pd_phys;
+    const uint8_t *s = (const uint8_t *)src;
+    while (len) {
+        uint32_t *pt = user_pt(pd, va);
+        if (!pt) return -1;
+        uint32_t pte = pt[(va >> 12) & 0x3FF];
+        if (!(pte & PAGE_PRESENT)) return -1;
+        uint32_t off  = va & 0xFFF;
+        uint32_t chunk = 4096 - off;
+        if (chunk > len) chunk = len;
+        /* El frame es PMM (>= 256 MiB): escribible vía identity VA en
+         * ring 0 con CUALQUIER CR3 activo (physmap supervisor compartido). */
+        memcpy((void *)((pte & ~0xFFFu) + off), s, chunk);
+        s += chunk; va += chunk; len -= chunk;
+    }
+    return 0;
+}
+
+void vmm_reset_user_region(uint32_t pd_phys)
+{
+    extern void pmm_free_frame(uint32_t);
+    uint32_t *pd = (uint32_t *)pd_phys;
+    for (int t = USER_TABLE_FIRST; t < USER_TABLE_LAST; t++) {
+        if (!(pd[t] & PAGE_PRESENT)) continue;
+        uint32_t *pt = (uint32_t *)(pd[t] & ~0xFFFu);
+        for (int p = 0; p < PAGES_PER_TABLE; p++) {
+            uint32_t pte = pt[p];
+            if (!(pte & PAGE_PRESENT)) continue;
+            uint32_t phys = pte & ~0xFFFu;
+            uint32_t virt = (uint32_t)((t * PAGES_PER_TABLE + p)) * 0x1000u;
+            /* Solo frames PMM privados (nunca identidad heredada). */
+            if (phys != virt && phys >= PMM_FRAME_MIN)
+                pmm_free_frame(phys);
+            pt[p] = 0;
+        }
+    }
+}
+
+int vmm_copy_user_space(uint32_t dst_pd, uint32_t src_pd)
+{
+    extern uint32_t pmm_alloc_frame(void);
+    uint32_t *dst = (uint32_t *)dst_pd;
+    uint32_t *src = (uint32_t *)src_pd;
+    for (int t = USER_TABLE_FIRST; t < USER_TABLE_LAST; t++) {
+        if (!(src[t] & PAGE_PRESENT)) continue;
+        uint32_t *spt = (uint32_t *)(src[t] & ~0xFFFu);
+        uint32_t *dpt = (uint32_t *)(dst[t] & ~0xFFFu);
+        for (int p = 0; p < PAGES_PER_TABLE; p++) {
+            uint32_t pte = spt[p];
+            if (!(pte & PAGE_PRESENT)) continue;
+            uint32_t sphys = pte & ~0xFFFu;
+            uint32_t virt  = (uint32_t)((t * PAGES_PER_TABLE + p)) * 0x1000u;
+            if (sphys == virt) {
+                /* Página identity heredada (no debería existir en v0.6.0,
+                 * pero si aparece: compartir la misma entrada — la memoria
+                 * reservada < 256 MiB no es reclaimable). */
+                dpt[p] = pte;
+                continue;
+            }
+            uint32_t nf = pmm_alloc_frame();
+            if (!nf) return -1;
+            memcpy((void *)nf, (void *)sphys, 4096);
+            vmm_deprivilege_identity_page(nf);
+            dpt[p] = nf | (pte & 0xFFFu) | PAGE_PRESENT;
+        }
+    }
+    return 0;
 }
 
 void vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t flags) {
@@ -289,21 +398,37 @@ void vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t fl
 
     uint32_t* pt = (uint32_t*)(pd[dir_idx] & ~0xFFF);
     pt[tbl_idx] = (phys & ~0xFFF) | (flags & 0xFFF) | PAGE_PRESENT;
+
+    /* v0.6.0: si el PD destino es el ACTIVO (ej. SYS_BRK mapeando en el
+     * heap del proceso en curso), invalidar la entrada de TLB: el page-walk
+     * cache puede retener el "not-present" anterior y aun así faultar. */
+    if (pd_phys == current_page_directory)
+        __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }
 
 void vmm_free_address_space(uint32_t pd_phys) {
     extern void pmm_free_frame(uint32_t);
-    uint32_t* pd = (uint32_t*)pd_phys;
-    for (int i = IDENTITY_TABLES; i < 1024; i++) {
-        if (pd[i] & PAGE_PRESENT) {
-            uint32_t* pt = (uint32_t*)(pd[i] & ~0xFFF);
-            for (int j = 0; j < 1024; j++) {
-                if (pt[j] & PAGE_PRESENT) {
-                    pmm_free_frame(pt[j] & ~0xFFF);
-                }
-            }
-            pmm_free_frame(pd[i] & ~0xFFF);
+    uint32_t *pd = (uint32_t *)pd_phys;
+    /* Sólo lo que el proceso POSEE en exclusiva:
+     *   - contenido de sus page tables PRIVADAS (32-63): frames PMM
+     *     mapeados a VA distinta (phys != virt => skip de identidades)
+     *   - las page tables privadas en sí
+     *   - el page directory
+     * NUNCA las tablas compartidas (0-31, 64-255) ni las PDEs 256+
+     * (MMIO del kernel — antes el free de 256+ podía devolver frames
+     * estáticos extra_tables al PMM: corrupción latente). */
+    for (int t = USER_TABLE_FIRST; t < USER_TABLE_LAST; t++) {
+        if (!(pd[t] & PAGE_PRESENT)) continue;
+        uint32_t *pt = (uint32_t *)(pd[t] & ~0xFFFu);
+        for (int p = 0; p < PAGES_PER_TABLE; p++) {
+            uint32_t pte = pt[p];
+            if (!(pte & PAGE_PRESENT)) continue;
+            uint32_t phys = pte & ~0xFFFu;
+            uint32_t virt = (uint32_t)((t * PAGES_PER_TABLE + p)) * 0x1000u;
+            if (phys != virt && phys >= PMM_FRAME_MIN)
+                pmm_free_frame(phys);
         }
+        pmm_free_frame(pd[t] & ~0xFFFu);
     }
     pmm_free_frame(pd_phys);
 }

@@ -100,6 +100,28 @@ syscall_stub:
     add esp, 8            ; pop int_no + err_code
     iret
 
+; --- fork(): entrada del hijo ------------------------------------------------
+; void fork_child_trampoline(void);
+; El hijo de fork() no pasa por usermode_save_and_enter: entra en escena
+; cuando el scheduler (vía context_switch) hace `ret` a su context.eip.
+; En ese momento esp apunta a una COPIA del trap frame del int 0x80 del
+; padre (layout idéntico a registers_t, con eax=0). Replicamos aquí la
+; cola de syscall_stub: restauramos los segmentos de datos de usuario,
+; el bloque pusha, saltamos int_no/err_code e iret: el hijo "regresa" de
+; su int 0x80 a ring 3 como si fork() hubiera devuelto 0.
+global fork_child_trampoline
+fork_child_trampoline:
+    pop eax               ; ds guardado
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    popa                  ; edi,esi,ebp,esp(dummy),ebx,edx,ecx,eax (=0)
+
+    add esp, 8            ; saltar int_no + err_code
+    iret                  ; eip, cs, eflags, useresp, ss -> ring 3
+
 ; --- drop into ring 3 -------------------------------------------------------
 ; void enter_usermode(uint32_t entry, uint32_t user_stack);
 ; Builds an iret frame that switches CS/SS to the ring-3 selectors and jumps

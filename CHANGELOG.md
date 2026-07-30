@@ -5,6 +5,66 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [0.6.0] - 2026-07-30
+
+### 🏛️ Address spaces REALES por proceso + fork() real (P0 de la auditoría)
+
+El cambio arquitectónico más grande de Trinux: cada proceso ahora vive en
+su propio espacio de direcciones, y `fork()` funciona de verdad.
+
+#### Añadido
+- **Aislamiento de memoria por proceso** (`mm/vmm.c`): cada page directory
+  de proceso tiene **page tables PRIVADAS** para la región de usuario
+  0x08000000-0x10000000 (tablas 32-63); kernel, physmap y MMIO se
+  comparten con el PD del kernel. Un proceso ya NO puede leer ni escribir
+  la memoria de otro usando su VA — solo la suya.
+- **Physmap cerrado a ring 3**: las tablas 20-31 y 64-255 del identity-map
+  pasan a supervisor-only. Antes CUALQUIER frame físico del sistema era
+  accesible desde ring 3 usando su dirección física como VA (page tables
+  de otros procesos, buffers de ramfs, etc.).
+- **ELF loader sobre frames frescos** (`kernel/elf.c`): code/data/bss se
+  cargan en frames PMM nuevos mapeados en las tablas privadas del proceso;
+  el proceso entra a ring 3 **con su propio CR3**. El user stack siempre
+  vive en VA `0x0F000000` pero en frames distintos por proceso.
+- **Muere el hack del backup de 736 KiB** y los stacks por nivel de
+  anidamiento (L0-L3): con aislamiento real, spawns anidados ilimitados
+  (`sh` → `ls` → `sh` → ...) funcionan sin tocar la memoria del padre.
+- **`fork()` real y asíncrono** (`mm/fork.c` + `cpu/syscall_asm.asm`):
+  deep-copy de la región de usuario del padre (`vmm_copy_user_space`) +
+  copia del trap frame del int 0x80 con `eax=0` en el kstack del hijo.
+  El hijo entra al scheduler y su primer `context_switch` aterriza en
+  `fork_child_trampoline`, que replica la cola de `syscall_stub` (iret a
+  ring 3 justo después del `int 0x80`). fork() devuelve el PID al padre
+  y 0 al hijo. La salida del hijo regresa directo al contexto del padre
+  (`process_resume_parent_or_park`) sin tocar el jump buffer ajeno.
+- **Jump stack con dueño** (`cpu/syscall.c`): la maquinaria setjmp/longjmp
+  de los ELF pasa de un buffer global único a una pila de 8 niveles con
+  pid dueño por nivel + CR3 guardado en el slot. Un hijo de fork (que
+  nunca pasa por `usermode_save_and_enter`) ya no puede corromper el
+  frame de salida de otro proceso al hacer SYS_EXIT/fault.
+- **`SYS_BRK` con frames frescos**: el heap de cada proceso se mapea VA →
+  frame PMM nuevo en sus tablas privadas (antes: identidad compartida).
+- **`execve()` con reset de región** (`vmm_reset_user_region`): libera los
+  frames viejos antes de cargar la imagen nueva (mismo PD, mismo PID).
+- Higiene del repo: los 34 `.o` trackeados salen del índice (`*.o` ya
+  estaba en `.gitignore`); se regeneran siempre con `make`.
+
+#### Cambiado
+- `vmm_create_address_space()` ahora crea tablas privadas 32-63 (+132 KiB
+  por proceso) y hace snapshot de las PDEs de MMIO del kernel (256+).
+- `vmm_free_address_space()` solo libera lo que el proceso posee en
+  exclusiva (fix latente: antes podía devolver frames estáticos de MMIO
+  al PMM) + `process_exit()` devuelve el CR3 al PD del kernel al morir.
+- `vmm_map_page_in()` invalida la TLB cuando mapea sobre el PD activo.
+- Límite del ELF loader unificado a 0x10000000 (era 1 GiB): coherente con
+  `uaccess` y con el physmap cerrado.
+
+#### Notas de diseño (v1)
+- Sin COW todavía: fork copia físicamente cada página presente del padre.
+- Modelo cooperativo: padre e hijo se alternan en syscalls
+  (waitpid/yield/sleep), igual que el resto de Trinux.
+- La fd-table sigue siendo global por diseño (los hijos la comparten).
+
 ## [0.5.3] - 2026-07-30
 
 ### 🛡️ Auditoría completa de código — 12 correcciones críticas/altas
