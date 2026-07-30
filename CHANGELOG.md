@@ -7,6 +7,26 @@ y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased] - 2026-07-29
 
+### 🔒 Seguridad — DoS trivial vía `nice`/`renice` sin privilegios
+- `process_set_priority()` (usada por `renice`, el comando `nice`, y el
+  syscall `SYS_RENICE`) no verificaba credenciales antes de bajar la
+  prioridad numérica de un proceso (es decir, subirle prioridad real de
+  CPU). El propio comentario en el código decía *"we don't have proper
+  credentials/uid plumbing yet, so any caller can change priority"*.
+  Esto significaba que **cualquier usuario sin privilegios** podía correr
+  `nice -20 exec algo` o `renice -20 <pid>` (incluso sobre PID 1) y
+  monopolizar la CPU vía el scheduler MLFQ — una denegación de servicio
+  trivial de un solo comando, sin necesitar exploit alguno.
+- Ahora bajar la prioridad numérica (`prio < PRIO_DEFAULT`, i.e. pedir
+  *más* CPU) requiere `uid == 0`, igual que el `nice`/`renice` reales de
+  Unix. Subir tu propia prioridad numérica (ser más "amable", ceder CPU)
+  sigue sin restricción para cualquier usuario.
+- El bug existía en **dos rutas separadas** que había que arreglar por
+  separado: `process_set_priority()` (usada por `renice` y por
+  `SYS_RENICE` desde ring 3) y el mecanismo distinto de `nice <prio> <cmd>`
+  en el shell (`process_set_next_priority()`), que no pasaba por el
+  primer check en absoluto.
+
 ### 🐛 Fix crítico de build
 - `user/coreutils/hdrs/reboot.h` estaba vacío (el binario embebido de
   `reboot` no se había regenerado tras el último merge), lo que rompía

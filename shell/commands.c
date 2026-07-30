@@ -1734,6 +1734,7 @@ static int cmd_renice(int argc, char **argv)
     if (r == -1)      kprintf("renice: (%d) - No such process\n", pid);
     else if (r == -2) kprintf("renice: prio %d out of range (%d..%d)\n",
                               prio, PRIO_MIN, PRIO_MAX);
+    else if (r == -3) kprintf("renice: cannot boost priority: Permission denied (root only)\n");
     else              kprintf("pid %d: priority set to %d\n", pid, prio);
     return 0;
 }
@@ -1762,6 +1763,19 @@ static int cmd_nice(int argc, char **argv)
         kprintf("nice: prio %d out of range (%d..%d)\n",
                 prio, PRIO_MIN, PRIO_MAX);
         return 1;
+    }
+    /* SECURITY: boosting priority (prio < PRIO_DEFAULT) is root-only, same
+     * restriction as `renice` / SYS_RENICE. Before this check, ANY logged
+     * in user could run `nice -20 exec something` and get the top priority
+     * slot, starving everyone else -- this path bypassed the check already
+     * present in process_set_priority() because it goes through the
+     * separate next_priority_hint mechanism used by process_create(). */
+    if (prio < PRIO_DEFAULT) {
+        user_t *u = current_user();
+        if (!u || u->uid != 0) {
+            kprintf("nice: cannot boost priority: Permission denied (root only)\n");
+            return 1;
+        }
     }
     process_set_next_priority(prio);
     /* One short confirmation, useful to spot accidentally swapped args

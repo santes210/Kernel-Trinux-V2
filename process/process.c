@@ -4,6 +4,7 @@
 #include "../mm/kheap.h"
 #include "../drivers/timer.h"   /* for timer_get_ticks() (start_tick) */
 #include "../mm/vmm.h"         /* for vmm_create/free/switch_address_space */
+#include "../auth/users.h"     /* for current_user() (root check in process_set_priority) */
 
 static process_t  processes[MAX_PROCESSES];
 static uint32_t   proc_count;
@@ -308,9 +309,18 @@ int process_set_priority(uint32_t pid, int prio)
     if (prio < PRIO_MIN || prio > PRIO_MAX) return -2;
     process_t *p = process_get(pid);
     if (!p) return -1;
-    /* Note: we don't have proper credentials/uid plumbing yet, so any
-     * caller can change priority.  When that's added, refuse negative
-     * priorities for non-root callers and return -3. */
+    /* SECURITY: boosting priority (any value below the default, i.e. more
+     * negative = more CPU share) is root-only, exactly like Unix `nice`.
+     * Before this check, ANY unprivileged process could call renice_(pid,
+     * -20) via SYS_RENICE on itself (or on any other pid, including PID 1)
+     * and starve the whole system -- a trivial denial-of-service. Raising
+     * your own niceness (prio >= PRIO_DEFAULT, i.e. being *more* polite)
+     * remains unrestricted, same as real Unix. */
+    if (prio < PRIO_DEFAULT) {
+        user_t *u = current_user();
+        if (!u || u->uid != 0)
+            return -3;
+    }
     p->priority = prio;
     return 0;
 }
