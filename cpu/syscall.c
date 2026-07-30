@@ -105,6 +105,10 @@ static uint32_t    dh_idx[DH_MAX];   /* índice del siguiente readdir */
  * write en 1/2 -> VGA + serial.  Esos no consumen slot.
  */
 #define FD_MAX 64
+/* Límite superior del heap de userland gestionado por SYS_BRK (v0.5.2):
+ * debe quedar por debajo de la región más baja usada como stack de
+ * usuario (ver USER_STACK_TOP_* en kernel/elf.c), con margen de sobra. */
+#define BRK_MAX_ADDR 0x0E000000U
 typedef struct {
     vfs_node_t *node;
     uint32_t    pos;
@@ -164,7 +168,7 @@ void syscall_handler(registers_t *regs)
     uint32_t a3  = regs->edx;
 
     /* CRITICAL: Validate syscall number to prevent out-of-bounds dispatch */
-    if (num > 73) {
+    if (num > 73) {  /* SYS_EXECVE=73 is now the highest valid syscall */
         kprintf("[syscall] WARNING: invalid syscall number %u from pid %d\n",
                 num, process_get_current() ? process_get_current()->pid : 0);
         regs->eax = (uint32_t)-1;
@@ -1198,34 +1202,90 @@ void syscall_handler(registers_t *regs)
     }
 
     case SYS_BRK: {
-        /* brk() - cambia el límite del heap del proceso.
-         * ebx = nueva dirección de break (0 = solo consultar actual)
-         * Retorna la dirección anterior de break, o 0 en error.
-         * El heap userland crece hacia arriba desde el final del BSS del ELF. */
+        /* brk() real por proceso (v0.5.2). ebx = nueva dirección de break
+         * (0 = solo consultar el break actual). Devuelve el break ANTERIOR
+         * (semántica estilo Unix: el valor de retorno de brk() malo suele
+         * ser -1, pero esta ABI histórica de Trinux usa 0 == error y por
+         * eso lo conservamos así). El heap crece desde justo después del
+         * BSS del ELF (proc->heap_start, calculado en kernel/elf.c al
+         * cargar el programa) y NUNCA puede bajar de ahí.
+         *
+         * Antes: la dirección base era un placeholder fijo (0x08100000)
+         * compartido por TODOS los procesos sin importar dónde terminaba
+         * realmente su BSS -- para binarios más grandes que ~1 MB de
+         * code+data+bss esto habría solapado el heap con el propio
+         * código/datos del programa. Ahora cada proceso trackea su
+         * propio heap_start/heap_brk. */
         process_t *p = process_get_current();
         if (!p || !p->page_dir) {
             regs->eax = 0;
             break;
         }
+        if (p->heap_start == 0) {
+            /* Proceso sin ELF cargado (no debería llegar aquí desde
+             * userland real, pero por seguridad no dejamos crecer un
+             * heap sin base conocida). */
+            regs->eax = 0;
+            break;
+        }
+        /* Límite superior: debe quedar por debajo de la región más baja
+         * que puede usarse como stack de usuario (ver USER_STACK_TOP_*
+         * en kernel/elf.c), con margen de sobra para no colisionar. */
         uint32_t new_brk = a1;
-        /* TODO: Implementar gestión real de heap por proceso.
-         * Por ahora, solo retornamos la dirección actual si new_brk == 0,
-         * o aceptamos el nuevo valor si está en rango válido (user space). */
         if (new_brk == 0) {
-            /* Consultar break actual - por ahora usamos una heurística */
-            regs->eax = 0x08100000;  /* aprox. fin del área ELF típica */
-        } else if (new_brk >= KERNEL_END_VIRT && new_brk < 0x40000000) {
-            /* Rango válido de user space (dentro de 1 GiB identity-map, above kernel) */
-            /* Mapear las páginas necesarias en el address space del proceso */
-            uint32_t old_brk = 0x08100000;  /* placeholder */
-            uint32_t end_pg = ((new_brk + 0xFFF) & ~0xFFF);
-            for (uint32_t pg = (old_brk & ~0xFFF); pg < end_pg; pg += 0x1000) {
+            regs->eax = p->heap_brk;
+            break;
+        }
+        if (new_brk < p->heap_start || new_brk >= BRK_MAX_ADDR) {
+            regs->eax = 0;  /* fuera de rango: no se toca heap_brk */
+            break;
+        }
+        uint32_t old_brk = p->heap_brk;
+        if (new_brk > old_brk) {
+            /* Crecer: mapear las páginas nuevas necesarias. */
+            uint32_t start_pg = (old_brk + 0xFFF) & ~0xFFFu;
+            uint32_t end_pg   = (new_brk + 0xFFF) & ~0xFFFu;
+            for (uint32_t pg = start_pg; pg < end_pg; pg += 0x1000) {
                 uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
                 vmm_map_page_in(p->page_dir, pg, pg, flags);
             }
-            regs->eax = old_brk;
+        }
+        /* Encoger (new_brk < old_brk): no desmapeamos páginas por ahora
+         * (evita liberar frames físicos compartidos con el identity-map
+         * global); simplemente el proceso ya no puede *pedir* más break
+         * por debajo de heap_start. Esto es conservador pero seguro. */
+        p->heap_brk = new_brk;
+        regs->eax = old_brk;
+        break;
+    }
+
+    /* === SYS_EXECVE: execve() real -- reemplaza la imagen del proceso
+     * QUE HACE LA LLAMADA (mismo pid) en vez de crear un proceso nuevo,
+     * a diferencia de SYS_SPAWN que crea uno nuevo y espera al que
+     * termine. Éxito: parcheamos regs->eip/regs->useresp del propio
+     * trap frame de este int 0x80 -- cuando este handler retorne, el
+     * `iret` de syscall_asm.asm saltará directo al programa nuevo. El
+     * proceso que llamó nunca "regresa" del syscall en el sentido
+     * normal, tal como pasa con execve(2) en Unix real. Fallo: el
+     * proceso llamador sigue corriendo con SU imagen intacta. */
+    case SYS_EXECVE: {
+        const char *path = (const char *)a1;
+        char **argv = (char **)a2;
+        UCHECK_STR(path);
+        static char k_path3[128];
+        int i = 0; while (path[i] && i < 127) { k_path3[i] = path[i]; i++; } k_path3[i] = 0;
+        int argc = 0;
+        if (argv) while (argv[argc]) argc++;
+        uint32_t new_eip = 0, new_esp = 0;
+        int rc = elf_execve(k_path3, cwd_of_caller(), argc, argv, &new_eip, &new_esp);
+        if (rc == 0) {
+            regs->eip     = new_eip;
+            regs->useresp = new_esp;
+            /* eax no importa: el programa nuevo arranca en _start, no
+             * en el punto donde alguien esperaba el valor de retorno
+             * de un syscall -- igual que un execve() real. */
         } else {
-            regs->eax = 0;  /* error */
+            regs->eax = (uint32_t)rc;
         }
         break;
     }

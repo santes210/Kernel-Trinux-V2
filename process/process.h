@@ -85,6 +85,16 @@ typedef struct process {
 
     /* ---- fork/waitpid (v0.3.1) ---- */
     uint32_t      parent_pid;     /* PID del proceso padre (0 si init)       */
+
+    /* ---- brk() / heap userland (v0.5.2) ----
+     * heap_start: dirección justo después del segmento BSS del ELF
+     * (page-aligned hacia arriba). Es el break inicial -- equivalente al
+     * "end" que expone la libc real antes del primer sbrk().
+     * heap_brk: break ACTUAL del proceso. Crece con SYS_BRK; nunca baja
+     * de heap_start. 0 en ambos = todavía no se cargó ningún ELF en este
+     * proceso (kthreads internos como init/kthreadd/mysh). */
+    uint32_t      heap_start;
+    uint32_t      heap_brk;
 } process_t;
 
 void        process_init(void);

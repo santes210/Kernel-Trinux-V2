@@ -5,6 +5,53 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [0.5.2] - 2026-07-29
+
+### 🚀 `SYS_EXECVE` real (execve() de verdad)
+- Nuevo syscall `SYS_EXECVE` (73): reemplaza la imagen del proceso QUE
+  LLAMA (mismo PID, mismo `page_dir`, mismos fds/cwd) con un ELF nuevo,
+  en lugar de crear un proceso nuevo como hace `SYS_SPAWN`/`exec`.
+- Implementado en dos pasadas en `kernel/elf.c:elf_execve()`: primero se
+  valida el ELF completo (magic/arquitectura/cada segmento `PT_LOAD`
+  dentro del 1 GiB identity-mapped y del archivo) sin tocar la memoria
+  del proceso llamador; solo si todo pasa se empieza a sobrescribir. Si
+  cualquier validación falla, el proceso original sigue corriendo
+  intacto — exactamente la semántica de fallo de `execve(2)` en Unix.
+- Valida el bit `ACC_EXEC` del binario destino (a diferencia de
+  `SYS_SPAWN`, hoy solo alcanzable desde el shell de confianza).
+- `cpu/syscall.c`: en éxito, el handler parchea `regs->eip`/`regs->useresp`
+  del propio trap frame del `int 0x80` en curso, así que el `iret` que ya
+  iba a ejecutar el retorno del syscall salta directo al programa nuevo
+  sin necesitar ningún mecanismo de contexto adicional.
+- Nuevo wrapper `execve_(path, argv)` en `user/trinux.h`.
+- Programa de prueba: `exec /bin/execvetest` — compara su propio PID
+  antes y después de hacer `execve_()` sobre sí mismo; el PID debe ser
+  idéntico, demostrando que es el mismo proceso reemplazado in-place
+  (y no uno nuevo).
+
+### 🚀 `brk()` real por proceso
+- `process_t` (`process/process.h`) gana dos campos: `heap_start` (break
+  inicial, fijado al cargar el ELF) y `heap_brk` (break actual).
+- `kernel/elf.c` calcula `heap_start` en ambos cargadores de ELF
+  (`elf_exec_argv_inner()` y el nuevo `elf_execve()`) como el final del
+  último segmento `PT_LOAD`, redondeado a página + una página de guarda.
+- `SYS_BRK` en `cpu/syscall.c` ya no usa una dirección fija compartida
+  (`0x08100000`) por todos los procesos — ahora lee/escribe
+  `heap_start`/`heap_brk` del proceso actual, rechaza bajar de
+  `heap_start`, y mapea solo las páginas nuevas necesarias al crecer.
+- `mm/fork.c`: el hijo hereda `heap_start`/`heap_brk` del padre (las
+  páginas de heap ya se copian físicamente en `vmm_copy_region()`).
+- Programa de prueba: `exec /bin/brktest` — crece el heap 8 KiB,
+  escribe/lee un patrón de bytes para confirmar que las páginas están
+  de verdad mapeadas, y verifica que un intento de encoger por debajo de
+  `heap_start` se rechaza sin tocar el break.
+
+### 📝 Documentación
+- README: sección "Limitaciones actuales" de v0.5.1 actualizada — ambos
+  puntos (`execve()` real, `brk()` por proceso) que decían "no
+  implementado" ahora están marcados como resueltos con referencia al
+  código correspondiente.
+
 ## [Unreleased] - 2026-07-29
 
 ### 🔒 Seguridad — DoS trivial vía `nice`/`renice` sin privilegios

@@ -234,6 +234,11 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
     serial_printf("[elf] loading %s: entry=%08x phnum=%u (pid=%u pd=%08x)\n",
                   path, entry, ehdr->e_phnum, proc ? proc->pid : 0, proc ? proc->page_dir : 0);
 
+    /* Tracks the highest (vaddr + memsz) across all PT_LOAD segments, so
+     * we can seed the process's brk() heap right after the ELF's BSS --
+     * exactly where a real libc's initial program break sits. */
+    uint32_t max_end = 0;
+
     /* ---- Load PT_LOAD segments into the process's address space ---- */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         elf32_phdr_t *phdr = (elf32_phdr_t *)(buf + ehdr->e_phoff +
@@ -260,6 +265,8 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
             if (proc) { proc->state = PROC_ZOMBIE; proc->exit_code = -3; }
             return -3;
         }
+        if (vaddr + memsz > max_end)
+            max_end = vaddr + memsz;
 
         /* Map pages in the process's address space if not already present.
          * For identity-mapped region, they should already be present from
@@ -281,6 +288,16 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
     }
 
     kfree(buf);
+
+    /* Seed brk(): the heap starts right after the last loaded segment
+     * (page-aligned up, with one guard page of slack so a slightly-off
+     * BSS end never overlaps the first heap page). SYS_BRK grows it from
+     * here. See cpu/syscall.c's SYS_BRK handler for the actual mapping. */
+    if (proc && max_end > 0) {
+        uint32_t heap_start = (max_end + 0x1000) & ~0xFFFu;
+        proc->heap_start = heap_start;
+        proc->heap_brk   = heap_start;
+    }
 
     /* ---- Set up user stack in the process's address space ---- */
     uint32_t USER_STACK_TOP;
@@ -368,4 +385,229 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
     }
 
     return exit_code;
+}
+
+/* ============================================================================
+ * elf_execve() — execve() real: reemplaza la imagen del proceso QUE LLAMA
+ * (mismo PID) en lugar de crear uno nuevo, tal como el execve(2) de Unix.
+ *
+ * A diferencia de elf_exec_argv_inner() (usado por `exec`/SYS_SPAWN, que
+ * crea un proceso NUEVO y entra a ring 3 de forma anidada vía
+ * usermode_save_and_enter + setjmp/longjmp), esta función es llamada
+ * DESDE el manejador de SYS_EXECVE mientras se procesa el int 0x80 de un
+ * proceso ring-3 ya existente.  No hace ningún salto: solo prepara la
+ * nueva imagen y devuelve el (entry, esp) nuevos para que el propio
+ * `iret` que ya iba a ejecutar el `int 0x80` salte directo al programa
+ * nuevo.  Así, cuando el programa nuevo eventualmente llame SYS_EXIT,
+ * usa exactamente el mismo mecanismo (setjmp/longjmp ya armado para
+ * este PID desde que fue lanzado originalmente) sin nada especial.
+ *
+ * Semántica de fallo: si CUALQUIER validación falla, el proceso que
+ * llamó NO se toca — sigue corriendo con su imagen original intacta,
+ * igual que un execve() real que falla.  Por eso se valida el ELF
+ * COMPLETO (incluyendo cada segmento PT_LOAD) antes de sobrescribir un
+ * solo byte de la memoria del proceso.
+ * ============================================================================ */
+int elf_execve(const char *path, vfs_node_t *cwd, int argc, char **argv,
+               uint32_t *out_eip, uint32_t *out_esp)
+{
+    process_t *proc = process_get_current();
+    if (!proc) return -1;
+
+    /* ---- Resolver y validar el ELF destino SIN tocar la memoria del
+     * proceso que llama.  Real execve(): si falla, el llamador sigue
+     * corriendo intacto. ---- */
+    vfs_node_t *file = vfs_resolve(path, cwd);
+    if (!file || file->type != VFS_FILE) return -1;
+
+    /* SECURITY: a diferencia del exec()/SYS_SPAWN existente (solo
+     * alcanzable desde el shell de confianza resolviendo /bin/<cmd>),
+     * SYS_EXECVE se invoca directamente desde ring 3, así que SÍ debe
+     * respetar el bit de ejecución -- un binario 0700 de otro usuario
+     * no debería poder "execve-arse" desde un proceso sin privilegios. */
+    if (!vfs_check_access(file, ACC_EXEC)) return -5;
+
+    uint32_t filesz = file->size;
+    if (filesz < sizeof(elf32_ehdr_t)) return -2;
+
+    uint8_t *buf = (uint8_t *)kmalloc(filesz);
+    if (!buf) return -3;
+
+    uint32_t got = vfs_read(file, 0, filesz, buf);
+    if (got < sizeof(elf32_ehdr_t)) { kfree(buf); return -2; }
+
+    elf32_ehdr_t *ehdr = (elf32_ehdr_t *)buf;
+    if (!elf_validate(ehdr)) { kfree(buf); return -2; }
+
+    uint32_t entry = ehdr->e_entry;
+    if (entry == 0) { kfree(buf); return -4; }
+
+    /* ---- Pase 1 (solo validación): cada segmento PT_LOAD debe caber en
+     * el 1 GiB identity-mapped y estar dentro del archivo leído.  Nada
+     * se escribe todavía -- esto es lo que hace seguro fallar: si algún
+     * segmento es inválido, salimos sin haber tocado un solo byte de la
+     * memoria del proceso que llamó. ---- */
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        elf32_phdr_t *phdr = (elf32_phdr_t *)(buf + ehdr->e_phoff +
+                                               (uint32_t)i * ehdr->e_phentsize);
+        if (phdr->p_type != PT_LOAD)
+            continue;
+        uint64_t end = (uint64_t)phdr->p_vaddr + phdr->p_memsz;
+        if (end > 0x40000000ULL) {
+            kfree(buf);
+            return -3;
+        }
+        if ((uint64_t)phdr->p_offset + phdr->p_filesz > got) {
+            kfree(buf);
+            return -2;
+        }
+    }
+
+    /* ---- argv vive en la memoria del PROPIO llamador, que el Pase 2 de
+     * abajo está a punto de sobrescribir -- copiarlo (con sus strings) a
+     * kheap primero, igual que ya hace elf_exec_argv() para spawns
+     * anidados. ---- */
+    char **argv_copy = NULL;
+    if (argc > 0 && argv) {
+        uint32_t total = 0;
+        for (int i = 0; i < argc; i++) {
+            int sl = 0; while (argv[i][sl]) sl++;
+            total += (uint32_t)sl + 1;
+        }
+        uint8_t *blob = (uint8_t *)kmalloc(total + (uint32_t)(argc + 1) * sizeof(char *));
+        if (!blob) { kfree(buf); return -3; }
+        argv_copy = (char **)blob;
+        char *str = (char *)(blob + (uint32_t)(argc + 1) * sizeof(char *));
+        for (int i = 0; i < argc; i++) {
+            argv_copy[i] = str;
+            int j = 0;
+            while (argv[i][j]) { *str++ = argv[i][j]; j++; }
+            *str++ = 0;
+        }
+        argv_copy[argc] = NULL;
+        argv = argv_copy;
+    }
+
+    serial_printf("[execve] pid=%u reemplazando imagen con %s: entry=%08x phnum=%u\n",
+                  proc->pid, path, entry, ehdr->e_phnum);
+
+    /* ---- Pase 2 (commit): a partir de aquí sobrescribimos la memoria
+     * del propio proceso -- ya no hay vuelta atrás, igual que el
+     * execve() real empieza a desmapear el address space viejo justo
+     * antes de mapear el nuevo. ---- */
+    uint32_t max_end = 0;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        elf32_phdr_t *phdr = (elf32_phdr_t *)(buf + ehdr->e_phoff +
+                                               (uint32_t)i * ehdr->e_phentsize);
+        if (phdr->p_type != PT_LOAD)
+            continue;
+
+        uint32_t vaddr   = phdr->p_vaddr;
+        uint32_t memsz   = phdr->p_memsz;
+        uint32_t filesz2 = phdr->p_filesz;
+        uint32_t offset  = phdr->p_offset;
+
+        if (vaddr + memsz > max_end)
+            max_end = vaddr + memsz;
+
+        if (proc->page_dir) {
+            for (uint32_t pg = vaddr & ~0xFFF; pg < vaddr + memsz; pg += 0x1000) {
+                uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
+                vmm_map_page_in(proc->page_dir, pg, pg, flags);
+            }
+        }
+
+        if (filesz2 > 0)
+            memcpy((void *)vaddr, buf + offset, filesz2);
+        if (memsz > filesz2)
+            memset((void *)(vaddr + filesz2), 0, memsz - filesz2);
+    }
+
+    kfree(buf);
+
+    /* SECURITY/CORRECTNESS: execve() reemplaza por completo el heap del
+     * proceso, igual que en Unix real -- cualquier puntero que el
+     * programa anterior tuviera hacia SU heap deja de tener sentido con
+     * el ELF nuevo mapeado encima. Sin este reset, un proceso podría
+     * heredar el heap_brk del programa viejo (potencialmente MÁS ALTO
+     * que el final del BSS del programa nuevo) y SYS_BRK aceptaría
+     * `new_brk` menores a ese valor heredado como "encoger", dejando
+     * mapeadas páginas de heap del programa anterior visibles para el
+     * nuevo -- una fuga de datos entre programas ejecutados vía execve()
+     * en el mismo proceso. */
+    if (max_end > 0) {
+        uint32_t heap_start = (max_end + 0x1000) & ~0xFFFu;
+        proc->heap_start = heap_start;
+        proc->heap_brk   = heap_start;
+    }
+
+    /* ---- Stack de usuario nuevo, reusando el MISMO nivel de anidamiento
+     * en el que ya corría el proceso llamador (ver USER_STACK_TOP_L* más
+     * arriba): execve() reemplaza el programa en su lugar, no añade un
+     * nivel nuevo de anidamiento. ---- */
+    uint32_t USER_STACK_TOP;
+    switch (g_nest) {
+        case 1:  USER_STACK_TOP = USER_STACK_TOP_L0; break;
+        case 2:  USER_STACK_TOP = USER_STACK_TOP_L1; break;
+        case 3:  USER_STACK_TOP = USER_STACK_TOP_L2; break;
+        case 4:  USER_STACK_TOP = USER_STACK_TOP_L3; break;
+        default: USER_STACK_TOP = USER_STACK_TOP_FALLBACK; break;
+    }
+    uint32_t stack_base = USER_STACK_TOP - USER_STACK_SIZE;
+
+    if (proc->page_dir) {
+        for (uint32_t pg = stack_base & ~0xFFF; pg < USER_STACK_TOP; pg += 0x1000) {
+            uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
+            vmm_map_page_in(proc->page_dir, pg, pg, flags);
+        }
+    }
+    memset((void *)stack_base, 0, USER_STACK_SIZE);
+
+    uint32_t user_esp = USER_STACK_TOP - 16;
+    user_esp -= 12;
+    ((uint32_t *)user_esp)[0] = 0;
+    ((uint32_t *)user_esp)[1] = 0;
+    ((uint32_t *)user_esp)[2] = 0;
+
+    if (argc > 0 && argv) {
+        user_esp = USER_STACK_TOP - 16;
+        uint32_t str_top = user_esp;
+        uint32_t str_ptrs[32];
+        if (argc > 32) argc = 32;
+        for (int i = argc - 1; i >= 0; i--) {
+            int slen = 0; while (argv[i][slen]) slen++;
+            slen++;
+            str_top -= (uint32_t)slen;
+            memcpy((void *)str_top, argv[i], (uint32_t)slen);
+            str_ptrs[i] = str_top;
+        }
+        str_top &= ~0x3u;
+        uint32_t arr = str_top - 4 * (uint32_t)(argc + 1);
+        for (int i = 0; i < argc; i++)
+            ((uint32_t *)arr)[i] = str_ptrs[i];
+        ((uint32_t *)arr)[argc] = 0;
+
+        user_esp = arr;
+        user_esp -= 12;
+        ((uint32_t *)user_esp)[0] = 0;
+        ((uint32_t *)user_esp)[1] = (uint32_t)argc;
+        ((uint32_t *)user_esp)[2] = arr;
+    }
+
+    if (argv_copy) kfree(argv_copy);
+
+    /* Renombrar el proceso para reflejar el programa nuevo -- mismo PID,
+     * mismo padre, mismos fds/cwd, exactamente como un execve() real. */
+    const char *slash = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/') slash = p + 1;
+    strncpy(proc->name, slash, PROC_NAME_MAX - 1);
+    proc->name[PROC_NAME_MAX - 1] = '\0';
+
+    serial_printf("[execve] pid=%u listo: eip=%08x esp=%08x\n",
+                  proc->pid, entry, user_esp);
+
+    *out_eip = entry;
+    *out_esp = user_esp;
+    return 0;
 }

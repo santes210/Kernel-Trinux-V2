@@ -100,8 +100,19 @@ int process_fork(void)
 
     /* Heredar el cwd del padre */
     process_t *parent = process_get_current();
-    if (parent)
+    if (parent) {
         strncpy(child->cwd, parent->cwd, sizeof(child->cwd) - 1);
+        /* Heredar también el estado del heap (brk): vmm_copy_region() ya
+         * copió físicamente el contenido de esas páginas de heap, así
+         * que el hijo debe seguir viendo el mismo heap_start/heap_brk
+         * que el padre tenía en el momento del fork -- si no, un SYS_BRK
+         * posterior en el hijo usaría heap_start=0 (rechazado) o volvería
+         * a arrancar desde 0, perdiendo la noción de cuánto heap ya
+         * estaba mapeado y potencialmente re-mapeando páginas que ya
+         * existen (inofensivo pero incorrecto) o dejando "agujeros". */
+        child->heap_start = parent->heap_start;
+        child->heap_brk   = parent->heap_brk;
+    }
 
     int child_pid = (int)child->pid;
 

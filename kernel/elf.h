@@ -62,4 +62,20 @@ int elf_exec(const char *path, vfs_node_t *cwd);
  * Idéntico a elf_exec() en lo demás. */
 int elf_exec_argv(const char *path, vfs_node_t *cwd, int argc, char **argv);
 
+/* execve() real: reemplaza la imagen del proceso que hace la llamada
+ * (mismo PID, mismo kernel stack, mismo address space) en lugar de crear
+ * un proceso nuevo -- semántica idéntica al execve(2) de Unix.
+ *
+ * Si tiene éxito, escribe el nuevo entry point y stack pointer de
+ * usuario en *out_eip / *out_esp (para que cpu/syscall.c parchee el
+ * trap frame del propio int 0x80 y el `iret` de retorno salte directo
+ * al programa nuevo) y devuelve 0.  Si falla, NO toca out_eip/out_esp
+ * y devuelve <0 (mismos códigos de error que elf_exec_argv: -1 no
+ * encontrado, -2 ELF inválido, -3 sin memoria/segmento fuera de rango,
+ * -4 entry point 0, -5 permiso de ejecución denegado) -- el llamador
+ * sigue corriendo normalmente, tal como pasa con un execve() fallido
+ * real. */
+int elf_execve(const char *path, vfs_node_t *cwd, int argc, char **argv,
+               uint32_t *out_eip, uint32_t *out_esp);
+
 #endif /* KERNEL_ELF_H */
