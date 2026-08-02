@@ -1,15 +1,25 @@
-/* mm/fork.c — fork() real con copia de address space.
+/* mm/fork.c — fork() REAL con address space independiente (v0.6.0).
  *
- * CAMBIO #4: cada proceso hijo recibe su propia copia física de la región
- * de usuario, completamente independiente del padre.
+ * Piezas:
+ *   1. vmm_create_address_space() crea el PD del hijo (tablas de usuario
+ *      32-63 PRIVADAS y vacías; kernel/physmap/MMIO compartidos).
+ *   2. vmm_share_user_space() marca cada página presente del padre
+ *      como RO+COW en padre E hijo (mismos frames, refcount en el PMM);
+ *      la primera escritura copia bajo demanda — Copy-on-Write (v0.6.1).
+ *   3. Se copia el trap frame COMPLETO del int 0x80 en curso a la cima
+ *      del kstack del hijo, con eax=0 (el hijo "regresa 0" de fork()).
+ *   4. El contexto del hijo apunta a fork_child_trampoline (asm), que
+ *      imita la cola de syscall_stub (pop ds / popa / add esp,8 / iret):
+ *      cuando el scheduler elija al hijo, el iret lo devuelve a ring 3
+ *      exactamente después de su instrucción `int 0x80`.
+ *   5. El padre sigue en su syscall y fork() le devuelve el PID del hijo.
  *
- * Flujo de fork():
- *   1. pmm_alloc_frame() × N para obtener frames físicos para las páginas del hijo.
- *   2. vmm_create_address_space() clona el kernel identity-map (256 MiB).
- *   3. vmm_copy_region() itera las páginas de usuario, copia físicamente su
- *      contenido y las mapea en el nuevo page directory.
- *   4. process_create() registra el proceso hijo con su propio page_dir.
- *   5. El kernel ejecuta el hijo y restaura el page directory del padre al volver.
+ * El modelo de ejecución de Trinux es cooperativo-asíncrono: padre e hijo
+ * se alternan cuando alguno llama a una syscall que cede la CPU
+ * (waitpid/yield/sleep...).  La salida del hijo no usa el setjmp/longjmp
+ * del ELF loader (eso es del spawn síncrono): process_exit() marca al
+ * hijo ZOMBIE y el flujo regresa directamente al contexto del padre
+ * (ver cpu/syscall.c — rama sin jump buffer armado para el pid actual).
  */
 #include "fork.h"
 #include "vmm.h"
@@ -17,45 +27,12 @@
 #include "kheap.h"
 #include "../lib/string.h"
 #include "../lib/printf.h"
-#include "../process/process.h"
 #include "../process/scheduler.h"
+#include "../drivers/serial.h"
 
-/* Rango de memoria de usuario a copiar en fork().
- * Cubre ELF code+data+stack de todos los niveles de spawn. */
-#define USER_COPY_START  0x08048000u
-#define USER_COPY_END    0x0F100000u   /* un poco por encima del stack top */
-
-#define PAGE_SIZE 4096
-
-/* Copia física las páginas de [start..end) al nuevo page directory.
- * Para cada página alineada en el rango:
- *   1. Alloca un frame físico nuevo.
- *   2. Copia 4 KiB del contenido actual (que está identity-mapped).
- *   3. Mapea el frame en el page directory del hijo con PAGE_USER|PAGE_RW.
- */
-void vmm_copy_region(uint32_t child_pd, uint32_t start, uint32_t end)
-{
-    uint32_t addr = start & ~(PAGE_SIZE - 1);
-    while (addr < end) {
-        /* Alloca frame físico para el hijo */
-        uint32_t new_frame = pmm_alloc_frame();
-        if (!new_frame) {
-            kprintf("[fork] pmm_alloc_frame failed at %08x\n", addr);
-            addr += PAGE_SIZE;
-            continue;
-        }
-
-        /* Copiar página (el identity-map hace phys==virt, así que podemos
-         * leer de `addr` directamente y escribir en `new_frame`). */
-        memcpy((void *)new_frame, (void *)addr, PAGE_SIZE);
-
-        /* Mapear en el page directory del hijo */
-        vmm_map_page_in(child_pd, addr, new_frame,
-                        PAGE_PRESENT | PAGE_RW | PAGE_USER);
-
-        addr += PAGE_SIZE;
-    }
-}
+/* En cpu/syscall_asm.asm — cola de retorno a ring 3 del hijo de fork(). */
+extern void fork_child_trampoline(void);
+extern void scheduler_add(process_t *proc);
 
 /* Libera los frames físicos del address space de usuario de un proceso. */
 void process_free_address_space(process_t *p)
@@ -65,74 +42,75 @@ void process_free_address_space(process_t *p)
     p->page_dir = 0;
 }
 
-/* fork(): crea un hijo con address space copiado.
- *
- * Devuelve el PID del hijo al llamador (el "padre").
- * El hijo no regresa de fork() — el kernel lo ejecuta y vuelve aquí
- * cuando el hijo llama SYS_EXIT.
- *
- * NOTA: en el modelo actual de Trinux, fork() es sincrónico:
- * el padre espera a que el hijo termine antes de continuar.
- * Para fork() asíncrono real habría que añadir wait()/waitpid()
- * completos y un scheduler que gestione múltiples page directories. */
-int process_fork(void)
+int process_fork(registers_t *regs)
 {
-    /* 1. Crear nuevo address space clonando el kernel identity-map */
+    process_t *parent = process_get_current();
+    if (!parent || !regs) return -1;
+    if (!parent->page_dir) {
+        /* Sólo procesos con address space pueden forkear (kthreads del
+         * kernel no — no tienen región de usuario que copiar). */
+        kprintf("[fork] el proceso actual no tiene address space\n");
+        return -1;
+    }
+
+    /* 1. PD del hijo (tablas de usuario privadas vacías). */
     uint32_t child_pd = vmm_create_address_space();
     if (!child_pd) {
-        kprintf("[fork] vmm_create_address_space failed\n");
+        kprintf("[fork] sin frames para el page directory del hijo\n");
         return -1;
     }
 
-    /* 2. Copiar la región de usuario al nuevo address space */
-    vmm_copy_region(child_pd, USER_COPY_START, USER_COPY_END);
+    /* 2. Compartir COW la región de usuario del padre. */
+    if (vmm_share_user_space(child_pd, parent->page_dir) != 0) {
+        vmm_free_address_space(child_pd);
+        kprintf("[fork] sin frames para compartir el address space\n");
+        return -1;
+    }
 
-    /* 3. Crear el proceso hijo */
-    process_t *child = process_create("(fork-child)", NULL);
+    /* 3. Registrar el proceso hijo.  process_create() ya le crea un PD
+     * propio (vacío): lo sustituimos por el que acabamos de llenar. */
+    process_t *child = process_create(parent->name, NULL);
     if (!child) {
         vmm_free_address_space(child_pd);
-        kprintf("[fork] process_create failed\n");
+        kprintf("[fork] process_create falló\n");
         return -1;
     }
-
-    /* Asignar page directory propio */
+    if (child->page_dir)
+        vmm_free_address_space(child->page_dir);
     child->page_dir = child_pd;
 
-    /* Heredar el cwd del padre */
-    process_t *parent = process_get_current();
-    if (parent) {
-        strncpy(child->cwd, parent->cwd, sizeof(child->cwd) - 1);
-        /* Heredar también el estado del heap (brk): vmm_copy_region() ya
-         * copió físicamente el contenido de esas páginas de heap, así
-         * que el hijo debe seguir viendo el mismo heap_start/heap_brk
-         * que el padre tenía en el momento del fork -- si no, un SYS_BRK
-         * posterior en el hijo usaría heap_start=0 (rechazado) o volvería
-         * a arrancar desde 0, perdiendo la noción de cuánto heap ya
-         * estaba mapeado y potencialmente re-mapeando páginas que ya
-         * existen (inofensivo pero incorrecto) o dejando "agujeros". */
-        child->heap_start = parent->heap_start;
-        child->heap_brk   = parent->heap_brk;
-    }
+    /* Herencia POSIX-básica: cwd, límites del heap, handlers de señal,
+     * prioridad base.  parent_pid ya lo puso process_create(). */
+    strncpy(child->cwd, parent->cwd, sizeof(child->cwd) - 1);
+    child->heap_start = parent->heap_start;
+    child->heap_brk   = parent->heap_brk;
+    for (int s = 0; s < _NSIG; s++)
+        child->sig_handlers[s] = parent->sig_handlers[s];
+    child->priority = parent->priority;
 
-    int child_pid = (int)child->pid;
+    /* 4. Copia del trap frame a la cima del kstack del hijo.
+     *
+     * LA CUMBRE del kstack la usa context_switch() (ver process/switch.asm):
+     * escribe la EIP nueva en [esp] antes de hacer `ret`, así que el
+     * contexto debe arrancar 4 bytes POR DEBAJO del frame real para que
+     * `ret` consuma ese slot y el esp quede apuntando al frame. */
+    uint32_t ktop = (uint32_t)child->kstack + 8192;
+    registers_t *cf = (registers_t *)(ktop - sizeof(registers_t));
+    memcpy(cf, regs, sizeof(registers_t));
+    cf->eax = 0;   /* fork() devuelve 0 en el hijo */
 
-    /* 4. Ejecutar el hijo: cambiar al address space del hijo,
-     *    ejecutarlo hasta que haga SYS_EXIT, luego volver al padre. */
-    uint32_t parent_pd = vmm_get_current_dir();
-    process_t *saved_current = process_get_current();
+    child->context.eip    = (uint32_t)fork_child_trampoline;
+    child->context.esp    = (uint32_t)cf - 4;
+    child->context.ebp    = 0;
+    child->context.ebx    = 0;
+    child->context.esi    = 0;
+    child->context.edi    = 0;
+    child->context.eflags = 0x202;            /* IF habilitado */
+    child->state  = PROC_READY;
 
-    process_set_current(child);
-    vmm_switch_address_space(child_pd);
+    serial_printf("[fork] hijo pid=%u listo (pd=%08x, esp_tramp=%08x)\n",
+                  child->pid, child_pd, (uint32_t)cf);
 
-    /* El hijo corre: el scheduler lo ejecutará normalmente.
-     * Como Trinux usa el flujo del kernel para la shell, el "hijo"
-     * aquí es realmente el proceso recién creado que el scheduler
-     * ejecutará hasta que llame process_exit(). */
     scheduler_add(child);
-
-    /* Restaurar contexto del padre */
-    process_set_current(saved_current);
-    vmm_switch_address_space(parent_pd);
-
-    return child_pid;
+    return (int)child->pid;                   /* el padre recibe el PID */
 }

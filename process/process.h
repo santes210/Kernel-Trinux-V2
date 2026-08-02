@@ -158,4 +158,8 @@ void      (*process_sigaction(int sig, void (*handler)(int)))(int);
  * Returns true if the process was terminated, false if a handler was called. */
 bool        process_deliver_signal(int sig);
 
+/* Salida sin jump buffer propio (fork-child): retoma el contexto del
+ * padre guardado por context_switch, o estaciona si no existe (v0.6.0). */
+void        process_resume_parent_or_park(void);
+
 #endif /* PROCESS_PROCESS_H */

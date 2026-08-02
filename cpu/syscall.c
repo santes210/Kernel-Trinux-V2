@@ -23,6 +23,7 @@
 #include "../shell/tcc.h"
 #include "../fs/pipe.h"
 #include "../mm/fork.h"
+#include "../mm/pmm.h"
 #include "../mm/vmm.h"
 
 extern void syscall_stub(void);
@@ -31,45 +32,132 @@ extern void tss_set_kernel_stack(uint32_t esp0);
 
 static bool g_in_usermode;        /* unused now but kept for sig */
 
-/* ---- ELF exit jump buffer ----
+/* ---- ELF exit jump stack (v0.6.0) ----
+ * Antes: UN buffer global. Con fork() asíncrono eso era inseguro: un
+ * hijo scheduler-managed (que nunca pasó por usermode_save_and_enter)
+ * podía hacer SYS_EXIT o faultar y el longjmp lo mandaba al frame
+ * guardado por OTRA ejecución síncrona (su padre, p. ej.) — corrupción
+ * de stacks garantizada.
+ *
+ * Ahora: pila con DUEÑO por nivel (pid del proceso que armó). Sólo se
+ * hace longjmp cuando el proceso ACTUAL es el dueño del tope. Un hijo
+ * de fork() nunca arma así que su salida/fault nunca toca los buffers:
+ * process_exit() + regreso directo al contexto del padre (schedule).
+ *
  * (Misma maquinaria que antes; ver elf_jmp.asm para el setjmp/longjmp.) */
 typedef struct {
     uint32_t valid;
     uint32_t esp, ebp, ebx, esi, edi, eip;
     int      exit_code;
+    uint32_t saved_cr3;  /* CR3 activo al armar (restaurar tras la salida) */
 } elf_jmp_t;
 
-static elf_jmp_t g_elf_jmp;
+#define ELF_JMP_MAX 8
+static elf_jmp_t g_jmp_stack[ELF_JMP_MAX];
+static uint32_t  g_jmp_owner[ELF_JMP_MAX];
+static int       g_jmp_sp;
+static int       g_last_exit_code;
 
 extern int  elf_jmp_setjmp (elf_jmp_t *dst);
 extern void elf_jmp_longjmp(elf_jmp_t *src) __attribute__((noreturn));
 
-void elf_arm_exit_jmp(void)
+int elf_arm_exit_jmp(void)
 {
-    g_elf_jmp.valid = 0;
-    if (elf_jmp_setjmp(&g_elf_jmp) == 0)
-        g_elf_jmp.valid = 1;
+    if (g_jmp_sp >= ELF_JMP_MAX) return -1;   /* sin slots: error */
+    elf_jmp_t *j = &g_jmp_stack[g_jmp_sp];
+    if (elf_jmp_setjmp(j) == 0) {
+        process_t *cur = process_get_current();
+        g_jmp_owner[g_jmp_sp] = cur ? cur->pid : 0;
+        j->valid     = 1;
+        j->saved_cr3 = vmm_get_current_dir();
+        g_jmp_sp++;
+        return 0;   /* primera pasada: entrar a ring 3 */
+    }
+    return 1;       /* segunda pasada: regreso vía longjmp */
 }
 
-int elf_get_exit_code(void) { return g_elf_jmp.exit_code; }
+/* TRUE si el tope de la pila pertenece al proceso actual y sigue armado.
+ * Guardia redundante del primer pasaje (ver kernel/elf.c): si un longjmp
+ * aterrizara fuera de elf_arm_exit_jmp, esto evita re-entrar al ELF. */
+bool elf_jmp_still_armed(void)
+{
+    if (g_jmp_sp <= 0) return false;
+    process_t *cur = process_get_current();
+    if (!cur) return false;
+    elf_jmp_t *top = &g_jmp_stack[g_jmp_sp - 1];
+    return top->valid && g_jmp_owner[g_jmp_sp - 1] == cur->pid;
+}
 
-void elf_disarm_exit_jmp(void) { g_elf_jmp.valid = 0; }
+/* El CR3 guardado en el slot más reciente liberado (el del programa que
+ * acaba de salir) — el CR3 del QUE LO LANZÓ. Tras elf_jmp_longjmp el sp
+ * ya fue decrementado, así que nuestro slot es g_jmp_stack[g_jmp_sp].
+ * Si la pila está vacía, devuelve el CR3 actual (caso defensivo). */
+uint32_t elf_jmp_saved_cr3(void)
+{
+    if (g_jmp_sp < 0 || g_jmp_sp >= ELF_JMP_MAX)
+        return vmm_get_current_dir();
+    uint32_t cr3 = g_jmp_stack[g_jmp_sp].saved_cr3;
+    return cr3 ? cr3 : vmm_get_current_dir();
+}
+
+int elf_get_exit_code(void) { return g_last_exit_code; }
+
+void elf_disarm_exit_jmp(void)
+{
+    /* Sólo hace pop en el camino simétrico (arm…(programa terminó sin
+     * longjmp)…disarm). En el camino normal SYS_EXIT/fault → longjmp,
+     * el kill path ya descontó sp, así que aquí no se toca nada. */
+    if (g_jmp_sp <= 0) return;
+    process_t *cur = process_get_current();
+    uint32_t pid = cur ? cur->pid : 0;
+    elf_jmp_t *top = &g_jmp_stack[g_jmp_sp - 1];
+    if (top->valid && g_jmp_owner[g_jmp_sp - 1] == pid) {
+        top->valid = 0;
+        g_jmp_sp--;
+    }
+}
+
+/* Devuelve el slot armado por el proceso ACTUAL (o NULL). */
+static elf_jmp_t *jmp_target_current(void)
+{
+    if (g_jmp_sp <= 0) return NULL;
+    process_t *cur = process_get_current();
+    if (!cur) return NULL;
+    elf_jmp_t *top = &g_jmp_stack[g_jmp_sp - 1];
+    if (top->valid && g_jmp_owner[g_jmp_sp - 1] == cur->pid)
+        return top;
+    return NULL;
+}
 
 bool usermode_fault_kill(int signal_code)
 {
     process_exit(signal_code);
-    if (g_elf_jmp.valid) {
-        g_elf_jmp.exit_code = signal_code;
-        g_elf_jmp.valid     = 0;
-        elf_jmp_longjmp(&g_elf_jmp);
+    elf_jmp_t *t = jmp_target_current();
+    if (t) {
+        g_last_exit_code = signal_code;
+        t->exit_code = signal_code;
+        t->valid = 0;
+        g_jmp_sp--;
+        elf_jmp_longjmp(t);          /* nunca regresa */
     }
-    schedule();
+    /* Sin buffer propio (ej. hijo de fork): vuelta directa al padre. */
+    process_resume_parent_or_park();
     return true;
 }
 
 void syscall_install(void)
 {
     idt_set_gate(0x80, (uint32_t)syscall_stub, 0x08, 0xEE);
+    /* v0.6.1: la pila de jump buffers es BSS y Trinux no zeroiza BSS al
+     * bootear (QEMU arranca RAM a cero, hardware real no garantiza nada).
+     * g_jmp_sp basura = overflow/owner basura, así que arrancarla a cero. */
+    g_jmp_sp = 0;
+    g_last_exit_code = 0;
+    for (int i = 0; i < ELF_JMP_MAX; i++) {
+        g_jmp_stack[i].valid = 0;
+        g_jmp_stack[i].saved_cr3 = 0;
+        g_jmp_owner[i] = 0;
+    }
 }
 
 /* ---------------- helpers privados ---------------- */
@@ -130,6 +218,24 @@ static int alloc_fd(void) {
     return -1;
 }
 
+/* FIX UAF (v0.5.3): true si algún fd VFS o dir-handle abierto apunta a
+ * `n`. vfs_delete() lo consulta antes de liberar el nodo: los kfds/dh
+ * guardan punteros crudos a vfs_node_t y ramfs_remove_node() hace kfree()
+ * — open(); unlink(); read() era un use-after-free trivial desde ring 3.
+ * (POSIX: el inode sobrevive al último close; aquí sin refcount la
+ * política práctica es EBUSY.) */
+bool fd_node_is_open(vfs_node_t *n)
+{
+    if (!n) return false;
+    for (int i = 3; i < FD_MAX; i++)
+        if (kfds[i].used && kfds[i].node == n)
+            return true;
+    for (int i = 1; i < DH_MAX; i++)
+        if (dh_table[i] == n)
+            return true;
+    return false;
+}
+
 /* CRITICAL: Clean up all file descriptors owned by a dying process.
  * Called from process_exit() to prevent FD leaks that would eventually
  * exhaust the global fd table and prevent any new files from being opened. */
@@ -180,12 +286,20 @@ void syscall_handler(registers_t *regs)
     /* ---- proceso ---- */
     case SYS_EXIT:
         process_exit((int)a1);
-        if (g_elf_jmp.valid) {
-            g_elf_jmp.exit_code = (int)a1;
-            g_elf_jmp.valid     = 0;
-            elf_jmp_longjmp(&g_elf_jmp);   /* nunca regresa */
+        {
+            elf_jmp_t *t = jmp_target_current();
+            if (t) {
+                g_last_exit_code = (int)a1;
+                t->exit_code     = (int)a1;
+                t->valid         = 0;
+                g_jmp_sp--;
+                elf_jmp_longjmp(t);   /* nunca regresa */
+            }
         }
-        schedule();
+        /* Hijo de fork() (sin buffer armado): regresar directo al
+         * contexto del padre que estaba esperando en waitpid/yield. */
+        process_resume_parent_or_park();
+        break;
         break;
 
     case SYS_GETPID:
@@ -705,8 +819,8 @@ void syscall_handler(registers_t *regs)
             int i=0; while (src[i] && i<127){ k_inpath[i]=src[i]; i++; } k_inpath[i]=0;
         }
 
-        char **argv_user = r->argv;   /* elf_exec_argv copia argv en kheap
-                                         si g_nest >= 1, así que está OK */
+        char **argv_user = r->argv;   /* v0.6.0: el padre vive en su PD
+                                         (CR3 activo aquí): lectura directa */
 
         /* Stdin redirection: read file into buffer and set keyboard override */
         static uint8_t stdin_buf[4096];
@@ -1182,7 +1296,7 @@ void syscall_handler(registers_t *regs)
 
     /* ---- fork/getppid (v0.3.1) ---- */
     case SYS_FORK: {
-        int child_pid = process_fork();
+        int child_pid = process_fork(regs);
         regs->eax = (uint32_t)child_pid;
         break;
     }
@@ -1242,12 +1356,23 @@ void syscall_handler(registers_t *regs)
         }
         uint32_t old_brk = p->heap_brk;
         if (new_brk > old_brk) {
-            /* Crecer: mapear las páginas nuevas necesarias. */
+            /* Crecer: mapear las páginas nuevas necesarias (v0.6.0:
+             * usa frames PMM FRESCOS en lugar de la identidad — cada
+             * proceso tiene su propio heap físico en sus tablas privadas,
+             * nunca compartido ni accesible por su dirección física). */
             uint32_t start_pg = (old_brk + 0xFFF) & ~0xFFFu;
             uint32_t end_pg   = (new_brk + 0xFFF) & ~0xFFFu;
-            for (uint32_t pg = start_pg; pg < end_pg; pg += 0x1000) {
-                uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
-                vmm_map_page_in(p->page_dir, pg, pg, flags);
+            int oom = 0;
+            for (uint32_t pg = start_pg; pg < end_pg && !oom; pg += 0x1000) {
+                uint32_t fr = pmm_alloc_frame();
+                if (!fr) { oom = 1; break; }
+                memset((void *)fr, 0, 4096);
+                vmm_map_page_in(p->page_dir, pg, fr,
+                                PAGE_PRESENT | PAGE_RW | PAGE_USER);
+            }
+            if (oom) {
+                regs->eax = 0;   /* fallo: conservar break anterior */
+                break;
             }
         }
         /* Encoger (new_brk < old_brk): no desmapeamos páginas por ahora
@@ -1299,13 +1424,20 @@ void syscall_handler(registers_t *regs)
     /* Check for pending signals before returning to usermode.
      * If a signal was delivered (e.g., Ctrl-C), terminate the process. */
     if (process_check_signal()) {
-        /* Process was killed by signal. Force exit via longjmp. */
-        if (g_elf_jmp.valid) {
+        /* Proceso muerto por señal. Forzar salida vía longjmp SÓLO si el
+         * buffer armado es del proceso actual (v0.6.0, owner check). */
+        elf_jmp_t *t = jmp_target_current();
+        if (t) {
             process_t *p = process_get_current();
-            g_elf_jmp.exit_code = p ? p->exit_code : 128 + SIGINT;
-            g_elf_jmp.valid = 0;
-            elf_jmp_longjmp(&g_elf_jmp);
+            g_last_exit_code = p ? p->exit_code : 128 + SIGINT;
+            t->exit_code = g_last_exit_code;
+            t->valid = 0;
+            g_jmp_sp--;
+            elf_jmp_longjmp(t);
         }
+        /* Señal mortal sin buffer propio (hijo de fork): no volver a
+         * ring 3 de un proceso ya ZOMBIE — vuelta directa al padre. */
+        process_resume_parent_or_park();
     }
 }
 

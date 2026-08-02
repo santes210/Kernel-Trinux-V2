@@ -5,6 +5,174 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [0.6.1] - 2026-07-30
+
+### 🐑 Copy-on-Write para fork()
+
+fork() deja de copiar físicamente la memoria del padre: ahora padre e
+hijo COMPARTEN los mismos frames físicos hasta que alguno escribe.
+
+#### Añadido
+- **`PAGE_COW` (bit 9 AVL)** (`mm/vmm.h`): marca de página compartida
+  read-only por fork. En fork, `vmm_share_user_space()` deja padre e
+  hijo con PTEs RO+COW apuntando a los mismos frames.
+- **Refcounts COW en el PMM** (`mm/pmm.c`): array de 196608 entradas
+  (384 KiB BSS, zeroing explícito — ver abajo) con
+  `pmm_cow_share/refs/unshare`. Un frame solo vuelve al PMM cuando su
+  última referencia muere.
+- **`cow_fault_resolve()`** (`mm/vmm.c`): el page-fault handler resuelve
+  escrituras a páginas COW — refcount>1: frame nuevo + copia; refcount 1:
+  reclamación gratuita del último dueño vivo. `invlpg` + reintento
+  transparente de la instrucción que faultó.
+- **`CR0.WP=1`** (crítico para que COW sea CORRECTO): antes el bit WP
+  estaba a 0, así que el kernel en ring 0 escribía páginas read-only
+  sin faultar — cualquier syscall que escribe un buffer de usuario
+  (`getline`, `file_read`, pipes, structs de info, ...) habría corrompido
+  silenciosamente las páginas compartidas por fork. Con WP=1 esas
+  escrituras faultan y se resuelven como COW.
+- Liberación consciente de COW en `vmm_free_address_space()` y
+  `vmm_reset_user_region()` (`vm_release_user_frame`): salir/execve solo
+  suelta la referencia; el último dueño libera el frame.
+- **Zeroing explícito del BSS del array COW y del jump stack**
+  (`pmm_init`, `syscall_install`): Trinux no inicializa BSS en boot.asm
+  (en QEMU funciona de casualidad porque la RAM arranca a cero; en
+  hardware real no está garantizado). Queda documentado en AUDITORIA.md
+  como deuda P3: zeroizar BSS en el boot.
+
+#### Cambiado
+- fork() ya no asigna frames para el contenido del padre (solo el PD +
+  32 page tables del hijo): es ~instantáneo y O(páginas modificadas)
+  en memoria en lugar de O(memoria total del padre).
+- Fallos de fork a mitad de camino se auto-curan: las páginas RO+COW
+  huérfanas se reclaman con refcount 1 en su primera escritura.
+
+## [0.6.0] - 2026-07-30
+
+### 🏛️ Address spaces REALES por proceso + fork() real (P0 de la auditoría)
+
+El cambio arquitectónico más grande de Trinux: cada proceso ahora vive en
+su propio espacio de direcciones, y `fork()` funciona de verdad.
+
+#### Añadido
+- **Aislamiento de memoria por proceso** (`mm/vmm.c`): cada page directory
+  de proceso tiene **page tables PRIVADAS** para la región de usuario
+  0x08000000-0x10000000 (tablas 32-63); kernel, physmap y MMIO se
+  comparten con el PD del kernel. Un proceso ya NO puede leer ni escribir
+  la memoria de otro usando su VA — solo la suya.
+- **Physmap cerrado a ring 3**: las tablas 20-31 y 64-255 del identity-map
+  pasan a supervisor-only. Antes CUALQUIER frame físico del sistema era
+  accesible desde ring 3 usando su dirección física como VA (page tables
+  de otros procesos, buffers de ramfs, etc.).
+- **ELF loader sobre frames frescos** (`kernel/elf.c`): code/data/bss se
+  cargan en frames PMM nuevos mapeados en las tablas privadas del proceso;
+  el proceso entra a ring 3 **con su propio CR3**. El user stack siempre
+  vive en VA `0x0F000000` pero en frames distintos por proceso.
+- **Muere el hack del backup de 736 KiB** y los stacks por nivel de
+  anidamiento (L0-L3): con aislamiento real, spawns anidados ilimitados
+  (`sh` → `ls` → `sh` → ...) funcionan sin tocar la memoria del padre.
+- **`fork()` real y asíncrono** (`mm/fork.c` + `cpu/syscall_asm.asm`):
+  deep-copy de la región de usuario del padre (`vmm_copy_user_space`) +
+  copia del trap frame del int 0x80 con `eax=0` en el kstack del hijo.
+  El hijo entra al scheduler y su primer `context_switch` aterriza en
+  `fork_child_trampoline`, que replica la cola de `syscall_stub` (iret a
+  ring 3 justo después del `int 0x80`). fork() devuelve el PID al padre
+  y 0 al hijo. La salida del hijo regresa directo al contexto del padre
+  (`process_resume_parent_or_park`) sin tocar el jump buffer ajeno.
+- **Jump stack con dueño** (`cpu/syscall.c`): la maquinaria setjmp/longjmp
+  de los ELF pasa de un buffer global único a una pila de 8 niveles con
+  pid dueño por nivel + CR3 guardado en el slot. Un hijo de fork (que
+  nunca pasa por `usermode_save_and_enter`) ya no puede corromper el
+  frame de salida de otro proceso al hacer SYS_EXIT/fault.
+- **`SYS_BRK` con frames frescos**: el heap de cada proceso se mapea VA →
+  frame PMM nuevo en sus tablas privadas (antes: identidad compartida).
+- **`execve()` con reset de región** (`vmm_reset_user_region`): libera los
+  frames viejos antes de cargar la imagen nueva (mismo PD, mismo PID).
+- Higiene del repo: los 34 `.o` trackeados salen del índice (`*.o` ya
+  estaba en `.gitignore`); se regeneran siempre con `make`.
+
+#### Cambiado
+- `vmm_create_address_space()` ahora crea tablas privadas 32-63 (+132 KiB
+  por proceso) y hace snapshot de las PDEs de MMIO del kernel (256+).
+- `vmm_free_address_space()` solo libera lo que el proceso posee en
+  exclusiva (fix latente: antes podía devolver frames estáticos de MMIO
+  al PMM) + `process_exit()` devuelve el CR3 al PD del kernel al morir.
+- `vmm_map_page_in()` invalida la TLB cuando mapea sobre el PD activo.
+- Límite del ELF loader unificado a 0x10000000 (era 1 GiB): coherente con
+  `uaccess` y con el physmap cerrado.
+
+#### Notas de diseño (v1)
+- Sin COW todavía: fork copia físicamente cada página presente del padre.
+- Modelo cooperativo: padre e hijo se alternan en syscalls
+  (waitpid/yield/sleep), igual que el resto de Trinux.
+- La fd-table sigue siendo global por diseño (los hijos la comparten).
+
+## [0.5.3] - 2026-07-30
+
+### 🛡️ Auditoría completa de código — 12 correcciones críticas/altas
+
+Revisión línea por línea de todo el kernel (~60.700 líneas, 272 archivos).
+Ver **AUDITORIA.md** para el análisis completo y la hoja de ruta.
+
+#### Seguridad (críticas)
+- **`uaccess_ok()` overflow** (`cpu/uaccess.h`): `addr + len > END` podía
+  envolver y validar rangos que recorren TODA la memoria (kernel incluido)
+  desde ring 3. Ahora `len > END - addr` (nunca desborda).
+- **ELF loader sobre-escribía el kernel** (`kernel/elf.c`): `PT_LOAD` con
+  `p_vaddr < 0x08000000` se copiaba en ring 0 sobre el propio kernel
+  (ejecución arbitraria ring 0 desde un ELF, tanto por `SYS_SPAWN` como por
+  `SYS_EXECVE`). Se rechaza todo segmento bajo `ELF_MIN_USER_VADDR` y se
+  valida la tabla de PHDRs contra el tamaño del archivo (OOB read) en ambas
+  rutas de carga.
+- **PMM entregaba frames de usuario vivos** (`mm/pmm.c`): solo se
+  reservaban 128 MiB; los frames del código/stack/heap de usuarios
+  (0x08048000-0x0F100000) quedaban "libres" para page dirs/tables/fork —
+  corrupción de procesos. Reserva ampliada a 256 MiB + cap de 1 GiB
+  (límite del identity-map; evita frames inmappings en máquinas >1 GiB).
+- **Page tables/dirs al alcance de ring 3** (`mm/vmm.c`): los frames
+  dinámicos del PMM caen en páginas identity U/S=1 — un usuario podía
+  editar las estructuras de paginación del kernel. Nueva
+  `vmm_deprivilege_identity_page()` aplicada a PDs, PTs y frames de fork.
+- **`fork()` paniqueaba el sistema** (`mm/fork.c`): el hijo se creaba con
+  `context.eip = 0`; al ser elegido por el scheduler → EIP=0 → page fault
+  en ring 0 → pánico. Ahora devuelve -1 de forma segura hasta implementarlo
+  bien (bosquejo incluido en el código y en AUDITORIA.md).
+- **Page fault en ring 3 = bucle infinito** (`mm/vmm.c`): solo se marcaba
+  SIGSEGV pendiente y se retornaba; el `iret` re-ejecutaba la misma
+  instrucción → fault infinito que colgaba el SO. Ahora termina el proceso
+  vía `usermode_fault_kill(-14)`, coherente con otras excepciones.
+
+#### Estabilidad (altas)
+- **`net_ping()` stack overflow** (`drivers/net.c`): paquete ICMP de 74
+  bytes construido sobre un buffer de 64 (overflow de 10 bytes, detectado
+  por `-Warray-bounds`) y se enviaban solo 60 de los 74 bytes.
+- **Trampoline SMP roto** (`cpu/smp_boot.c`): `jmp far` a 0x8016 en medio
+  de una instrucción (triple fault de APs), array de 256 desbordado con
+  258 reales (CR3 truncado), y `ap_main` recibía un arg cdecl que el
+  trampoline nunca empujó — ahora cada AP lee su APIC ID del LAPIC.
+- **Use-after-free por unlink** (`fs/vfs.c`, `cpu/syscall.c`): borrar un
+  archivo/dir con fd o dir-handle abierto liberaba el nodo con punteros
+  vivos. `vfs_delete()` devuelve "busy" (nueva `fd_node_is_open()`).
+- **`/dev` moría tras el primer sync** (`fs/devfs.c`, `fs/diskfs.c`):
+  diskfs persistía nodos sin handlers y se duplicaban al bootear — el
+  nodo muerto tapaba al real. Ya no se persisten /dev ni /fat (esta última
+  además congelaba una vista muerta del volumen FAT16) y `devfs_init`
+  re-anima o recrea los nodos.
+- **Buffers de 4 KiB en el kstack** (`fs/ramfs.c`): lecturas/escrituras
+  disk-backed usaban la mitad de un kstack de 8 KiB. Ahora estáticos.
+- **Leaks**: block lists disk-backed no se liberaban en `wipe_children`
+  (diskfs); PTEs remapeadas por fork quedaban dangling al morir el hijo
+  (nueva `vmm_restore_user_identity()` en `process_exit`).
+
+#### Menores
+- `KERNEL_VERSION` 0.2.0 → 0.5.3 (desfasada del CHANGELOG).
+- `fat16_init` no chequeaba NULL si fallaba la lectura del directorio.
+- Warnings: declaraciones implícitas (`tss_set_kernel_stack` en elf.c,
+  `schedule` en process.c), `status_col` sin inicializar y
+  `dirty_batch`/label `ed_exit` sin uso (editor.c), excess-elements
+  (smp_boot.c).
+- Nota: `fs/fat.c` (driver FAT viejo, sin uso: todo pasa por fat16.c)
+  sigue compilándose pero muerto — ver AUDITORIA.md §3-P2.
+
 ## [0.5.2] - 2026-07-29
 
 ### 🚀 `SYS_EXECVE` real (execve() de verdad)

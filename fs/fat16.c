@@ -544,6 +544,7 @@ void fat16_init(void)
     total_clusters         = data_sectors / bpb.sectors_per_cluster;
 
     fat_root_node = fat16_read_dir(0, true);
+    if (!fat_root_node) return;   /* FIX (v0.5.3): antes se usaba sin NULL check */
     strcpy(fat_root_node->name, "fat");
     fat_root_node->readdir = fat16_vfs_readdir;
 

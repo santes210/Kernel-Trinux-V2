@@ -329,7 +329,11 @@ int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
     ping_seq++;
     ping_reply_got = false;
 
-    uint8_t frame[64];
+    /* FIX (v0.5.3): el paquete completo es eth(14)+ip(20)+icmp(8+32) = 74
+     * bytes, pero el buffer era de 64 -> stack overflow de 10 bytes en el
+     * stack del kernel (lo detectaba -Warray-bounds). */
+    #define PING_FRAME_LEN (14 + 20 + 8 + 32)   /* 74 bytes */
+    uint8_t frame[PING_FRAME_LEN];
     eth_t  *eth  = (eth_t  *)frame;
     ipv4_t *ip   = (ipv4_t *)(frame + 14);
     icmp_t *icmp = (icmp_t *)(frame + 34);
@@ -359,7 +363,8 @@ int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
     icmp->checksum = inet_checksum(icmp, 40);
 
     uint32_t t_start = timer_get_ticks();
-    rtl8139_send(frame, 60);
+    /* FIX (v0.5.3): enviar el paquete completo (74 bytes), no 60. */
+    rtl8139_send(frame, PING_FRAME_LEN);
 
     /* Esperar reply */
     uint32_t hz = timer_get_freq();

@@ -11,6 +11,10 @@ static uint32_t   proc_count;
 static uint32_t   next_pid = 1;
 process_t *current;
 
+/* FIX (v0.5.3): schedule() se usaba en process_waitpid() sin declaración
+ * (implicit-declaration warning). */
+extern void schedule(void);
+
 /* `nice <prio> <cmd>` stashes a value here; the next process_create()
  * picks it up and resets it back to "none" (INT32_MIN). */
 #define NICE_NONE  (-0x80000000)
@@ -224,7 +228,15 @@ void process_exit(int code)
         if (current->page_dir) {
             vmm_free_address_space(current->page_dir);
             current->page_dir = 0;
+            /* v0.6.0: si el CR3 activo es ese PD recién liberado, la CPU
+             * sigue ejecutando via TLB hasta el próximo cambio de CR3;
+             * pasar YA al PD del kernel elimina la ventana de riesgo. */
+            vmm_switch_address_space(vmm_kernel_dir());
         }
+
+        /* Liberar frames que fork() remapeó en las page tables compartidas
+         * y restaurar PTEs identidad (v0.5.3; idempotente). */
+        vmm_restore_user_identity();
     }
 }
 
@@ -456,4 +468,33 @@ bool process_deliver_signal(int sig)
     p->exit_code = 128 + sig;
     p->signaled = true;
     return true;  /* proceso terminado */
+}
+
+/* v0.6.0 — salida de un proceso SIN jump buffer propio (hijo de fork).
+ *
+ * El padre cooperativo está detenido dentro de schedule() (context_switch
+ * guardó su contexto de kernel al darle la CPU al hijo). Retomar ese
+ * contexto devuelve el control directamente al waitpid/yield del padre.
+ * Un ELF síncrono nunca llega aquí: tiene su propio jump buffer (owner). */
+void process_resume_parent_or_park(void)
+{
+    process_t *cur = process_get_current();
+    process_t *par = cur ? process_get(cur->parent_pid) : NULL;
+
+    if (par && par->context.esp && par->state != PROC_ZOMBIE) {
+        par->state = PROC_RUNNING;
+        process_set_current(par);
+        extern void tss_set_kernel_stack(uint32_t esp0);
+        if (par->kstack)
+            tss_set_kernel_stack((uint32_t)par->kstack + 8192);
+        extern void context_switch(context_t *old, context_t *new, uint32_t pd);
+        context_switch(NULL, &par->context, par->page_dir);
+        /* nunca regresa */
+    }
+
+    /* Sin padre aprovechable: estacionar (idle-hlt + scheduler). */
+    for (;;) {
+        __asm__ volatile("sti; hlt");
+        schedule();
+    }
 }

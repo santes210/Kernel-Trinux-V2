@@ -117,60 +117,85 @@ extern void smp_ap_entry(void);
  * usa la GDT y CR3 del BSP directamente (espacio de direcciones compartido).
  */
 
-/* Estructura de parámetros al final del trampoline (en 0x8000 + offsets). */
+/* Estructura de parámetros al final del trampoline (en 0x8000 + offsets).
+ * FIX (v0.5.3): CR3 está en 0xFE y ocupa 4 bytes -> el bloque total es
+ * 0x102 (258 bytes), NO 256; el array viejo (256) se desbordaba y GCC
+ * descartaba el exceso (-Wexcess-initializer), truncando CR3. */
 #define TRAMP_PARAM_GDT    0xF0   /* 6 bytes */
 #define TRAMP_PARAM_ENTRY  0xF6   /* 4 bytes */
 #define TRAMP_PARAM_STACK  0xFA   /* 4 bytes */
-#define TRAMP_PARAM_CR3    0xFE   /* 4 bytes — nota: 0x100 = 256 bytes total */
+#define TRAMP_PARAM_CR3    0xFE   /* 4 bytes */
+#define TRAMP_TOTAL        0x102  /* tamaño total del bloque (258 bytes) */
 
-/* Trampoline en real mode (16 bits). Los offsets asumen base 0x8000. */
-static const uint8_t trampoline_code[256] = {
+/* Trampoline en real mode (16 bits). Los offsets asumen base 0x8000.
+ *
+ * Layout real del código (55 bytes, 0x00-0x36):
+ *   0x00  cli                                    (1)
+ *   0x01  lgdt [0x80F0]                          (5)
+ *   0x06  mov eax, cr0                           (3)
+ *   0x09  or  al, 1                              (2)
+ *   0x0B  mov cr0, eax                           (3)
+ *   0x0E  jmp far 0x08:0x8015                    (7)
+ *   0x15  mov ax, 0x10   <- código de 32 bits    (4)
+ *   0x19  mov ds/es/ss/fs/gs, ax                 (10)
+ *   0x23  mov esp, [0x80FA]                      (6)
+ *   0x29  mov eax, [0x80FE]                      (5)
+ *   0x2E  mov cr3, eax                           (3)
+ *   0x31  jmp dword [0x80F6]  -> ap_main         (6)
+ *   0x37..0xEF  padding (185 bytes)
+ *   0xF0..0x101 parámetros (ver TRAMP_PARAM_*)
+ *
+ * FIX (v0.5.3): el jmp far apuntaba a 0x8016, en MEDIO de `mov ax,0x10`
+ * (que empieza en 0x15): el AP decodificaba basura -> triple fault. */
+static const uint8_t trampoline_code[TRAMP_TOTAL] = {
     /* 0x00: cli */
     0xFA,
-    /* 0x01: lgdt [0x8000 + TRAMP_PARAM_GDT]
-     * En real mode con CS=0x800, DS=0x800, la dirección es 0x800*16+0xF0=0x80F0.
-     * Usamos lgdt con dirección absoluta: 0x0F 0x01 0x16 lo hi */
-    0x0F, 0x01, 0x16, 0xF0, 0x80,   /* lgdt [0x80F0] — dirección de la GDT en mem baja */
-    /* 0x07: mov eax, cr0 */
+    /* 0x01: lgdt [0x80F0] (dirección absoluta de la GDT en memoria baja) */
+    0x0F, 0x01, 0x16, 0xF0, 0x80,
+    /* 0x06: mov eax, cr0 */
     0x0F, 0x20, 0xC0,
-    /* 0x0A: or al, 1  (set PE) */
+    /* 0x09: or al, 1  (set PE) */
     0x0C, 0x01,
-    /* 0x0C: mov cr0, eax */
+    /* 0x0B: mov cr0, eax */
     0x0F, 0x22, 0xC0,
-    /* 0x0F: jmp far 0x08:0x00008016 (salto a 32 bits, dirección fija 0x8016) */
+    /* 0x0E: jmp far 0x08:0x8015 (FIX: 0x8015 = inicio real del código 32b) */
     0xEA,
-    0x16, 0x80, 0x00, 0x00,   /* offset 0x8016 little-endian */
+    0x15, 0x80, 0x00, 0x00,   /* offset 0x8015 little-endian */
     0x08, 0x00,               /* segment 0x08 (kernel code) */
-    /* 0x16: código de 32 bits — el AP está ahora en protected mode */
-    /* A partir de aquí los bytes son i386 (32-bit) */
-    /* mov ax, 0x10; mov ds,ax; mov es,ax; mov ss,ax; mov fs,ax; mov gs,ax */
+    /* 0x15: código de 32 bits — el AP está ahora en protected mode */
     0x66, 0xB8, 0x10, 0x00,   /* mov ax, 0x10 */
     0x8E, 0xD8,               /* mov ds, ax */
     0x8E, 0xC0,               /* mov es, ax */
     0x8E, 0xD0,               /* mov ss, ax */
     0x8E, 0xE0,               /* mov fs, ax */
     0x8E, 0xE8,               /* mov gs, ax */
-    /* Cargar stack: mov esp, [0x80FA] */
-    0x8B, 0x25, 0xFA, 0x80, 0x00, 0x00,   /* mov esp, [0x80FA] */
-    /* Cargar CR3: mov eax,[0x80FE]; mov cr3,eax */
-    0xA1, 0xFE, 0x80, 0x00, 0x00,         /* mov eax, [0x80FE] */
-    0x0F, 0x22, 0xD8,                      /* mov cr3, eax */
-    /* Habilitar paginación (CR0.PG ya estaba en la GDT del BSP): no-op aquí */
-    /* Saltar a la función ap_main del kernel: jmp [0x80F6] */
-    0xFF, 0x25, 0xF6, 0x80, 0x00, 0x00,   /* jmp dword [0x80F6] */
-    /* Relleno hasta 0xF0 */
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    /* 0x23: mov esp, [0x80FA] (stack del AP, viene del área de params) */
+    0x8B, 0x25, 0xFA, 0x80, 0x00, 0x00,
+    /* 0x29: mov eax, [0x80FE]; mov cr3, eax (page directory del BSP) */
+    0xA1, 0xFE, 0x80, 0x00, 0x00,
+    0x0F, 0x22, 0xD8,
+    /* 0x31: jmp dword [0x80F6] (ap_main) */
+    0xFF, 0x25, 0xF6, 0x80, 0x00, 0x00,
+    /* Relleno hasta 0xF0: 0xF0 - 0x37 = 185 bytes */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  10 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  20 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  30 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  40 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  50 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  60 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  70 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  80 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /*  90 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 100 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 110 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 120 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 130 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 140 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 150 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 160 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 170 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 180 */
+    0, 0, 0, 0, 0,               /* 185 */
     /* 0xF0: GDT ptr (6 bytes) — se rellena en smp_boot_aps() */
     0, 0, 0, 0, 0, 0,
     /* 0xF6: ap_entry (4 bytes) */
@@ -181,9 +206,15 @@ static const uint8_t trampoline_code[256] = {
     0, 0, 0, 0
 };
 
-/* Entry point C para los APs — llamado desde el trampoline. */
-void ap_main(uint32_t ap_id)
+/* Entry point C para los APs — llamado desde el trampoline.
+ * FIX (v0.5.3): antes recibía `ap_id` como argumento cdecl, pero el
+ * trampoline salta (jmp) a ap_main sin empujar ningún argumento — leía
+ * basura del stack. Cada AP lee su APIC ID del registro LAPIC_ID
+ * (bits 31-24), el método estándar (Intel SDM Vol.3 §8.4.5). */
+void ap_main(void)
 {
+    uint32_t ap_id = lapic_read(LAPIC_ID) >> 24;
+
     /* Marcar que este AP arrancó */
     if (ap_id < SMP_MAX_CPUS)
         ap_booted[ap_id] = 1;
@@ -253,8 +284,10 @@ int smp_boot_aps(void)
         }
         uint32_t stack_top = (uint32_t)ap_stacks[ap_idx] + AP_STACK_SIZE;
 
-        /* Copiar trampoline a 0x8000 */
-        memcpy((void *)AP_TRAMPOLINE_ADDR, trampoline_code, 256);
+        /* Copiar trampoline a 0x8000 (FIX: tamaño real, no 256 a secas —
+         * el bloque con parámetros mide TRAMP_TOTAL=258 bytes) */
+        memcpy((void *)AP_TRAMPOLINE_ADDR, trampoline_code,
+               sizeof(trampoline_code));
 
         /* Rellenar parámetros al final del trampoline */
         uint8_t *tramp = (uint8_t *)AP_TRAMPOLINE_ADDR;
