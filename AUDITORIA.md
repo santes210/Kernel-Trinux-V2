@@ -192,7 +192,12 @@
     Idealmente: compilar con `-Werror` en CI cuando estén en cero.
 17. `boot/mbr_boot.asm` y `boot/longmode.asm` no se enlazan (docs vivas).
     Mover a `docs/` para no confundir.
-18. Los objetos `.o` rastreados en git mezclados con los ignorados: elegir
+19. **El kernel NO zeroiza el BSS** (`boot/boot.asm`): funciona en QEMU
+    de casualidad (RAM arranca a cero); en hardware real los estáticos
+    sin init explícito son basura. COW/jump stack ya se protegen con
+    memset propio (v0.6.1), pero lo correcto es zeroizar
+    [bss_start, bss_end) en el entry antes de `kernel_main`.
+20. Los objetos `.o` rastreados en git mezclados con los ignorados: elegir
     un solo criterio (recomendado: ignorar todos y compilar siempre).
 
 ---

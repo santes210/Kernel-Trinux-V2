@@ -3,9 +3,9 @@
  * Piezas:
  *   1. vmm_create_address_space() crea el PD del hijo (tablas de usuario
  *      32-63 PRIVADAS y vacías; kernel/physmap/MMIO compartidos).
- *   2. vmm_copy_user_space() hace deep-copy de cada página presente del
- *      padre a frames PMM nuevos (mismo VA, frame distinto => el hijo
- *      tiene su propia copia de code/data/bss/heap/stack).
+ *   2. vmm_share_user_space() marca cada página presente del padre
+ *      como RO+COW en padre E hijo (mismos frames, refcount en el PMM);
+ *      la primera escritura copia bajo demanda — Copy-on-Write (v0.6.1).
  *   3. Se copia el trap frame COMPLETO del int 0x80 en curso a la cima
  *      del kstack del hijo, con eax=0 (el hijo "regresa 0" de fork()).
  *   4. El contexto del hijo apunta a fork_child_trampoline (asm), que
@@ -60,10 +60,10 @@ int process_fork(registers_t *regs)
         return -1;
     }
 
-    /* 2. Deep-copy de la región de usuario del padre. */
-    if (vmm_copy_user_space(child_pd, parent->page_dir) != 0) {
+    /* 2. Compartir COW la región de usuario del padre. */
+    if (vmm_share_user_space(child_pd, parent->page_dir) != 0) {
         vmm_free_address_space(child_pd);
-        kprintf("[fork] sin frames para copiar el address space\n");
+        kprintf("[fork] sin frames para compartir el address space\n");
         return -1;
     }
 

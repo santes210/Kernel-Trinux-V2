@@ -148,6 +148,16 @@ bool usermode_fault_kill(int signal_code)
 void syscall_install(void)
 {
     idt_set_gate(0x80, (uint32_t)syscall_stub, 0x08, 0xEE);
+    /* v0.6.1: la pila de jump buffers es BSS y Trinux no zeroiza BSS al
+     * bootear (QEMU arranca RAM a cero, hardware real no garantiza nada).
+     * g_jmp_sp basura = overflow/owner basura, así que arrancarla a cero. */
+    g_jmp_sp = 0;
+    g_last_exit_code = 0;
+    for (int i = 0; i < ELF_JMP_MAX; i++) {
+        g_jmp_stack[i].valid = 0;
+        g_jmp_stack[i].saved_cr3 = 0;
+        g_jmp_owner[i] = 0;
+    }
 }
 
 /* ---------------- helpers privados ---------------- */

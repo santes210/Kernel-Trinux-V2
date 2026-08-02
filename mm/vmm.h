@@ -6,6 +6,9 @@
 #define PAGE_PRESENT       0x1
 #define PAGE_RW            0x2
 #define PAGE_USER          0x4
+/* Bit AVL (9) reusado como marcador Copy-on-Write (v0.6.1): la página es
+ * compartida padre/hijo por fork() y RO hasta la primera escritura. */
+#define PAGE_COW           0x200U
 #define PAGE_WRITE_THROUGH 0x8
 #define PAGE_CACHE_DISABLE 0x10
 
@@ -43,10 +46,14 @@ int      vmm_copy_to_user(uint32_t pd, uint32_t va, const void *src, uint32_t le
  * privadas se conservan (quedan vacías). */
 void     vmm_reset_user_region(uint32_t pd);
 
-/* Deep-copy de la región de usuario privada de `src_pd` a `dst_pd`
- * (fork()): cada página presente se copia a un frame PMM nuevo con los
- * mismos flags. Devuelve 0 ok, -1 si faltaron frames. */
-int      vmm_copy_user_space(uint32_t dst_pd, uint32_t src_pd);
+/* Compartir COW la región de usuario privada de `src_pd` con `dst_pd`
+ * (fork(), v0.6.1): cada página presente del padre queda marcada RO+COW
+ * en AMBOS page directories (con refcount en el PMM); el hijo apunta a
+ * los MISMOS frames. La primera escritura en cualquiera dispara un page
+ * fault que copia la página bajo demanda (ver cow_fault_resolve en
+ * vmm.c). Las páginas no-PMM (defensivas) sí se copian físicamente.
+ * Devuelve 0 ok, -1 si faltaron frames para copias defensivas. */
+int      vmm_share_user_space(uint32_t dst_pd, uint32_t src_pd);
 
 /* Quita PAGE_USER de la página identity-mapped de un frame (para
  * estructuras internas del kernel alojadas en frames del PMM). */

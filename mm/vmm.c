@@ -15,6 +15,7 @@
  * supervisor-only (U/S=0), pages at or above are user-accessible (U/S=1).
  */
 #include "vmm.h"
+#include "pmm.h"
 #include "../lib/string.h"
 #include "../lib/printf.h"
 #include "../cpu/isr.h"
@@ -71,9 +72,22 @@ static void enable_paging(void)
 {
     uint32_t cr0;
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    cr0 |= 0x80000000;   /* set PG bit */
+    cr0 |= 0x80000000;   /* PG bit */
+    cr0 |= 0x00010000;   /* WP bit (v0.6.1): supervisor TAMBIÉN honra RO.
+                          * Sin esto, una syscall que escribe un buffer de
+                          * usuario (getline, file_read, ...) pasaría por
+                          * encima de las páginas COW read-only de fork()
+                          * sin faultar: corrupción SILENCIOSA de la página
+                          * compartida padre/hijo. Con WP=1 esas escrituras
+                          * faultan y cow_fault_resolve() las resuelve.
+                          * Nuestras estructuras kernel son todas RW, así
+                          * que ninguna escritura legítima se ve afectada. */
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
 }
+
+/* Forward decls: implementaciones más abajo (v0.6.1, COW). */
+static uint32_t *user_pt(uint32_t *pd, uint32_t virt);
+static bool      cow_fault_resolve(uint32_t pd_phys, uint32_t va);
 
 static void page_fault_handler(registers_t *regs)
 {
@@ -83,6 +97,18 @@ static void page_fault_handler(registers_t *regs)
     bool present = regs->err_code & 0x1;
     bool write   = regs->err_code & 0x2;
     bool user    = regs->err_code & 0x4;
+
+    /* COW (v0.6.1): una escritura a página presente con bit PAGE_COW se
+     * resuelve aquí: copiar el frame (o reclamarlo si somos los últimos),
+     * mapear RW, invlpg y RETORNAR — la instrucción se reintenta sola.
+     * Aplica tanto a faults de ring 3 como de ring 0 (WP=1: syscalls que
+     * escriben buffers de usuario sobre páginas compartidas por fork). */
+    if (present && write) {
+        process_t *cp = process_get_current();
+        uint32_t cpd = (cp && cp->page_dir) ? cp->page_dir : vmm_get_current_dir();
+        if (cow_fault_resolve(cpd, faulting_address))
+            return;   /* página ya escribible: reintento transparente */
+    }
 
     /* Si el fault vino de ring 3 (user mode), matar el proceso en lugar de panic */
     if (user) {
@@ -309,6 +335,59 @@ static uint32_t *user_pt(uint32_t *pd, uint32_t virt)
     return (uint32_t *)(pd[dir_idx] & ~0xFFFu);
 }
 
+/* Resuelve un page fault de Copy-on-Write sobre la VA `va`.
+ * Devuelve true si la página era COW y ya quedó escribible (reintentar
+ * la instrucción); false si no era COW (el caller decide: kill/panic).
+ *
+ * Casos:
+ *   - refcount > 1: hay otros dueños → frame nuevo + copia + unshare.
+ *   - refcount <=1: somos el último dueño vivo → reclamar el frame tal
+ *     cual (gratis) restaurando RW.
+ */
+static bool cow_fault_resolve(uint32_t pd_phys, uint32_t va)
+{
+    uint32_t *pd = (uint32_t *)pd_phys;
+    uint32_t *pt = user_pt(pd, va);
+    if (!pt) return false;
+
+    uint32_t *pe = &pt[(va >> 12) & 0x3FF];
+    uint32_t pte = *pe;
+    if (!(pte & PAGE_COW)) return false;
+
+    extern uint32_t pmm_alloc_frame(void);
+    extern void     serial_printf(const char *fmt, ...);
+    uint32_t sphys = pte & ~0xFFFu;
+    uint32_t nf;
+
+    if (pmm_cow_refs(sphys) > 1) {
+        nf = pmm_alloc_frame();
+        if (!nf) {
+            serial_printf("[cow] OOM resolviendo COW en VA %08x\n", va);
+            return false;   /* el caller lo tratará como fault mortal */
+        }
+        memcpy((void *)nf, (void *)sphys, 4096);
+        pmm_cow_unshare(sphys);
+    } else {
+        nf = sphys;               /* último dueño: reclamar sin copiar */
+        pmm_cow_unshare(sphys);   /* 1 -> 0 */
+    }
+
+    *pe = nf | ((pte & 0xFFFu) & ~PAGE_COW) | PAGE_RW | PAGE_PRESENT;
+    __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+    return true;
+}
+
+/* Suelta una referencia a un frame de la región privada de usuario:
+ * decrementa el refcount COW y solo lo devuelve al PMM cuando la cuenta
+ * llega a 0 (privado o último dueño). Frames no-PMM no se tocan. */
+static void vm_release_user_frame(uint32_t phys)
+{
+    extern void pmm_free_frame(uint32_t);
+    if (phys < PMM_COW_BASE) return;         /* identidad/reservada */
+    if (pmm_cow_unshare(phys) == 0)
+        pmm_free_frame(phys);
+}
+
 int vmm_copy_to_user(uint32_t pd_phys, uint32_t va, const void *src, uint32_t len)
 {
     uint32_t *pd = (uint32_t *)pd_phys;
@@ -331,7 +410,6 @@ int vmm_copy_to_user(uint32_t pd_phys, uint32_t va, const void *src, uint32_t le
 
 void vmm_reset_user_region(uint32_t pd_phys)
 {
-    extern void pmm_free_frame(uint32_t);
     uint32_t *pd = (uint32_t *)pd_phys;
     for (int t = USER_TABLE_FIRST; t < USER_TABLE_LAST; t++) {
         if (!(pd[t] & PAGE_PRESENT)) continue;
@@ -341,19 +419,26 @@ void vmm_reset_user_region(uint32_t pd_phys)
             if (!(pte & PAGE_PRESENT)) continue;
             uint32_t phys = pte & ~0xFFFu;
             uint32_t virt = (uint32_t)((t * PAGES_PER_TABLE + p)) * 0x1000u;
-            /* Solo frames PMM privados (nunca identidad heredada). */
+            /* v0.6.1: release con refcount COW (solo frames PMM, nunca
+             * identidad heredada). Si el frame sigue compartido por otro
+             * proceso (fork), aquí solo cae NUESTRA referencia. */
             if (phys != virt && phys >= PMM_FRAME_MIN)
-                pmm_free_frame(phys);
+                vm_release_user_frame(phys);
             pt[p] = 0;
         }
     }
 }
 
-int vmm_copy_user_space(uint32_t dst_pd, uint32_t src_pd)
+int vmm_share_user_space(uint32_t dst_pd, uint32_t src_pd)
 {
-    extern uint32_t pmm_alloc_frame(void);
+    /* fork() COW: marcar cada página presente del padre como RO + PAGE_COW
+     * en AMBOS page directories, con refcount en el PMM. Las escrituras
+     * futuras (de cualquiera) se copian bajo demanda en cow_fault_resolve. */
     uint32_t *dst = (uint32_t *)dst_pd;
     uint32_t *src = (uint32_t *)src_pd;
+    extern uint32_t pmm_alloc_frame(void);
+    bool flush_src = (src_pd == current_page_directory);
+
     for (int t = USER_TABLE_FIRST; t < USER_TABLE_LAST; t++) {
         if (!(src[t] & PAGE_PRESENT)) continue;
         uint32_t *spt = (uint32_t *)(src[t] & ~0xFFFu);
@@ -363,18 +448,30 @@ int vmm_copy_user_space(uint32_t dst_pd, uint32_t src_pd)
             if (!(pte & PAGE_PRESENT)) continue;
             uint32_t sphys = pte & ~0xFFFu;
             uint32_t virt  = (uint32_t)((t * PAGES_PER_TABLE + p)) * 0x1000u;
-            if (sphys == virt) {
-                /* Página identity heredada (no debería existir en v0.6.0,
-                 * pero si aparece: compartir la misma entrada — la memoria
-                 * reservada < 256 MiB no es reclaimable). */
-                dpt[p] = pte;
+
+            /* Páginas no-PMM (identidad/reservadas, defensivo: hoy no se
+             * producen) o sin refcount posible → copia física clásica. */
+            if (sphys < PMM_COW_BASE || pmm_cow_share(sphys) == 0) {
+                uint32_t nf = pmm_alloc_frame();
+                if (!nf) return -1;   /* fork aborta; las RO+COW ya escritas
+                                       * se auto-curan: refcount 1 reclama */
+                memcpy((void *)nf, (void *)sphys, 4096);
+                dpt[p] = nf | (pte & ~(uint32_t)PAGE_COW & 0xFFFu) | PAGE_PRESENT;
                 continue;
             }
-            uint32_t nf = pmm_alloc_frame();
-            if (!nf) return -1;
-            memcpy((void *)nf, (void *)sphys, 4096);
-            vmm_deprivilege_identity_page(nf);
-            dpt[p] = nf | (pte & 0xFFFu) | PAGE_PRESENT;
+
+            /* Compartir: padre e hijo RO + COW. Si la página ya era COW de
+             * un fork anterior (cadena sh→hijo→nieto) basta un refcount+. */
+            if ((pte & PAGE_RW) || (pte & PAGE_COW)) {
+                uint32_t shared = (pte & ~(uint32_t)PAGE_RW) | PAGE_COW;
+                spt[p] = shared;
+                dpt[p] = shared;
+                if (flush_src)
+                    __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
+            } else {
+                /* Página RO genuina (hoy ninguna): compartir sin COW. */
+                dpt[p] = pte;
+            }
         }
     }
     return 0;
@@ -426,7 +523,7 @@ void vmm_free_address_space(uint32_t pd_phys) {
             uint32_t phys = pte & ~0xFFFu;
             uint32_t virt = (uint32_t)((t * PAGES_PER_TABLE + p)) * 0x1000u;
             if (phys != virt && phys >= PMM_FRAME_MIN)
-                pmm_free_frame(phys);
+                vm_release_user_frame(phys);
         }
         pmm_free_frame(pd[t] & ~0xFFFu);
     }

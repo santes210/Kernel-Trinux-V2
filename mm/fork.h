@@ -7,8 +7,6 @@
  * devuelve el PID del hijo, en el hijo devuelve 0.
  *
  * Limitaciones intencionales (v1):
- *   - Sin Copy-on-Write: se copia físicamente cada página presente del
- *     padre. COW vendría después usando el bit RW=0 + page-fault traps.
  *   - El modelo de scheduling es cooperativo: padre e hijo se turnan en
  *     los puntos de syscall (waitpid/yield/sleep), como el resto de
  *     Trinux. fork() desde procesos que nunca hagan syscalls tras el

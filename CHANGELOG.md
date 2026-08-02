@@ -5,6 +5,47 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [0.6.1] - 2026-07-30
+
+### 🐑 Copy-on-Write para fork()
+
+fork() deja de copiar físicamente la memoria del padre: ahora padre e
+hijo COMPARTEN los mismos frames físicos hasta que alguno escribe.
+
+#### Añadido
+- **`PAGE_COW` (bit 9 AVL)** (`mm/vmm.h`): marca de página compartida
+  read-only por fork. En fork, `vmm_share_user_space()` deja padre e
+  hijo con PTEs RO+COW apuntando a los mismos frames.
+- **Refcounts COW en el PMM** (`mm/pmm.c`): array de 196608 entradas
+  (384 KiB BSS, zeroing explícito — ver abajo) con
+  `pmm_cow_share/refs/unshare`. Un frame solo vuelve al PMM cuando su
+  última referencia muere.
+- **`cow_fault_resolve()`** (`mm/vmm.c`): el page-fault handler resuelve
+  escrituras a páginas COW — refcount>1: frame nuevo + copia; refcount 1:
+  reclamación gratuita del último dueño vivo. `invlpg` + reintento
+  transparente de la instrucción que faultó.
+- **`CR0.WP=1`** (crítico para que COW sea CORRECTO): antes el bit WP
+  estaba a 0, así que el kernel en ring 0 escribía páginas read-only
+  sin faultar — cualquier syscall que escribe un buffer de usuario
+  (`getline`, `file_read`, pipes, structs de info, ...) habría corrompido
+  silenciosamente las páginas compartidas por fork. Con WP=1 esas
+  escrituras faultan y se resuelven como COW.
+- Liberación consciente de COW en `vmm_free_address_space()` y
+  `vmm_reset_user_region()` (`vm_release_user_frame`): salir/execve solo
+  suelta la referencia; el último dueño libera el frame.
+- **Zeroing explícito del BSS del array COW y del jump stack**
+  (`pmm_init`, `syscall_install`): Trinux no inicializa BSS en boot.asm
+  (en QEMU funciona de casualidad porque la RAM arranca a cero; en
+  hardware real no está garantizado). Queda documentado en AUDITORIA.md
+  como deuda P3: zeroizar BSS en el boot.
+
+#### Cambiado
+- fork() ya no asigna frames para el contenido del padre (solo el PD +
+  32 page tables del hijo): es ~instantáneo y O(páginas modificadas)
+  en memoria en lugar de O(memoria total del padre).
+- Fallos de fork a mitad de camino se auto-curan: las páginas RO+COW
+  huérfanas se reclaman con refcount 1 en su primera escritura.
+
 ## [0.6.0] - 2026-07-30
 
 ### 🏛️ Address spaces REALES por proceso + fork() real (P0 de la auditoría)

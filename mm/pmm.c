@@ -11,6 +11,14 @@
 #define MAX_MAPPED_FRAMES  (0x40000000u / PMM_FRAME_SIZE)   /* 1 GiB */
 
 static uint32_t frame_bitmap[BITMAP_WORDS];
+/* ---- Copy-on-Write refcounts (v0.6.1) ----
+ * Array paralelo al bitmap: frames posibles en [0x10000000, 0x40000000).
+ * uint16_t por si aparecen cadenas de fork largas (nietos, bisnietos).
+ * 196608 entradas * 2 bytes = 384 KiB de BSS (estático, cero al boot). */
+#define COW_MAX_FRAMES  ((0x40000000u - PMM_COW_BASE) / PMM_FRAME_SIZE)
+
+static uint16_t cow_refcount[COW_MAX_FRAMES];
+
 static uint32_t total_frames;
 static uint32_t used_frames;
 
@@ -60,6 +68,12 @@ void pmm_init(uint32_t total_memory_bytes)
      * (USER_SPACE_END = 0x10000000). En máquinas con <= 256 MiB
      * pmm_alloc_frame devuelve 0 y los callers degradan con gracia. */
     pmm_reserve_region(0x00000000, 256 * 1024 * 1024);
+
+    /* v0.6.1: el array de refcounts COW es BSS — y Trinux NO zeroiza BSS
+     * en boot.asm (funciona de casualidad en QEMU, que arranca la RAM a
+     * cero). Inicializarlo explícitamente aquí: es la base de TODA la
+     * contabilidad Copy-on-Write. */
+    memset(cow_refcount, 0, sizeof(cow_refcount));
 }
 
 void pmm_reserve_region(uint32_t addr, uint32_t len)
@@ -101,4 +115,35 @@ uint32_t pmm_get_used_memory(void)  { return used_frames * PMM_FRAME_SIZE; }
 uint32_t pmm_get_free_memory(void)
 {
     return (total_frames - used_frames) * PMM_FRAME_SIZE;
+}
+
+static bool cow_trackable(uint32_t phys)
+{
+    return phys >= PMM_COW_BASE && phys < 0x40000000u;
+}
+
+uint32_t pmm_cow_share(uint32_t phys)
+{
+    if (!cow_trackable(phys)) return 0;
+    uint32_t idx = (phys - PMM_COW_BASE) / PMM_FRAME_SIZE;
+    if (cow_refcount[idx] == 0)
+        cow_refcount[idx] = 2;   /* pasa de privado a compartido (1+1) */
+    else if (cow_refcount[idx] < 0xFFFF)
+        cow_refcount[idx]++;
+    return cow_refcount[idx];
+}
+
+uint32_t pmm_cow_refs(uint32_t phys)
+{
+    if (!cow_trackable(phys)) return 0;
+    return cow_refcount[(phys - PMM_COW_BASE) / PMM_FRAME_SIZE];
+}
+
+uint32_t pmm_cow_unshare(uint32_t phys)
+{
+    if (!cow_trackable(phys)) return 0;
+    uint32_t idx = (phys - PMM_COW_BASE) / PMM_FRAME_SIZE;
+    if (cow_refcount[idx] > 0)
+        cow_refcount[idx]--;
+    return cow_refcount[idx];
 }
