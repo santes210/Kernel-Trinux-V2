@@ -8,18 +8,43 @@ extern void *kmalloc(size_t size);
 
 void *memcpy(void *dest, const void *src, size_t n)
 {
+    /* Ruta rápida con `rep movsl`: copia de a 4 bytes por iteración en vez
+     * de byte a byte. En los buffers grandes del kernel (copia de páginas de
+     * 4 KiB en fork, frames de red, E/S de disco) esto reduce ~4x el número
+     * de iteraciones; x86 acepta direcciones sin alinear. El resto (<4 bytes)
+     * se copia byte a byte. memcpy() nunca solapa (ver memmove()). */
     uint8_t *d = (uint8_t *)dest;
     const uint8_t *s = (const uint8_t *)src;
-    for (size_t i = 0; i < n; i++)
-        d[i] = s[i];
+    size_t words = n >> 2;
+    if (words) {
+        __asm__ volatile("rep movsl"
+                         : "+D"(d), "+S"(s), "+c"(words)
+                         :
+                         : "memory");
+    }
+    size_t rem = n & 3;
+    while (rem--)
+        *d++ = *s++;
     return dest;
 }
 
 void *memset(void *dest, int c, size_t n)
 {
+    /* `rep stosl` con el byte replicado en los 4 bytes del registro. */
     uint8_t *d = (uint8_t *)dest;
-    for (size_t i = 0; i < n; i++)
-        d[i] = (uint8_t)c;
+    size_t words = n >> 2;
+    if (words) {
+        uint32_t pattern = (uint32_t)(uint8_t)c;
+        pattern |= pattern << 8;
+        pattern |= pattern << 16;
+        __asm__ volatile("rep stosl"
+                         : "+D"(d), "+c"(words)
+                         : "a"(pattern)
+                         : "memory");
+    }
+    size_t rem = n & 3;
+    while (rem--)
+        *d++ = (uint8_t)c;
     return dest;
 }
 

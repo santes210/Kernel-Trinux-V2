@@ -1,4 +1,5 @@
 #include "process.h"
+#include "scheduler.h"         /* schedule() en process_waitpid() */
 #include "../lib/string.h"
 #include "../lib/printf.h"
 #include "../mm/kheap.h"
@@ -13,7 +14,10 @@ process_t *current;
 
 /* `nice <prio> <cmd>` stashes a value here; the next process_create()
  * picks it up and resets it back to "none" (INT32_MIN). */
-#define NICE_NONE  (-0x80000000)
+/* (-2^31) escrito como resta de constantes signed para que el tipo sea
+ * `int`: escribir -0x80000000 directamente hace que el literal sea unsigned
+ * y dispara -Wsign-compare contra next_priority_hint (int). */
+#define NICE_NONE  (-2147483647 - 1)
 static int        next_priority_hint = NICE_NONE;
 
 void process_set_next_priority(int prio)
@@ -23,16 +27,9 @@ void process_set_next_priority(int prio)
     next_priority_hint = prio;
 }
 
-/* The idle task — runs when literally no one else is READY.  Body is just
- * `sti; hlt` in an infinite loop: the CPU goes to sleep until the next
- * interrupt (timer tick, keyboard, serial...).  This is what actually
- * STOPS the CPU from spinning and heating up when the system is idle. */
-static void idle_task_entry(void)
-{
-    for (;;) {
-        __asm__ volatile("sti; hlt");
-    }
-}
+/* Nota: el idle task real (cuerpo `sti; hlt` en bucle) no existe como tarea
+ * enlazada: ver el comentario largo en process_init() sobre por qué el slot
+ * `idle` es un placeholder usado solo para contabilidad de CPU. */
 
 static const char *state_name(proc_state_t s)
 {

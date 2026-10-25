@@ -22,6 +22,7 @@
 #include "../fs/vfs.h"
 #include "../mm/kheap.h"
 #include "../mm/vmm.h"
+#include "../boot/gdt.h"
 #include "../cpu/syscall.h"
 #include "../process/process.h"
 #include "../lib/string.h"
@@ -62,8 +63,6 @@
  * Alternativa mas simple y correcta: GUARDAR Y RESTAURAR la region
  * 0x08048000..0x08100000 (768 KB) alrededor del spawn anidado.
  * Eso es lo que hacemos abajo, con un kmalloc temporal. */
-static uint8_t *g_padre_backup;
-static uint32_t g_padre_backup_size;
 #define PADRE_SAVE_BASE  0x08048000
 #define PADRE_SAVE_SIZE  0x000B8000   /* 736 KB -- cubre code+data+bss del shell */
 
@@ -356,7 +355,6 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
                   entry, user_esp);
 
     /* ---- Drop to ring 3 using save/restore mechanism ---- */
-    extern void tss_set_kernel_stack(uint32_t esp0);
     extern int  usermode_save_and_enter(uint32_t entry, uint32_t user_stack,
                                         uint32_t *save_esp);
     extern void elf_arm_exit_jmp(void);

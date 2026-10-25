@@ -30,7 +30,7 @@
  * 0x05000000 = 80 MiB = 20480 pages = 20 page tables (0-19).
  * We use a generous boundary to ensure all kernel structures are protected. */
 #define KERNEL_END_VIRT  0x05000000U    /* 80 MiB */
-#define KERNEL_END_TABLE (KERNEL_END_VIRT >> 22)  /* 20 = page table index */
+#define KERNEL_END_TABLE ((int)(KERNEL_END_VIRT >> 22))  /* 20 = page table index */
 
 /* Extra page tables for on-demand MMIO mappings (AHCI ABAR, etc.).
  * These cover addresses above the 1 GiB identity-mapped region.

@@ -236,8 +236,10 @@ void fb_set_color(uint8_t color) { cur_color = color; }
 
 void fb_set_cursor(int col, int row)
 {
-    if (col < 0) col = 0; if (col >= cols) col = cols - 1;
-    if (row < 0) row = 0; if (row >= rows) row = rows - 1;
+    if (col < 0) col = 0;
+    if (col >= cols) col = cols - 1;
+    if (row < 0) row = 0;
+    if (row >= rows) row = rows - 1;
     cur_col = col;
     cur_row = row;
 }

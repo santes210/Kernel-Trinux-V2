@@ -25,11 +25,10 @@
 #include "../mm/fork.h"
 #include "../mm/vmm.h"
 
+#include "../boot/gdt.h"
+
 extern void syscall_stub(void);
 extern void enter_usermode(uint32_t entry, uint32_t user_stack);
-extern void tss_set_kernel_stack(uint32_t esp0);
-
-static bool g_in_usermode;        /* unused now but kept for sig */
 
 /* ---- ELF exit jump buffer ----
  * (Misma maquinaria que antes; ver elf_jmp.asm para el setjmp/longjmp.) */
@@ -160,6 +159,10 @@ void fd_cleanup_process(uint32_t pid)
 
 /* ---------------- handler ---------------- */
 
+/* Número de syscall más alto válido. Debe coincidir con SYS_EXECVE (73) en
+ * user/trinux.h; si se añaden syscalls, actualizar AMBOS sitios. */
+#define SYS_MAX  73
+
 void syscall_handler(registers_t *regs)
 {
     uint32_t num = regs->eax;
@@ -167,8 +170,14 @@ void syscall_handler(registers_t *regs)
     uint32_t a2  = regs->ecx;
     uint32_t a3  = regs->edx;
 
-    /* CRITICAL: Validate syscall number to prevent out-of-bounds dispatch */
-    if (num > 73) {  /* SYS_EXECVE=73 is now the highest valid syscall */
+    /* CRITICAL: Validate syscall number to prevent out-of-bounds dispatch.
+     *
+     * Nota de rendimiento: el switch denso 0..SYS_MAX de abajo lo compila
+     * GCC -O2 como una TABLA DE SALTOS indexada (jmp *table(,%eax,4)), es
+     * decir dispatch O(1) — verificado en el ensamblador generado—, por lo
+     * que no necesita reemplazarse manualmente por una tabla de punteros a
+     * función (que añadiría riesgo sin aportar velocidad). */
+    if (num > SYS_MAX) {
         kprintf("[syscall] WARNING: invalid syscall number %u from pid %d\n",
                 num, process_get_current() ? process_get_current()->pid : 0);
         regs->eax = (uint32_t)-1;

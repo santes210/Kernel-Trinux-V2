@@ -6,7 +6,10 @@
 
 #define USER_NAME_MAX  32
 #define USER_HOME_MAX  64
-#define USER_PASS_MAX  32
+/* Alberga el registro de credencial completo:
+ *   "$" + sal(16 hex) + "$" + hash SHA-256(64 hex) + NUL = 83 bytes.
+ * 96 deja margen. El valor antiguo (32) truncaba los hashes de 64 chars. */
+#define USER_PASS_MAX  96
 #define MAX_USERS      32
 
 /* A single account, mirrored from /etc/passwd (+ /etc/shadow password). */
@@ -17,7 +20,7 @@ typedef struct {
     char     home[USER_HOME_MAX];
     char     shell[USER_HOME_MAX];
     char     gecos[USER_NAME_MAX];   /* description / full name */
-    char     password[USER_PASS_MAX]; /* plaintext (educational kernel) */
+    char     password[USER_PASS_MAX]; /* registro "$sal$hash" (ver users.c) */
 } user_t;
 
 /* Initialise the user database: ensure /etc/passwd & /etc/shadow exist with
