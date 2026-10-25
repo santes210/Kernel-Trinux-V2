@@ -1,5 +1,5 @@
 /* kernel/longmode_detect.c — CAMBIO #11: detección de Long Mode via CPUID.
- * Separado aquí para no contaminar el wildcard de cpu/*.c con un stub. */
+ * Separado aquí para no contaminar el wildcard del directorio cpu/ con un stub. */
 #include "../lib/types.h"
 
 int longmode_check(void)

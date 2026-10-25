@@ -93,7 +93,10 @@ static uint8_t  reset_reg_value;
 
 /* ---- Helpers ---- */
 
-static uint8_t acpi_checksum(const void *p, uint32_t len)
+/* Validación de checksum ACPI (suma módulo 256 == 0). Se usará al validar
+ * tablas ACPI adicionales; retenida aunque aún no tenga llamadores. */
+static uint8_t __attribute__((unused))
+acpi_checksum(const void *p, uint32_t len)
 {
     uint8_t sum = 0;
     const uint8_t *b = (const uint8_t *)p;
@@ -166,7 +169,10 @@ bool acpi_power_init(void)
 
     /* Buscar RSDP en EBDA y en 0xE0000-0xFFFFF */
     uint8_t *rsdp_ptr = NULL;
-    uint16_t ebda_seg = *(volatile uint16_t *)0x40E;
+    /* Acceso al BDA (word en 0x40E) vía asm para no violar -Warray-bounds:
+     * GCC no puede saber que la dirección física 0x40E es memoria válida. */
+    uint16_t ebda_seg;
+    __asm__ volatile("movw (%1), %0" : "=r"(ebda_seg) : "r"((uint32_t)0x40E));
     if (ebda_seg) {
         uint32_t ebda = (uint32_t)ebda_seg << 4;
         if (ebda >= 0x80000 && ebda < 0xA0000) {

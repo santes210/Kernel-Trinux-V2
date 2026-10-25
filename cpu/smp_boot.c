@@ -123,63 +123,69 @@ extern void smp_ap_entry(void);
 #define TRAMP_PARAM_STACK  0xFA   /* 4 bytes */
 #define TRAMP_PARAM_CR3    0xFE   /* 4 bytes — nota: 0x100 = 256 bytes total */
 
-/* Trampoline en real mode (16 bits). Los offsets asumen base 0x8000. */
+/* Trampoline en real mode (16 bits). Los offsets asumen base 0x8000.
+ *
+ * Se usan inicializadores designados de C99/GNU para FIJAR la posición de
+ * cada byte: las instrucciones ocupan 0x00..0x37 y la región de parámetros
+ * vive exactamente en 0xF0..0xFF (rellenada en runtime por smp_boot_aps).
+ * Las posiciones no listadas (0x38..0xEF) se inicializan a cero. Esto
+ * reemplaza la versión anterior con relleno manual, que declaraba 309 bytes
+ * en un array de 256 y perdía silenciosamente los 53 últimos (los propios
+ * parámetros del trampoline). */
 static const uint8_t trampoline_code[256] = {
     /* 0x00: cli */
-    0xFA,
-    /* 0x01: lgdt [0x8000 + TRAMP_PARAM_GDT]
-     * En real mode con CS=0x800, DS=0x800, la dirección es 0x800*16+0xF0=0x80F0.
-     * Usamos lgdt con dirección absoluta: 0x0F 0x01 0x16 lo hi */
-    0x0F, 0x01, 0x16, 0xF0, 0x80,   /* lgdt [0x80F0] — dirección de la GDT en mem baja */
-    /* 0x07: mov eax, cr0 */
-    0x0F, 0x20, 0xC0,
-    /* 0x0A: or al, 1  (set PE) */
-    0x0C, 0x01,
-    /* 0x0C: mov cr0, eax */
-    0x0F, 0x22, 0xC0,
-    /* 0x0F: jmp far 0x08:0x00008016 (salto a 32 bits, dirección fija 0x8016) */
-    0xEA,
-    0x16, 0x80, 0x00, 0x00,   /* offset 0x8016 little-endian */
-    0x08, 0x00,               /* segment 0x08 (kernel code) */
-    /* 0x16: código de 32 bits — el AP está ahora en protected mode */
-    /* A partir de aquí los bytes son i386 (32-bit) */
-    /* mov ax, 0x10; mov ds,ax; mov es,ax; mov ss,ax; mov fs,ax; mov gs,ax */
-    0x66, 0xB8, 0x10, 0x00,   /* mov ax, 0x10 */
-    0x8E, 0xD8,               /* mov ds, ax */
-    0x8E, 0xC0,               /* mov es, ax */
-    0x8E, 0xD0,               /* mov ss, ax */
-    0x8E, 0xE0,               /* mov fs, ax */
-    0x8E, 0xE8,               /* mov gs, ax */
-    /* Cargar stack: mov esp, [0x80FA] */
-    0x8B, 0x25, 0xFA, 0x80, 0x00, 0x00,   /* mov esp, [0x80FA] */
-    /* Cargar CR3: mov eax,[0x80FE]; mov cr3,eax */
-    0xA1, 0xFE, 0x80, 0x00, 0x00,         /* mov eax, [0x80FE] */
-    0x0F, 0x22, 0xD8,                      /* mov cr3, eax */
-    /* Habilitar paginación (CR0.PG ya estaba en la GDT del BSP): no-op aquí */
-    /* Saltar a la función ap_main del kernel: jmp [0x80F6] */
-    0xFF, 0x25, 0xF6, 0x80, 0x00, 0x00,   /* jmp dword [0x80F6] */
-    /* Relleno hasta 0xF0 */
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    /* 0xF0: GDT ptr (6 bytes) — se rellena en smp_boot_aps() */
-    0, 0, 0, 0, 0, 0,
-    /* 0xF6: ap_entry (4 bytes) */
-    0, 0, 0, 0,
-    /* 0xFA: stack top (4 bytes) */
-    0, 0, 0, 0,
-    /* 0xFE: cr3 (4 bytes) */
-    0, 0, 0, 0
+    [0x00] = 0xFA,
+    /* 0x01: lgdt [0x80F0] — en real mode CS=0x800 → 0x800*16+0xF0.
+     * Carga el descriptor de GDT que smp_boot_aps() escribe en 0x80F0. */
+    [0x01] = 0x0F, [0x02] = 0x01, [0x03] = 0x16,
+    [0x04] = 0xF0, [0x05] = 0x80,
+    /* 0x06: mov eax, cr0 */
+    [0x06] = 0x0F, [0x07] = 0x20, [0x08] = 0xC0,
+    /* 0x09: or al, 1  (set PE, activa protected mode) */
+    [0x09] = 0x0C, [0x0A] = 0x01,
+    /* 0x0B: mov cr0, eax */
+    [0x0B] = 0x0F, [0x0C] = 0x22, [0x0D] = 0xC0,
+    /* 0x0E: jmp far 0x08:0x00008016 (vacía el pipeline, entra en 32 bits) */
+    [0x0E] = 0xEA,
+    [0x0F] = 0x16, [0x10] = 0x80, [0x11] = 0x00, [0x12] = 0x00,
+    [0x13] = 0x08, [0x14] = 0x00,               /* segment 0x08 (kernel code) */
+    /* 0x15: NOP de alineación. El jmp far de arriba salta a 0x8016, así que
+     * el código de 32 bits DEBE empezar en el offset 0x16. (El layout previo
+     * tenía un desfase de un byte: el 0x66 caía en 0x15 y el salto aterrizaba
+     * en mitad de la instrucción.) */
+    [0x15] = 0x90,
+    /* 0x16..: código de 32 bits — el AP está ahora en protected mode.
+     * mov ax, 0x10; mov ds,ax; mov es,ax; mov ss,ax; mov fs,ax; mov gs,ax */
+    [0x16] = 0x66, [0x17] = 0xB8, [0x18] = 0x10, [0x19] = 0x00,  /* mov ax, 0x10 */
+    [0x1A] = 0x8E, [0x1B] = 0xD8,               /* mov ds, ax */
+    [0x1C] = 0x8E, [0x1D] = 0xC0,               /* mov es, ax */
+    [0x1E] = 0x8E, [0x1F] = 0xD0,               /* mov ss, ax */
+    [0x20] = 0x8E, [0x21] = 0xE0,               /* mov fs, ax */
+    [0x22] = 0x8E, [0x23] = 0xE8,               /* mov gs, ax */
+    /* 0x24: mov esp, [0x80FA] — stack top del AP */
+    [0x24] = 0x8B, [0x25] = 0x25,
+    [0x26] = 0xFA, [0x27] = 0x80, [0x28] = 0x00, [0x29] = 0x00,
+    /* 0x2A: mov eax, [0x80FE] — CR3 del BSP */
+    [0x2A] = 0xA1, [0x2B] = 0xFE, [0x2C] = 0x80, [0x2D] = 0x00, [0x2E] = 0x00,
+    /* 0x2F: mov cr3, eax */
+    [0x2F] = 0x0F, [0x30] = 0x22, [0x31] = 0xD8,
+    /* 0x32: jmp dword [0x80F6] — salta al entry point C (ap_main) */
+    [0x32] = 0xFF, [0x33] = 0x25,
+    [0x34] = 0xF6, [0x35] = 0x80, [0x36] = 0x00, [0x37] = 0x00,
+
+    /* Región de parámetros (0xF0..0xFF), se rellena en smp_boot_aps():
+     *   0xF0: GDT ptr (6 bytes)   0xF6: ap_entry (4)
+     *   0xFA: stack top (4)       0xFE: cr3 (4)
+     * El designador de rango garantiza que el array mide 256 bytes y que
+     * estos offsets nunca se desplazan si cambian las instrucciones. */
+    [0xF0 ... 0xFF] = 0
 };
+
+/* El trampoline se copia entero a dirección física 0x8000 y los parámetros
+ * se escriben en offsets fijos (0xF0..0xFF); cualquier cambio de tamaño los
+ * invalidaría. Lo verificamos en compilación. */
+_Static_assert(sizeof(trampoline_code) == 256,
+               "SMP AP trampoline must be exactly 256 bytes");
 
 /* Entry point C para los APs — llamado desde el trampoline. */
 void ap_main(uint32_t ap_id)

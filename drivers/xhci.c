@@ -103,7 +103,10 @@ static uint32_t rd32(volatile uint8_t *base, uint32_t off)
 { return *(volatile uint32_t *)(base + off); }
 static void wr32(volatile uint8_t *base, uint32_t off, uint32_t val)
 { *(volatile uint32_t *)(base + off) = val; }
-static uint64_t rd64(volatile uint8_t *base, uint32_t off)
+/* Lectura MMIO de 64 bits: necesaria para registros de 64 bits del xHCI
+ * cuando se active el soporte completo de 64 bits; aún sin uso en i686. */
+static uint64_t __attribute__((unused))
+rd64(volatile uint8_t *base, uint32_t off)
 { return (uint64_t)rd32(base, off) | ((uint64_t)rd32(base, off + 4) << 32); }
 static void wr64(volatile uint8_t *base, uint32_t off, uint64_t val)
 { wr32(base, off, (uint32_t)val); wr32(base, off + 4, (uint32_t)(val >> 32)); }
@@ -720,7 +723,6 @@ bool xhci_init(void)
     /* Slot Context (at offset ctx_size in input context) */
     uint32_t *slot_ctx = (uint32_t *)(input_ctx + ctx_size);
     uint32_t route_string = 0;
-    uint32_t mep = speed >= 4 ? 1 : 0;  /* multi-endpoint */
     slot_ctx[0] = (1 << 27) |            /* context entries = 1 (just EP0) */
                   (speed << 20) |         /* speed */
                   route_string;

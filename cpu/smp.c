@@ -161,11 +161,24 @@ static rsdp_t *find_rsdp_in(uint32_t start, uint32_t end)
     return 0;
 }
 
+/* Lee una word de 16 bits de una dirección física absoluta de la zona baja
+ * (BIOS Data Area etc.) sin que GCC interprete el entero como un array de
+ * longitud cero y dispare -Warray-bounds. La dirección se pasa por registro,
+ * así el compilador no hace análisis de bounds sobre el acceso. */
+static uint16_t bda_read16(uint32_t phys_addr)
+{
+    uint16_t value;
+    __asm__ volatile("movw (%1), %0"
+                     : "=r"(value)
+                     : "r"(phys_addr));
+    return value;
+}
+
 static rsdp_t *find_rsdp(void)
 {
     /* Locación 1: EBDA (Extended BIOS Data Area). El puntero al EBDA está
      * en 0x40E (word) — la dirección está en unidades de 16 bytes. */
-    uint16_t ebda_seg = *(volatile uint16_t *)0x40E;
+    uint16_t ebda_seg = bda_read16(0x40E);
     if (ebda_seg) {
         uint32_t ebda = (uint32_t)ebda_seg << 4;
         if (ebda >= 0x80000 && ebda < 0xA0000) {

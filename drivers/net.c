@@ -36,7 +36,9 @@ static uint16_t ping_seq = 0;   /* sequence number de los pings */
 
 /* ---- Helpers de endian (el protocolo IP es big-endian) ---- */
 static uint16_t htons(uint16_t v) { return (uint16_t)((v>>8)|(v<<8)); }
-static uint32_t htonl(uint32_t v) {
+/* Retenido para el futuro stack TCP/UDP (campos de 32 bits); aún sin uso. */
+static uint32_t __attribute__((unused))
+htonl(uint32_t v) {
     return ((v>>24)&0xFF)|((v>>8)&0xFF00)|((v<<8)&0xFF0000)|((v<<24)&0xFF000000u);
 }
 #define ntohs htons
@@ -325,11 +327,17 @@ int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
         return -1;
     }
 
-    /* Construir y enviar Echo Request */
+    /* Construir y enviar Echo Request.
+     * El frame completo mide 14 (Ethernet) + 20 (IPv4) + 8 (cabecera ICMP)
+     * + 32 (payload) = 74 bytes. El buffer anterior era de 64 bytes y el
+     * campo icmp->data[32] escribía 10 bytes FUERA del array, corrompiendo
+     * la pila del kernel (-Warray-bounds lo detectaba). 128 deja margen y
+     * mantiene alineación simple; rtl8139_send() sigue emitiendo 60 bytes
+     * (mínimo Ethernet) con el relleno que la propia NIC/hardware espera. */
     ping_seq++;
     ping_reply_got = false;
 
-    uint8_t frame[64];
+    uint8_t frame[128];
     eth_t  *eth  = (eth_t  *)frame;
     ipv4_t *ip   = (ipv4_t *)(frame + 14);
     icmp_t *icmp = (icmp_t *)(frame + 34);
