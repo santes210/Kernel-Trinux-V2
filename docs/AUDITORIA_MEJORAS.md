@@ -155,6 +155,11 @@ asíncronas, cola y caché, en vez de que cada FS hable directo con el hardware.
   (el kernel ya escribe `[boot] kernel_main entered`), (c) análisis estático
   (`cppcheck`/`scan-build`), (d) test de regresión de comandos de la shell.
 - Sin tests unitarios en el árbol; toda la validación es manual con QEMU.
+- **Hallazgo v0.5.3**: `build.yml` estaba roto en master —el heredoc de
+  `grub.cfg` sin indentar invalidaba el YAML y todos los runs fallaban en 0 s
+  sin crear jobs— además de incluir el paquete inexistente `truncate`. El fix
+  existe localmente pero el token de CI no tiene permiso `workflows` para
+  subirlo; debe aplicarlo un mantenedor. `ci.yml` sí funciona y valida el PR.
 
 ---
 
