@@ -23,9 +23,13 @@ ASM := nasm
 QEMU := qemu-system-i386
 
 # ---- Flags ----
-CFLAGS  := $(ARCHFLAGS) -std=gnu11 -ffreestanding -O2 -Wall -Wextra \
+# -MMD -MP: genera archivos .d con las dependencias de headers, así editar un
+# .h reconstruye automáticamente los .o que lo incluyen (antes se podían
+# enlazar objetos obsoletos). -Werror: el kernel debe compilar sin warnings;
+# si aparece uno nuevo, el build (y la CI) fallan en vez de ocultarlo.
+CFLAGS  := $(ARCHFLAGS) -std=gnu11 -ffreestanding -O2 -Wall -Wextra -Werror \
            -nostdlib -fno-builtin -fno-stack-protector -fno-pic \
-           -fno-asynchronous-unwind-tables -Iinclude -Ilib
+           -fno-asynchronous-unwind-tables -Iinclude -Ilib -MMD -MP
 ASFLAGS := -f elf32
 LDFLAGS := $(LDARCH) -T linker.ld -nostdlib
 
@@ -44,9 +48,13 @@ ASM_SOURCES := boot/boot.asm boot/kernel_entry.asm boot/gdt_flush.asm \
 # ASM_SOURCES += boot/longmode.asm
 
 OBJS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.asm=.o)
+DEPS := $(OBJS:.o=.d)
 
 KERNEL := mykernel.bin
 ISO    := mykernel.iso
+
+# Dependencias de headers generadas por -MMD en la compilación anterior.
+-include $(DEPS)
 
 # ---- Default ----
 all: $(KERNEL)
@@ -97,7 +105,7 @@ run-iso: iso $(DISK)
 
 # ---- Cleanup ----
 clean:
-	rm -f $(OBJS) $(KERNEL) $(ISO)
+	rm -f $(OBJS) $(DEPS) $(KERNEL) $(ISO)
 	rm -rf iso
 
 .PHONY: all run run-curses run-iso iso clean

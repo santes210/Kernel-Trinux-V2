@@ -8,6 +8,9 @@
 *.iso
 *.img
 
+# Dependencias de headers generadas por -MMD
+*.d
+
 # Excepciones: los .o de ASM precompilados están en el repo
 # para compilar sin nasm en entornos de desarrollo local.
 # En CI se usa nasm directamente para compilar todo limpio.

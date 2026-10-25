@@ -5,6 +5,55 @@ Todos los cambios notables de Trinux se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [0.5.3] - 2026-10-25 — Fase 0: correcciones, rendimiento y endurecimiento
+
+### 🐛 Correcciones críticas
+- **`net_ping`: corregido desbordamiento de pila** (`drivers/net.c`): el
+  frame ICMP completo (14+20+8+32 = 74 bytes) se construía sobre un buffer de
+  64 bytes, escribiendo 10 bytes fuera del array. Ahora usa 128 bytes.
+- **Trampoline SMP reconstruido con inicializadores designados**
+  (`cpu/smp_boot.c`): el array declarado de 256 bytes tenía 309 elementos y
+  GCC descartaba en silencio los 53 últimos (los propios parámetros GDT/CR3/
+  stack). Además se corrige un desfase de un byte entre el `jmp far` a
+  `0x8016` y el inicio real del código 32-bit (NOP de alineación). Añadido
+  `_Static_assert` de tamaño.
+- **Auth: el campo `password` (32 bytes) truncaba los hashes SHA-256 de 64
+  hex.** Ampliado `USER_PASS_MAX` a 96.
+
+### 🔐 Seguridad de contraseñas
+- Formato nuevo en `/etc/shadow`: `$<sal_hex16>$<sha256_hex64>` con sal
+  aleatoria de 8 bytes por contraseña (vía `/dev/random` con respaldo
+  xorshift sembrado por el PIT) y **4096 iteraciones SHA-256 estilo PBKDF2**
+  (key stretching). Comparación en tiempo constante.
+- Migración automática: los registros legacy (SHA-256 sin sal o texto plano)
+  se siguen aceptando y se re-escriben al formato salado en el primer login
+  exitoso. Dos contraseñas iguales ya no producen el mismo hash.
+- `users_save()` usa buffers en heap (8 KiB/4 KiB): los 2 KiB de pila se
+  desbordaban con 32 usuarios y el formato nuevo.
+
+### ⚡ Rendimiento
+- `memcpy`/`memset` (`lib/string.c`) ahora usan `rep movsl`/`rep stosl`
+  (copias de 4 bytes) en lugar de byte a byte; ruta caliente de fork, red y
+  E/S de disco.
+- PMM (`mm/pmm.c`): cursor de asignación con scan amortiguado O(1) en vez
+  de reescanear desde el frame 0 en cada `pmm_alloc_frame()`.
+- Documentado que el dispatch de syscalls ya es O(1): GCC convierte el
+  switch denso 0..73 en jump table; se elimina el número mágico (`SYS_MAX`).
+
+### 🛠️ Ingeniería y calidad
+- **Cero warnings con `-Werror`** (antes 41): corregidos -Warray-bounds
+  (lecturas del BDA 0x40E vía asm), declaraciones implícitas
+  (`tss_set_kernel_stack` ahora en `boot/gdt.h`; `schedule()` vía
+  `scheduler.h`), sign-compare, indentación engañosa, variables/funciones
+  sin uso y el `/*` dentro de comentario.
+- Makefile: `-MMD -MP` para dependencias de headers (cambiar un `.h` ya no
+  enlaza objetos obsoletos) y `make clean` borra los `.d`.
+- Eliminados del repositorio: 34 `.o` versionados, `trinux.iso` (21 MiB),
+  `fs/fat.c` + `fs/fat.h` + `fs/fat.c.orig` (driver FAT de solo lectura sin
+  usar; el real es `fat16.c`) y los blobs ELF muertos `snake_elf.h`,
+  `vgademo_elf.h`, `hello_elf.h`.
+- `KERNEL_VERSION` sincronizado con el CHANGELOG (0.2.0 → 0.5.2).
+
 ## [0.5.2] - 2026-07-29
 
 ### 🚀 `SYS_EXECVE` real (execve() de verdad)
