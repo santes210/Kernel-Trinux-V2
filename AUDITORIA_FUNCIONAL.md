@@ -637,3 +637,40 @@ de gestión de memoria, y eso no lo ve un analizador.
 
 Automatizado como `make analyze` y como paso "Análisis estático
 (-fanalyzer)" en `.github/workflows/audit.yml`.
+
+## 9. Ronda 3c — límites `uint32 -> int` en la entrada de usuario
+
+Patrón repetido que encontré al revisar el camino de teclado: el kernel
+recibe tamaños como `uint32_t` y los castea a `int` para llamar a funciones
+del driver que esperan `int`. Si el valor tiene el bit 31 puesto, el cast
+produce un **número negativo**, y la función del driver no está preparada
+para eso (`len < max_len - 1` con `max_len` negativo es siempre falso, así
+que el guardia no protege nada, pero la escritura del terminador sí ocurre).
+
+### 9.1 `SYS_GETLINE` (`getline(buf, 0x80000000)`)
+
+```c
+if (max == 0) { ... }              // 0x80000000 pasa
+if (!uaccess_ok(buf, max)) ...     // “válido” si el rango cae en user space
+keyboard_readline(buf, (int)max);  // ← int negativo
+```
+
+`uaccess_ok(buf, 0x80000000)` también sale mal por el mismo motivo, pero el
+efecto visible es el `buffer[-1]` del terminador. Se acota `max` a 4096
+(una línea de shell) **antes** del cast.
+
+### 9.2 `read(0, buf, len)` en `SYS_FILE_READ`
+
+Idéntico: `int len = (int)a3;` y luego `uaccess_ok(b, (uint32_t)len)` con
+`len` negativo otra vez. Mismo acotado a 4096.
+
+### 9.3 `keyboard_readline()` no se defendía sola
+
+Aunque los dos llamantes ya acotan, el driver también se protege ahora:
+`if (!buffer || max_len <= 0) return 0;`. Antes con `max_len == 0` escribía
+`buffer[-1]` al pulsar Enter, y con `buffer == NULL` escribía en la
+dirección 0.
+
+`vga_set_cursor()` (usado por `SYS_SET_CURSOR` con coordenadas del usuario)
+**sí** acotaba ya los dos ejes a `[0, VGA_WIDTH/HEIGHT)`, así que ahí no había
+nada que arreglar.

@@ -298,6 +298,13 @@ int keyboard_try_getchar(void) {
 
 int keyboard_readline(char *buffer, int max_len)
 {
+    /* Con max_len <= 0 el `len < max_len - 1` de abajo quedaba en
+     * `0 < -1` (falso) pero el `buffer[len] = '\0'` del Enter se ejecutaba
+     * igual: buffer[-1] en el caso max_len == 0. Y con buffer == NULL,
+     * escritura en la dirección 0. */
+    if (!buffer || max_len <= 0)
+        return 0;
+
     int len = 0;
     for (;;) {
         int key = keyboard_getchar();

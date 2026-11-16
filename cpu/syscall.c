@@ -344,7 +344,13 @@ void syscall_handler(registers_t *regs)
     case SYS_GETLINE: {
         char    *buf = (char *)a1;
         uint32_t max = a2;
+        /* `max` es uint32 y se casteaba a int a ciegas: 0x80000000 pasa el
+         * test `max == 0` y luego llega a keyboard_readline() como un int
+         * NEGATIVO, con lo que `len < max_len - 1` nunca se cumple pero el
+         * terminador sí se escribe -> buffer[-1]. Se acota a un valor
+         * razonable (una línea de shell como máximo) antes del cast. */
         if (max == 0) { regs->eax = 0; break; }
+        if (max > 4096) max = 4096;
         if (!uaccess_ok(buf, max)) { regs->eax = (uint32_t)-14; break; }
         regs->eax = (uint32_t)keyboard_readline(buf, (int)max);
         break;
@@ -687,9 +693,11 @@ void syscall_handler(registers_t *regs)
         fd = pipe_low_fd(fd);          /* ¿stdin redirigido a un pipe? */
         if (fd == 0) {
             char *b = (char *)a2;
-            int len = (int)a3;
-            if (!uaccess_ok(b, (uint32_t)len)) { regs->eax = (uint32_t)-14; break; }
-            regs->eax = (uint32_t)keyboard_readline(b, len);
+            /* Mismo problema que en SYS_GETLINE: uint32 -> int a ciegas. */
+            uint32_t want0 = a3;
+            if (want0 > 4096) want0 = 4096;
+            if (!uaccess_ok(b, want0)) { regs->eax = (uint32_t)-14; break; }
+            regs->eax = (uint32_t)keyboard_readline(b, (int)want0);
             break;
         }
         /* Pipe read: check if fd is a pipe before checking kfds */
