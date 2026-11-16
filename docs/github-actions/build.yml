@@ -135,8 +135,15 @@ jobs:
           # Un SOLO script genera ambas cosas: no pueden divergir. Lo que hizo
           # que la imagen publicada no arrancase fue tener dos caminos distintos
           # (grub-mkrescue a un lado, cp+truncate al otro).
+          #
+          # USB_OUT e ISO_OUT le dicen los nombres EXACTOS desde el principio.
+          # Antes el script escribía mykernel-usb.img y un paso posterior lo
+          # renombraba; si ese paso no llegaba a ejecutarse (porque el `ls` de
+          # este buscaba ya el nombre final), el build moría con
+          # "ls: cannot access trinux-usb-512.img".
           chmod +x make-usb-image.sh
-          ISO_OUT=${{ env.ISO_FILE }} ./make-usb-image.sh ${{ env.USB_SIZE }}
+          USB_OUT=${{ env.USB_IMG }} ISO_OUT=${{ env.ISO_FILE }} \
+            ./make-usb-image.sh ${{ env.USB_SIZE }}
 
           echo "════ Resultado ════"
           ls -lh ${{ env.ISO_FILE }} ${{ env.USB_IMG }}
@@ -155,24 +162,16 @@ jobs:
           grep -qa $'\x02\xb0\xad\x1b' ${{ env.KERNEL_BIN }} \
             || { echo "❌ ${{ env.KERNEL_BIN }} no tiene cabecera Multiboot"; exit 1; }
 
-          echo "✅ BIOS : MBR 0x55AA + grub.cfg + kernel"
-          echo "✅ UEFI : EFI/BOOT/BOOTX64.EFI presente"
-
-      - name: 🔌 Nombre final de la imagen USB + verificación
-        run: |
-          # El script ya generó mykernel-usb.img: solo hay que darle el nombre
-          # que espera el resto del workflow (env.USB_IMG).
-          if [ "mykernel-usb.img" != "${{ env.USB_IMG }}" ]; then
-            mv -f mykernel-usb.img ${{ env.USB_IMG }}
-          fi
-
+          # ---- Verificación de la imagen USB ----
           SIG=$(dd if=${{ env.USB_IMG }} bs=1 skip=510 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
           [ "$SIG" = "55aa" ] || { echo "❌ imagen USB sin firma 0x55AA"; exit 1; }
           grep -qa "BOOTX64" ${{ env.USB_IMG }} \
             || { echo "❌ imagen USB sin BOOTX64.EFI"; exit 1; }
 
           FINAL=$(stat -c%s ${{ env.USB_IMG }})
-          echo "✅ Imagen USB lista: $((FINAL/1024/1024)) MiB (BIOS + UEFI)"
+          echo "✅ BIOS : MBR 0x55AA + grub.cfg + kernel"
+          echo "✅ UEFI : EFI/BOOT/BOOTX64.EFI presente"
+          echo "✅ USB  : $((FINAL/1024/1024)) MiB listos"
 
       - name: 🔐 Checksums SHA-256
         run: |

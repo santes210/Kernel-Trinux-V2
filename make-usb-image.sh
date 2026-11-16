@@ -34,7 +34,11 @@ set -euo pipefail
 
 SIZE_MB="${1:-512}"
 KERNEL="mykernel.bin"
-OUT="mykernel-usb.img"
+# Nombre de la imagen. Se puede fijar con USB_OUT (lo usa el CI para que el
+# fichero se llame trinux-usb-512.img desde el principio). Antes el workflow
+# esperaba ese nombre pero el script escribia mykernel-usb.img y el `ls` del
+# paso siguiente fallaba con "No such file or directory".
+OUT="${USB_OUT:-mykernel-usb.img}"
 ISODIR="iso"
 BUILDDIR=".usb-build"
 
