@@ -31,7 +31,7 @@
  * 0x05000000 = 80 MiB = 20480 pages = 20 page tables (0-19).
  * We use a generous boundary to ensure all kernel structures are protected.
  * ¡Ojo! Debe coincidir con USER_SPACE_START de include/userlayout.h. */
-#define KERNEL_END_VIRT  USER_SPACE_START /* 0x05000000, ver userlayout.h */
+/* KERNEL_END_VIRT viene de vmm.h -> include/userlayout.h (una sola fuente). */
 #define KERNEL_END_TABLE (KERNEL_END_VIRT >> 22)  /* 20 = page table index */
 
 static uint32_t page_directory[TABLES_PER_DIR] __attribute__((aligned(4096)));

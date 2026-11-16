@@ -236,8 +236,14 @@ void fb_set_color(uint8_t color) { cur_color = color; }
 
 void fb_set_cursor(int col, int row)
 {
-    if (col < 0) col = 0; if (col >= cols) col = cols - 1;
-    if (row < 0) row = 0; if (row >= rows) row = rows - 1;
+    /* Dos `if` en la misma línea: el segundo NO está dentro del primero
+     * (era el aviso -Wmisleading-indentation de gcc y un bug esperando a
+     * que alguien añada una llave). Explícito y con guardas por si el
+     * framebuffer no llegó a inicializarse (cols/rows = 0 -> -1). */
+    if (col < 0) col = 0;
+    if (cols > 0 && col >= cols) col = cols - 1;
+    if (row < 0) row = 0;
+    if (rows > 0 && row >= rows) row = rows - 1;
     cur_col = col;
     cur_row = row;
 }

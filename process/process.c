@@ -76,15 +76,23 @@ void process_init(void)
      * them at PRIO_IDLE so the real idle task (which HLTs the CPU) gets
      * the CPU whenever there's nothing else to do, and so a freshly-
      * created user task at PRIO_DEFAULT instantly beats them all. */
+    /* OJO: spawn_kthread() devuelve NULL si no quedan huecos en la tabla de
+     * procesos (o si falla el kmalloc del kstack).  Aquí se desreferenciaba
+     * a ciegas: un `process_create()` que devolviera NULL durante el arranque
+     * hacía #PF en ring 0 antes de llegar al shell. */
     process_t *init = spawn_kthread("init", PROC_RUNNING);
-    init->priority = PRIO_IDLE;
-    current = init;
+    if (init) {
+        init->priority = PRIO_IDLE;
+        current = init;
+    }
 
     process_t *kth = spawn_kthread("kthreadd", PROC_SLEEPING);
-    kth->priority = PRIO_IDLE;
+    if (kth)
+        kth->priority = PRIO_IDLE;
 
     process_t *msh = spawn_kthread("mysh", PROC_READY);
-    msh->priority = PRIO_IDLE;
+    if (msh)
+        msh->priority = PRIO_IDLE;
 
     /* ---- Idle "task" ----
      *

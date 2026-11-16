@@ -117,9 +117,22 @@ sys.exit(1 if m else 0)"
 	  if [ "$$n" -ne 0 ]; then echo "$$n artefactos versionados"; exit 1; fi; \
 	  echo "0 artefactos versionados"
 
+# ---- Análisis estático de GCC (lo que ejecuta audit.yml) ----
+analyze:
+	@rc=0; \
+	for f in boot/*.c kernel/*.c drivers/*.c cpu/*.c mm/*.c fs/*.c \
+	         process/*.c shell/*.c auth/*.c lib/*.c user/*.c; do \
+	  out=$$(gcc -m32 -std=gnu11 -ffreestanding -O1 -fanalyzer -Wall -Wextra \
+	              -nostdlib -fno-builtin -fno-stack-protector -fno-pic \
+	              -Iinclude -Ilib -c "$$f" -o /dev/null 2>&1 || true); \
+	  bad=$$(printf '%s\n' "$$out" | grep -E '\[-Wanalyzer-|: error:' || true); \
+	  if [ -n "$$bad" ]; then echo "❌ $$f"; printf '%s\n' "$$bad" | head -6; rc=1; fi; \
+	done; \
+	[ $$rc -eq 0 ] && echo "✅ -fanalyzer limpio"; exit $$rc
+
 # ---- Cleanup ----
 clean:
 	rm -f $(OBJS) $(KERNEL) $(ISO)
 	rm -rf iso
 
-.PHONY: all run run-curses run-iso iso clean smoke audit
+.PHONY: all run run-curses run-iso iso clean smoke audit analyze

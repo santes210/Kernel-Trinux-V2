@@ -10,8 +10,11 @@
 #define PAGE_CACHE_DISABLE 0x10
 
 /* Kernel/user boundary: pages below this are supervisor-only (U/S=0).
- * This value is defined in vmm.c and exposed here for other subsystems. */
-#define KERNEL_END_VIRT    0x05000000U   /* 80 MiB: kernel code + data + heap */
+ * Definido UNA sola vez en include/userlayout.h (USER_SPACE_START) y
+ * reexportado aquí; antes vmm.c y vmm.h tenían dos #define del mismo valor
+ * que podían divergir sin que nadie se enterara. */
+#include "../include/userlayout.h"
+#define KERNEL_END_VIRT    USER_SPACE_START   /* 80 MiB: kernel code + data + heap */
 
 void vmm_init(void);
 void vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags);

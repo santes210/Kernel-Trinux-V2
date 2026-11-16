@@ -588,3 +588,52 @@ Los chequeos de §7.1–7.9 están automatizados en `.github/workflows/audit.yml
 (paso "Regresiones de seguridad / robustez"): si alguien vuelve a introducir
 el `longjmp` global, el `owner_pid` sin comprobar o el `strcat` sin límite, el
 CI falla.
+
+## 8. Ronda 3b — análisis estático (`-fanalyzer`)
+
+En lugar de seguir leyendo código a ojo, se pasó el analizador de GCC 12
+(`-fanalyzer`) por los 51 archivos del kernel. Encontró dos cosas reales y
+permitió descartar muchas sospechas.
+
+### 8.1 🔴 `process_init()` desreferenciaba `NULL`
+
+```c
+process_t *init = spawn_kthread("init", PROC_RUNNING);
+init->priority = PRIO_IDLE;          // ← sin comprobar
+process_t *kth  = spawn_kthread("kthreadd", PROC_SLEEPING);
+kth->priority  = PRIO_IDLE;          // ← idem
+```
+
+`spawn_kthread()` devuelve `NULL` si no hay hueco en la tabla de procesos o
+si falla el `kmalloc` del kstack. En ese caso el arranque hacía `#PF` en
+ring 0 **antes** de llegar al shell, sin mensaje. Ahora se comprueba cada
+puntero (si `init` es NULL, `current` se queda NULL y el resto sigue).
+
+### 8.2 `KERNEL_END_VIRT` definido dos veces
+
+`mm/vmm.h` decía `0x05000000` y `mm/vmm.c` lo definía otra vez. Mientras los
+dos valores coincidan no pasa nada, pero es exactamente el tipo de deriva que
+ya provocó la desincronización de los límites de usuario (§6.5). Ahora vive
+solo en `include/userlayout.h` y `vmm.h` lo reexporta.
+
+### 8.3 `fb_set_cursor()` con dos `if` engañosos
+
+```c
+if (col < 0) col = 0; if (col >= cols) col = cols - 1;
+```
+
+`-Wmisleading-indentation`: el segundo `if` **no** está dentro del primero.
+Se ve a simple vista, y precisamente por eso alguien añadirá llaves algún día
+y cambiará el comportamiento sin querer. Explicitado, y con guarda por si el
+framebuffer no se inicializó (`cols == 0` dejaba `col = -1`).
+
+### 8.4 Lo que `-fanalyzer` NO encontró
+
+Ningún doble free, uso después de free, ni buffer overflow detectable en
+`fs/`, `mm/`, `drivers/`, `auth/`, `kernel/` ni `shell/commands.c`. Los
+problemas de esta ronda y de la anterior eran de **lógica** (un `owner_pid`
+que nadie miraba, un `longjmp` global, un `if` que no comprobaba límites), no
+de gestión de memoria, y eso no lo ve un analizador.
+
+Automatizado como `make analyze` y como paso "Análisis estático
+(-fanalyzer)" en `.github/workflows/audit.yml`.
