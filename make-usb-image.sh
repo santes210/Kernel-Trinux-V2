@@ -118,10 +118,11 @@ insmod iso9660
 insmod search_fs_file
 search --no-floppy --file --set=root /boot/__KERNEL__
 
-# Video: en UEFI el framebuffer lo da el GOP del firmware; en BIOS, VBE.
+# Video: NO cargamos gfxterm a proposito. El menu se dibuja con la consola del
+# firmware (texto por GOP), que siempre existe, y el framebuffer del KERNEL lo
+# negocia GRUB a partir de la cabecera Multiboot (flags bit 2 = FB_VIDMODE),
+# no del terminal de GRUB. Menos piezas = menos formas de fallar.
 insmod all_video
-insmod gfxterm
-terminal_output gfxterm console
 
 menuentry "Trinux — Arranque normal" {
   multiboot /boot/__KERNEL__
@@ -154,8 +155,8 @@ grub-mkstandalone \
     --format=x86_64-efi \
     --output="$BUILDDIR/BOOTX64.EFI" \
     --modules="part_gpt part_msdos fat iso9660 normal multiboot relocator \
-               all_video gfxterm efi_gop efi_uga serial terminal search \
-               search_fs_file search_fs_uuid configfile echo test" \
+               all_video efi_gop serial search search_fs_file \
+               configfile echo test" \
     --locales="" --themes="" --fonts="" \
     "boot/grub/grub.cfg=$BUILDDIR/grub.cfg" \
     >/dev/null || die "grub-mkstandalone (x86_64-efi) fallo"
@@ -167,8 +168,8 @@ if [ "$HAVE_EFI32" = 1 ]; then
         --format=i386-efi \
         --output="$BUILDDIR/BOOTIA32.EFI" \
         --modules="part_gpt part_msdos fat iso9660 normal multiboot relocator \
-                   all_video gfxterm efi_gop efi_uga serial terminal search \
-                   search_fs_file search_fs_uuid configfile echo test" \
+                   all_video efi_gop serial search search_fs_file \
+                   configfile echo test" \
         --locales="" --themes="" --fonts="" \
         "boot/grub/grub.cfg=$BUILDDIR/grub.cfg" \
         >/dev/null || warn "grub-mkstandalone (i386-efi) fallo; sigo sin UEFI-32"
