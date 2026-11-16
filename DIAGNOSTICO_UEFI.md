@@ -1,20 +1,22 @@
-# Por qué Trinux arranca en BIOS/MBR pero no en UEFI
+# Por qué Trinux no arrancaba en UEFI (y cómo se arregló)
 
-Resumen: **el kernel no es el problema, es el camino de arranque.** Trinux es
-un kernel Multiboot v1 de **32 bits** (`readelf -h` → `ELF32`, `Intel 80386`,
-entrada `_start`). Eso funciona de forma nativa en BIOS/MBR y tiene tres
-barreras distintas en UEFI, en este orden de importancia:
+> **Estado: RESUELTO.** Este documento explica el diagnóstico original y lo
+> que se cambió. La imagen que genera `make usb` ahora arranca en BIOS **y**
+> en UEFI, siempre que **Secure Boot esté desactivado**.
+> Recuperación de un arranque fallido: `GRUB_RESCUE.md`.
 
-1. **Secure Boot** (la causa más probable si ni siquiera ves el menú GRUB).
-2. **El módulo `multiboot` de GRUB-EFI** (si ves el menú pero falla al cargar).
-3. **La consola**: en UEFI no existe el modo texto VGA `0xB8000`.
+Los tres motivos por los que fallaba, en orden de importancia:
 
-Y hay un cuarto problema que sí está en el repo: **la imagen "USB" que genera
-el CI no tiene partición ESP**, así que no arranca en UEFI puro aunque el
-firmware esté en modo CSM desactivado.
+1. **No había nada que ejecutar en UEFI.** El CI copiaba el ISO y le pegaba
+   ceros detrás (`cp` + `truncate`). Ese medio no tiene partición ESP ni
+   `EFI/BOOT/BOOTX64.EFI`, así que el firmware UEFI no tiene a qué saltar.
+2. **Secure Boot** bloquea el módulo `multiboot` de GRUB (no está firmado,
+   CVE-2015-5281). Aun con la ESP correcta, hay que desactivarlo.
+3. **La consola**: en UEFI no existe el modo texto VGA `0xB8000`. Si el
+   framebuffer falla, la pantalla queda negra aunque el kernel esté vivo. Mira
+   el puerto serie para distinguirlo de un cuelgue.
 
 ---
-
 ## 1. Secure Boot (mirar esto primero)
 
 Si en la máquina UEFI **no aparece ni el menú de GRUB**, casi seguro es esto.

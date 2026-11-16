@@ -14,7 +14,7 @@ dispositivos en `/dev`, sistema multiusuario con permisos Unix reales,
 editor de texto a pantalla completa, pipes, redirección, grep, y mucho más.
 
 **Funciona tanto en QEMU como en hardware real** — la imagen USB generada
-bootea en **Legacy BIOS / CSM**, y el kernel detecta automáticamente si
+bootea en **Legacy BIOS/CSM y en UEFI** (ver más abajo), y el kernel detecta automáticamente si
 el disco es IDE, SATA (AHCI) o USB (xHCI), así que puedes correrlo en
 laptops modernas como la HP Stream 14 donde la USB de boot es el único
 medio de almacenamiento accesible.
@@ -1161,34 +1161,61 @@ defecto: `user`/`user` o `root`/`root`.
 ### En hardware real (USB bootable) 💾
 
 ```sh
-sudo apt-get install grub-pc-bin xorriso mtools
+# Herramientas: BIOS + los DOS sabores de EFI + FAT
+sudo apt-get install grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
+                     xorriso mtools dosfstools
 
-# Genera la imagen (ajusta el tamaño a tu USB)
+# Genera la imagen (ajusta el tamaño a tu USB; 512 MiB por defecto)
 make usb                     # equivale a ./make-usb-image.sh 512
 ./make-usb-image.sh 14336    # o pide 14 GB explícitamente
 
-# Grábala a la USB (¡CUIDADO: verifica con lsblk antes!)
+# Grábala (¡CUIDADO: verifica con lsblk antes!)
 sudo dd if=mykernel-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
 sync
 ```
 
-`make usb` **verifica la imagen** antes de dártela: firma de arranque
-`0x55AA` en el sector 0, `grub.cfg` con la entrada `multiboot` y el kernel
-con su cabecera Multiboot (magic `0x1BADB002`). Si algo falta, **falla** en
-vez de generar un pendrive que arranca a `grub rescue>`.
+La imagen es **híbrida de verdad**, con dos caminos de arranque:
 
-| Tipo de PC | Funciona? |
-|---|---|
-| PC con BIOS Legacy / CSM | ✅ |
-| PC con UEFI (sin Legacy) | ⚠️ ver nota |
-| Mac Intel | ❌ no implementado |
-| QEMU | ✅ |
+| Firmware | Qué ejecuta | Estado |
+|---|---|---|
+| BIOS / CSM | MBR de GRUB (`i386-pc`) | ✅ |
+| UEFI x86_64 | `EFI/BOOT/BOOTX64.EFI` en una ESP FAT de 48 MiB | ✅ |
+| UEFI IA-32 | `EFI/BOOT/BOOTIA32.EFI` | ✅ si instalas `grub-efi-ia32-bin` |
+| Mac Intel (HFS+) | — | ❌ no implementado |
+| QEMU (BIOS y OVMF) | — | ✅ |
 
-> **Estado real de UEFI:** lo que genera el repo hoy es una imagen
-> **BIOS/MBR arrancable**. No incluye `EFI/BOOT/BOOTIA32.EFI`, así que en una
-> máquina en UEFI puro no arranca. Ver `DIAGNOSTICO_UEFI.md` para las causas y
-> lo que faltaría. Las versiones anteriores de este README afirmaban UEFI ✅ y
-> partición HFS+ para Mac; ninguna de las dos cosas estaba implementada.
+#### Para arrancar en UEFI: desactiva Secure Boot
+
+Es obligatorio, y no es algo que Trinux pueda evitar. El módulo `multiboot`
+de GRUB carga código **sin firmar**, así que el firmware lo bloquea
+(CVE-2015-5281). Sin Secure Boot desactivado verás
+`prohibited by secure boot policy` o una pantalla que vuelve al menú de la BIOS.
+
+Cómo desactivarlo: entra en la UEFI/BIOS (F2, F10, Del o Esc al encender),
+busca **Secure Boot** en la pestaña *Security* / *Boot* y ponlo en
+**Disabled**. Si está en gris, primero hay que poner una contraseña de
+administrador, o cambiar *Setup Mode* a *Custom* y borrar las claves.
+
+#### Cómo se construye (y por qué así)
+
+1. **GRUB EFI embebido**: `grub-mkstandalone` mete el menú y los módulos
+   *dentro* del `.EFI`. No depende de encontrar su `$prefix` en el disco, así
+   que el fallo clásico `grub rescue>` no puede ocurrir por esa vía.
+2. **ESP de 48 MiB**: la de `grub-mkrescue` por defecto son 10 MiB y no cabe
+   el GRUB EFI completo.
+3. **El `grub.cfg` localiza su propio kernel** con
+   `search --file --set=root /boot/mykernel.bin`. Sin eso, el `root` inicial
+   dentro del `.EFI` es `(memdisk)` y daría `file not found`.
+4. **Reserva de arranque de 48 MiB en el kernel**: antes eran 16 MiB y el
+   bitmap de `blockfs` escribía **encima de la ESP**. Se corrompía en el
+   primer `sync` y el arranque siguiente ya no encontraba el gestor. Si alguna
+   vez cambias `DISKFS_BOOT_RESERVE_SECTORS`, cambia también
+   `BOOT_RESERVE_SECTORS` y este script: los tres tienen que coincidir.
+
+El script **verifica** la imagen antes de darte el control: firma `0x55AA` en
+el sector 0, cabecera PE (`MZ`) del `.EFI`, presencia de
+`EFI/BOOT/BOOTX64.EFI` y del kernel con su magic Multiboot. Si algo falta,
+**falla** en vez de producir un pendrive muerto.
 
 Al bootear verás un menú GRUB con estas opciones:
 - **Trinux** — boot normal (pide login)
@@ -1260,7 +1287,8 @@ qemu-system-i386 -drive file=trinux.img,format=raw,if=ide -m 512M \
 | GNU ld | `binutils` | Enlazar el binario ELF con `linker.ld` |
 | QEMU | `qemu-system-x86` | Emular y probar |
 | GRUB (Legacy) | `grub-pc-bin` | Boot BIOS en la imagen USB |
-| GRUB (EFI) | `grub-efi-ia32-bin` | *(pendiente: hoy no se usa, ver `DIAGNOSTICO_UEFI.md`)* |
+| GRUB (EFI x86_64) | `grub-efi-amd64-bin` | `BOOTX64.EFI` para UEFI moderno |
+| GRUB (EFI IA-32) | `grub-efi-ia32-bin` | `BOOTIA32.EFI`, solo para UEFI-32 antiguo |
 | xorriso + mtools | `xorriso mtools` | Generar la ISO/imagen híbrida |
 
 ### Targets del Makefile
@@ -1273,7 +1301,7 @@ qemu-system-i386 -drive file=trinux.img,format=raw,if=ide -m 512M \
 | `make iso` | Genera `mykernel.iso` booteable con GRUB |
 | `make run-iso` | Genera y arranca la ISO |
 | `make clean` | Borra `.o`, binarios e ISO |
-| `make usb` / `./make-usb-image.sh N` | Genera y **verifica** `mykernel-usb.img` de N MiB (BIOS/MBR) |
+| `make usb` / `./make-usb-image.sh N` | Genera y **verifica** `mykernel-usb.img` de N MiB (BIOS + UEFI) |
 
 ---
 
@@ -2649,13 +2677,14 @@ Kernel-Trinux-V2/
   En su lugar se lee directamente el Embedded Controller con layouts
   conocidos + auto-detección.  Funciona en la mayoría de laptops.
 
-- **Imagen USB arrancable en BIOS/MBR** gracias a `grub-mkrescue` y
-  `grub-pc-bin`, con `make usb` verificando el resultado (firma `0x55AA`,
-  `grub.cfg` y kernel con cabecera Multiboot dentro de la imagen).
-  *No* es dual-boot todavia: no hay partición ESP, ni `BOOTIA32.EFI`, ni
-  partición HFS+, así que en UEFI puro no arranca. Los detalles de qué
-  falta están en `DIAGNOSTICO_UEFI.md`; la recuperación de un arranque
-  fallido (`grub rescue>`), en `GRUB_RESCUE.md`.
+- **Imagen USB arrancable en BIOS y UEFI** construida con `xorriso`:
+  GRUB `i386-pc` en el MBR + una ESP FAT de 48 MiB con `BOOTX64.EFI`
+  (`grub-mkstandalone`, con el menú y los módulos embebidos) y
+  `BOOTIA32.EFI` para UEFI-32. `make usb` verifica firma `0x55AA`,
+  cabecera PE del `.EFI`, y que el kernel lleve su magic Multiboot.
+  Requiere **Secure Boot desactivado** (el módulo `multiboot` no está
+  firmado). Diagnóstico y límites en `DIAGNOSTICO_UEFI.md`; recuperación
+  de un arranque fallido en `GRUB_RESCUE.md`.
 
 - **Single-user mode** igual que Linux real: se parsea la cmdline de
   Multiboot buscando `single` o `init=/bin/bash`.  Desde GRUB se edita
@@ -2689,7 +2718,7 @@ Kernel-Trinux-V2/
 - [x] PCI + AHCI/SATA (disco en hardware real)
 - [x] xHCI + USB Mass Storage (persistencia en USB)
 - [x] Batería (ACPI EC) + CPU usage en tiempo real
-- [ ] Boot UEFI (via GRUB EFI 32-bit) — **no implementado**, ver `DIAGNOSTICO_UEFI.md`
+- [x] Boot UEFI (ESP FAT + BOOTX64.EFI, GRUB EFI embebido)
 - [x] Single-user mode / recovery (estilo Linux)
 - [x] Cargar binarios ELF desde el filesystem (TCC + TASM + exec)
 - [x] **TCC: variables globales (`.bss`), `char[]` real, array-write LHS** 🆕

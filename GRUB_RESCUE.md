@@ -1,5 +1,11 @@
 # `grub rescue>` al arrancar el USB de Trinux
 
+> **Nota:** la imagen que genera `make usb` a partir de esta versión ya no
+> debería llegar aquí: usa `grub-mkstandalone`, que lleva el menú y los módulos
+> **dentro** del `.EFI`, así que GRUB no tiene que buscar su `/boot/grub` en el
+> disco. Este documento sigue siendo útil para imágenes antiguas o para el
+> camino BIOS. Estado actual del soporte UEFI: `DIAGNOSTICO_UEFI.md`.
+
 ## Qué significa
 
 `grub rescue>` **no es un fallo del kernel**. GRUB arrancó: el sector 0 del

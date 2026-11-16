@@ -20,8 +20,17 @@
 #define DISKFS_TAIL_BYTES   (64u * 1024u * 1024u)
 #define DISKFS_TAIL_SECTORS (DISKFS_TAIL_BYTES / 512u)
 
-/* Reserve the first 16 MiB for the bootloader + kernel image. */
-#define BOOT_RESERVE_SECTORS (16u * 1024u * 1024u / 512u)
+/* Reserve the first 48 MiB for the bootloader + kernel image.
+ *
+ * Este valor NO es arbitrario. En una imagen arrancable por UEFI el firmware
+ * lee una particion ESP (FAT) al principio del disco. `grub-mkrescue` la
+ * coloca en el sector 1, ocupa unos 34 MiB con el GRUB EFI completo y sus
+ * modulos, y termina hacia el LEB 35 MiB. Antes la reserva era de 16 MiB, asi
+ * que blockfs escribia su bitmap ENCIMA de la ESP y la corrompia en el primer
+ * `sync`. Con 48 MiB hay margen para la ESP y para el kernel.
+ *
+ * Debe coincidir EXACTAMENTE con DISKFS_BOOT_RESERVE_BYTES de fs/diskfs.c. */
+#define BOOT_RESERVE_SECTORS (48u * 1024u * 1024u / 512u)
 
 /* Bitmap lives right after the boot reserve. */
 #define BITMAP_LBA  BOOT_RESERVE_SECTORS

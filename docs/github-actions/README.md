@@ -33,6 +33,21 @@ comprobaciones son obligatorias.
 
 ## Historial de correcciones en los workflows
 
+- **Imagen USB híbrida de verdad (BIOS + UEFI).** El paso de USB hacía
+  `cp trinux.iso trinus-usb.img` + `truncate`: un ISO con ceros detrás, sin
+  partición ESP. En una máquina UEFI eso no arranca — no hay
+  `EFI/BOOT/BOOTX64.EFI` a qué saltar. Ahora el mismo `make-usb-image.sh`
+  genera ISO e imagen USB con `xorriso`, GRUB `i386-pc` en el MBR y una ESP FAT
+  de 48 MiB con `BOOTX64.EFI` y `BOOTIA32.EFI` (GRUB EFI **standalone**, con el
+  menú embebido).
+- **El CI exige que exista el camino UEFI.** Se comprueba `BOOTX64` dentro de
+  la ISO y de la imagen; si falta, el build **falla**. Antes se publicaba una
+  imagen que no arrancaba en UEFI y nadie lo detectaba.
+- **`grub-efi-ia32-bin` añadido** a las dependencias (el README lo pedía y el
+  workflow no lo instalaba). Y se quitó `truncate` de la lista de `apt-get`,
+  que no es un paquete.
+
+
 - **`build.yml` no era YAML válido.** El here-doc que genera
   `iso/boot/grub/grub.cfg` estaba **sin indentar** dentro de un bloque
   `run: |`. YAML terminaba el bloque escalar en el primer `set timeout=5` y

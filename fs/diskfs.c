@@ -38,7 +38,7 @@
 /* ----------------------------------------------------------------------------
  * On-disk layout (must stay in sync with fs/blockfs.c!):
  *
- *   [ 0 .. BOOT_RESERVE )            bootloader / kernel image (16 MiB)
+ *   [ 0 .. BOOT_RESERVE )            bootloader / kernel / ESP UEFI (48 MiB)
  *   [ BOOT_RESERVE .. tail_start )   blockfs: bitmap + file-content blocks
  *   [ tail_start .. end )            diskfs: this metadata snapshot (TAIL)
  *
@@ -60,9 +60,17 @@
  * file *contents* live in blockfs). */
 #define DISKFS_MAX_IMAGE     DISKFS_TAIL_BYTES
 
-/* The bootloader (GRUB + kernel, ~10-16 MiB) lives at the START, so we keep a
- * 16 MiB boot reserve and never write below it. MUST equal blockfs's. */
-#define DISKFS_BOOT_RESERVE_SECTORS (16u * 1024u * 1024u / ATA_SECTOR_SIZE)
+/* The bootloader (GRUB + kernel + la particion ESP que lee la UEFI) vive al
+ * PRINCIPIO del disco, asi que nunca escribimos por debajo de esta marca.
+ *
+ * 48 MiB y no 16: en una imagen arrancable por UEFI, `grub-mkrescue` pone la
+ * ESP (FAT) en el sector 1 y ocupa ~34 MiB (GRUB EFI + modulos + kernel). Con
+ * la reserva vieja de 16 MiB el bitmap de blockfs caia DENTRO de la ESP y la
+ * corrompia al hacer `sync`; el siguiente arranque ya no encontraba el
+ * gestor de arranque.
+ *
+ * MUST equal blockfs's BOOT_RESERVE_SECTORS. */
+#define DISKFS_BOOT_RESERVE_SECTORS (48u * 1024u * 1024u / ATA_SECTOR_SIZE)
 
 static uint32_t diskfs_base_lba(void)
 {

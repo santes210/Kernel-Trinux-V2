@@ -62,10 +62,15 @@ $(KERNEL): $(OBJS) linker.ld
 	@echo "Built $(KERNEL)"
 
 # ---- Disk image for persistence ----
-# A raw 16 MiB disk QEMU exposes as the primary IDE master. The kernel's ATA
-# driver reads/writes it; `sync` in the shell saves the filesystem here.
+# Raw disk QEMU expone como maestro IDE primario. El driver ATA del kernel lo
+# lee/escribe; `sync` guarda ahi el filesystem.
+#
+# 256 MiB y no 128: blockfs necesita 48 MiB de reserva de arranque + 64 MiB de
+# cola para el snapshot de diskfs + espacio para datos. Con 128 MiB quedaban
+# ~16 MiB utiles y `blockfs_init()` se desactivaba en silencio (los ficheros se
+# quedaban en RAM), asi que la persistencia no se probaba nunca.
 DISK    := disk.img
-DISKMB  := 128
+DISKMB  := 256
 
 $(DISK):
 	@echo "Creating $(DISKMB) MiB disk image $(DISK)"
