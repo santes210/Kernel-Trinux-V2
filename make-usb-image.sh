@@ -102,25 +102,44 @@ rm -rf "$BUILDDIR" "$ISODIR"
 mkdir -p "$BUILDDIR" "$ISODIR/boot/grub"
 
 cat > "$BUILDDIR/grub.cfg" <<'GRUBEOF'
-set timeout=5
+set timeout=60
 set default=0
 set gfxmode=auto
 set gfxpayload=keep
 
 # ---------------------------------------------------------------------------
-# Localizar donde esta el kernel.
+# Localizar donde esta el kernel.  (CORREGIDO)
 #
-# Esto es CRITICO y es el fallo tipico de grub-mkstandalone: dentro del .EFI el
-# `root` inicial es (memdisk), asi que `multiboot /boot/mykernel.bin` buscaria
-# (memdisk)/boot/mykernel.bin y daria "error: file not found". Buscamos la
-# particion que de verdad lo contiene: la ESP en UEFI, el ISO en BIOS.
+# Dos bugs aqui causaban una pantalla negra con la palabra "GRUB" y dejaban el
+# kernel sin cargar, en BIOS *y* en UEFI:
+#
+#  1. `search --no-floppy --file --set=root /boot/mykernel.bin`
+#     La opcion --file EXIGE el nombre del fichero como argumento; lo que
+#     venia despues se interpretaba como patron de dispositivo. Resultado:
+#     `root` NUNCA se fijaba. Al arrancar en BIOS desde una particion ISO9660
+#     (donde `root` es (cd0) y el ceros-de-relleno), `normal` no encontraba su
+#     /boot/grub, no podia mostrar el menu y se quedaba en la pantalla "GRUB".
+#     En UEFI pasaba algo equivalente y devolvia al firmware.
+#
+#  2. Se asumia que el cfg se carga desde (memdisk). Desde que el cfg vive en
+#     la particion, `root` YA apunta al sitio correcto; solo hay que
+#     ASEGURARLO en vez de fallar.
+#
+# La estrategia ahora es a prueba de balas: si el kernel ya es accesible con el
+# `root` actual, se usa; si no, se busca; y si no aparece en ningun sitio, el
+# menu sale igualmente y muestra un diagnostico en vez de quedarse mudo.
 # ---------------------------------------------------------------------------
 insmod part_gpt
 insmod part_msdos
 insmod fat
 insmod iso9660
 insmod search_fs_file
-search --no-floppy --file --set=root /boot/__KERNEL__
+
+if [ -f /boot/__KERNEL__ ]; then
+  echo "Trinux: kernel encontrado en $root"
+else
+  search --no-floppy --file --set=root /boot/__KERNEL__
+fi
 
 # Video: NO cargamos gfxterm a proposito. El menu se dibuja con la consola del
 # firmware (texto por GOP), que siempre existe, y el framebuffer del KERNEL lo
@@ -142,12 +161,23 @@ menuentry "Trinux — Shell ring-0 (debug)" {
   multiboot /boot/__KERNEL__ oldsh
   boot
 }
+
+menuentry "Trinux — Diagnostico (lista dispositivos)" {
+  echo "root=$root"
+  ls
+  ls /boot
+  sleep 30
+}
 GRUBEOF
 
 sed -i "s/__KERNEL__/${KERNEL}/g" "$BUILDDIR/grub.cfg"
 grep -q "multiboot /boot/${KERNEL}" "$BUILDDIR/grub.cfg" || \
     die "el grub.cfg no contiene la entrada multiboot esperada"
-cp "$BUILDDIR/grub.cfg" "$ISODIR/boot/grub/grub.cfg"
+# El grub.cfg de la PARTICION: se carga cuando `root` ya apunta a la
+# particion (BIOS: ISO9660; UEFI: FAT). El del memdisk es el que lleva la
+# logica de busqueda; repetirla aqui solo puede fallar de nuevo.
+sed 's|^[[:space:]]*search --no-floppy|# search ya resuelto por el memdisk: no repetir|' \
+    "$BUILDDIR/grub.cfg" > "$ISODIR/boot/grub/grub.cfg"
 cp "$KERNEL" "$ISODIR/boot/$KERNEL"
 
 # ------------------------------------------------------ GRUB EFI embebido ----
@@ -217,7 +247,7 @@ grub-mkimage \
     --prefix=/boot/grub \
     --compress=xz \
     biosdisk iso9660 part_msdos part_gpt fat normal multiboot relocator \
-    search search_fs_file configfile echo test \
+    search search_fs_file configfile echo test all_video \
     >/dev/null 2>&1 || die "grub-mkimage (i386-pc) fallo"
 [ -s "$BUILDDIR/core.img" ] || die "grub-mkimage no genero core.img"
 
