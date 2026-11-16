@@ -5,6 +5,7 @@
 #include "../drivers/timer.h"   /* for timer_get_ticks() (start_tick) */
 #include "../mm/vmm.h"         /* for vmm_create/free/switch_address_space */
 #include "../auth/users.h"     /* for current_user() (root check in process_set_priority) */
+#include "scheduler.h"      /* schedule() — sin esto era una declaración implícita */
 
 static process_t  processes[MAX_PROCESSES];
 static uint32_t   proc_count;
@@ -159,15 +160,29 @@ process_t *process_create(const char *name, void (*entry)(void))
 
     p->kstack = kmalloc_aligned(8192);
     uint32_t* stack = (uint32_t*)((uint32_t)p->kstack + 8192);
-    
-    /* Simulate a call frame for context_switch to ret into */
-    *(--stack) = (uint32_t)kernel_thread_exit; /* where to return if entry() returns */
-    *(--stack) = (uint32_t)entry;              /* eip */
-    
-    p->context.eip = (uint32_t)entry;
-    p->context.esp = (uint32_t)stack;
-    p->context.ebp = (uint32_t)stack;
-    p->context.eflags = 0x202; /* IF enabled */
+
+    /* Simulate a call frame for context_switch to ret into.
+     *
+     * OJO: si entry es NULL (SYS_FORK, que reutiliza la imagen del padre) el
+     * kernel NO puede dejar context.eip = 0, porque el primer schedule() que
+     * elija a este proceso saltaría a la dirección 0 y moriría.  En ese caso
+     * el llamador debe fijar context/esp a mano (ver process_fork()).  Aquí
+     * solo se instala un frame válido cuando hay entry de verdad. */
+    if (entry) {
+        *(--stack) = (uint32_t)kernel_thread_exit; /* where to return if entry() returns */
+        *(--stack) = (uint32_t)entry;              /* eip */
+
+        p->context.eip    = (uint32_t)entry;
+        p->context.esp    = (uint32_t)stack;
+        p->context.ebp    = (uint32_t)stack;
+        p->context.eflags = 0x202; /* IF enabled */
+    } else {
+        /* Contexto vacío: lo rellena quien crea el proceso (fork/exec). */
+        p->context.eip    = 0;
+        p->context.esp    = (uint32_t)stack;
+        p->context.ebp    = (uint32_t)stack;
+        p->context.eflags = 0x202;
+    }
 
     return p;
 }
@@ -220,11 +235,17 @@ void process_exit(int code)
             }
         }
 
-        /* Free the process's address space (will be fully freed when slot is reused) */
-        if (current->page_dir) {
-            vmm_free_address_space(current->page_dir);
-            current->page_dir = 0;
-        }
+        /* OJO: aquí NO se libera el address space.
+         *
+         * Esta función corre *en la pila del propio proceso* y sigue
+         * ejecutándose después de marcarse ZOMBIE: si se liberara el page
+         * directory ahora, el contexto todavía activo (cr3 de este proceso)
+         * apuntaría a frames ya devueltos al PMM y el siguiente schedule()
+         * usaría —o peor, reutilizaría— esa memoria.  Se difiere al reciclado
+         * del slot en process_create(), que ya llama a
+         * vmm_free_address_space(p->page_dir), y que corre en otro proceso.
+         * Quien vaya a salir en ring 3 debe haber cargado antes el page
+         * directory del kernel (ver schedule() -> context_switch). */
     }
 }
 

@@ -19,11 +19,11 @@
 #include "../lib/printf.h"
 #include "../process/process.h"
 #include "../process/scheduler.h"
+#include "../include/userlayout.h"
 
 /* Rango de memoria de usuario a copiar en fork().
- * Cubre ELF code+data+stack de todos los niveles de spawn. */
-#define USER_COPY_START  0x08048000u
-#define USER_COPY_END    0x0F100000u   /* un poco por encima del stack top */
+ * Viene de include/userlayout.h (fuente única): 0x08048000 .. 0x0F000000.
+ * Antes acababa en 0x0F100000, 1 MiB por encima del stack más alto. */
 
 #define PAGE_SIZE 4096
 
@@ -50,8 +50,14 @@ void vmm_copy_region(uint32_t child_pd, uint32_t start, uint32_t end)
         memcpy((void *)new_frame, (void *)addr, PAGE_SIZE);
 
         /* Mapear en el page directory del hijo */
-        vmm_map_page_in(child_pd, addr, new_frame,
-                        PAGE_PRESENT | PAGE_RW | PAGE_USER);
+        /* OJO: variante PRIVADA. child_pd acaba de salir de
+         * vmm_create_address_space(), así que sus entradas apuntan a las
+         * page_tables[] globales del kernel. Con vmm_map_page_in() este bucle
+         * reescribía esas tablas COMPARTIDAS: un fork() remapeaba
+         * 0x08048000..0x0F000000 a los frames privados del hijo para todos
+         * los procesos, padre incluido. */
+        vmm_map_page_private_in(child_pd, addr, new_frame,
+                                PAGE_PRESENT | PAGE_RW | PAGE_USER);
 
         addr += PAGE_SIZE;
     }

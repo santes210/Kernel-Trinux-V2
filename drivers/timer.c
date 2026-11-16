@@ -17,11 +17,19 @@ static volatile uint32_t last_idle;
 
 /* scheduler hook (weak-ish: defined in scheduler.c) */
 extern void scheduler_tick(void);
+/* Red (v0.6): el stack ARP/IP/ICMP existía pero nadie lo sondeaba fuera de
+ * net_ping(), así que un ping *entrante* o una respuesta ARP se quedaban en
+ * el ring del RTL8139 hasta que expiraba el timeout.  Sondeamos desde el
+ * tick del PIT (100 Hz) — barato: rtl8139_recv() devuelve 0 si no hay nada. */
+extern void net_poll(void);
+#define NET_POLL_EVERY 2   /* ~50 Hz */
 extern void scheduler_set_last_user(int was_user);   /* see scheduler.c */
 
 static void timer_callback(registers_t *regs)
 {
     ticks++;
+    if ((ticks % NET_POLL_EVERY) == 0)
+        net_poll();     /* no-op si no hay NIC (comprueba net_ready) */
     /* Inspect the saved CS to decide whether the CPU was in ring 3 (user)
      * or ring 0 (kernel) at the moment the timer fired.  This is what
      * lets `top` show user vs system CPU time per process, htop-style. */

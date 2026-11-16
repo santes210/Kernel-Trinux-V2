@@ -128,27 +128,71 @@ static void k_print_num(int n) {
     if (n < 0) { putchar_('-'); k_print_unum((unsigned)(-n)); }
     else k_print_unum((unsigned)n);
 }
-static void kprintf_internal(const char *fmt, long *args) {
-    int ai = 0;
+/* macro varargs simple via puntero: solo funciona con max 6 args */
+/* El kprintf de tcc tiene que aceptar punteros y enteros mezclados (por
+ * ejemplo kprintf("%d: %s", n, name)).  La versión anterior empaquetaba todo
+ * en un `long[]` así que pasar un `char *` truncaba el puntero a 32 bits con
+ * aviso -Wint-conversion, y además el formato con ancho (%08x) se imprimía
+ * mal.  Ahora se usan varargs de verdad (__builtin_va_list, igual que en
+ * user/trinux.h) y se respeta el ancho y el relleno con ceros. */
+static void kprintf_internal(const char *fmt, __builtin_va_list ap) {
     while (*fmt) {
         if (*fmt != '%') { putchar_(*fmt++); continue; }
         fmt++;
-        /* opcional padding como %08x: ignoramos para simplicidad */
-        while ((*fmt >= '0' && *fmt <= '9') || *fmt == '0') fmt++;
+        int zero_pad = 0, left = 0, width = 0;
+        if (*fmt == '0') { zero_pad = 1; fmt++; }
+        if (*fmt == '-') { left = 1; fmt++; }
+        while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        char tmp[16];
+        int n = 0;
         switch (*fmt) {
-            case 'd': k_print_num((int)args[ai++]); break;
-            case 'u': k_print_unum((unsigned)args[ai++]); break;
-            case 'x': k_print_hex((unsigned)args[ai++]); break;
-            case 's': print((const char *)args[ai++]); break;
-            case 'c': putchar_((int)args[ai++]); break;
-            case '%': putchar_('%'); break;
+            case 'd': {
+                int v = __builtin_va_arg(ap, int);
+                if (v < 0) { putchar_('-'); v = -v; }
+                if (v == 0) tmp[n++] = '0';
+                while (v && n < 11) { tmp[n++] = '0' + (v % 10); v /= 10; }
+                break;
+            }
+            case 'u': {
+                unsigned int v = __builtin_va_arg(ap, unsigned int);
+                if (v == 0) tmp[n++] = '0';
+                while (v && n < 11) { tmp[n++] = '0' + (v % 10); v /= 10; }
+                break;
+            }
+            case 'x': case 'X': {
+                unsigned int v = __builtin_va_arg(ap, unsigned int);
+                const char *h = (*fmt == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
+                if (v == 0) tmp[n++] = '0';
+                while (v && n < 9) { tmp[n++] = h[v & 0xF]; v >>= 4; }
+                break;
+            }
+            case 's': {
+                const char *str = __builtin_va_arg(ap, const char *);
+                if (!str) str = "(null)";
+                print(str);
+                fmt++;
+                continue;
+            }
+            case 'c': putchar_((int)__builtin_va_arg(ap, int)); fmt++; continue;
+            case '%': putchar_('%'); fmt++; continue;
             default:  putchar_('?'); break;
         }
+        int pad = width - n;
+        if (!left) { while (pad-- > 0) putchar_(zero_pad ? '0' : ' '); }
+        while (n > 0) putchar_(tmp[--n]);
+        if (left) { pad = width - 0; (void)pad; }
         fmt++;
     }
 }
-/* macro varargs simple via puntero: solo funciona con max 6 args */
-#define kprintf(fmt, ...) do {     long _kargs[] = { 0, ##__VA_ARGS__ };     kprintf_internal(fmt, &_kargs[1]); } while (0)
+/* Variádica de verdad: __builtin_va_start solo es válido DENTRO de una
+ * función con `...`, así que el macro delega en esta función y no en
+ * kprintf_internal() directamente. */
+static void kprintf(const char *fmt, ...) {
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    kprintf_internal(fmt, ap);
+    __builtin_va_end(ap);
+}
 
 /* --- string ops que faltan en trinux.h --- */
 static int strlen(const char *s) { int n=0; while(s[n])n++; return n; }

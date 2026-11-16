@@ -95,9 +95,31 @@ run-iso: iso $(DISK)
 	$(QEMU) -cdrom $(ISO) -m 512M -serial stdio \
 		-drive file=$(DISK),format=raw,if=ide
 
+# ---- Smoke test (lo que ejecuta el CI) ----
+# Arranca el kernel en QEMU headless, captura COM1 y valida la secuencia de
+# arranque. Ver scripts/smoke_test.sh y docs/github-actions/README.md.
+smoke: $(KERNEL)
+	bash scripts/smoke_test.sh
+
+# ---- Auditoría estática (lo que ejecuta audit.yml) ----
+audit:
+	@python3 scripts/gen_embedded.py --check
+	@echo "== syscalls declarados vs implementados =="
+	@python3 -c "import re,sys;\
+h=open('user/trinux.h').read();c=open('cpu/syscall.c').read();\
+d={int(n):m for m,n in re.findall(r'#define\\s+(SYS_\\w+)\\s+(\\d+)',h)};\
+i=set(re.findall(r'case\\s+(SYS_\\w+)\\s*:',c));\
+m=[(d[n],n) for n in sorted(d) if d[n] not in i];\
+print(f'{len(d)} declarados, {len(d)-len(m)} con handler');\
+sys.exit(1 if m else 0)"
+	@echo "== artefactos versionados =="
+	@n=$$(git ls-files '*.o' '*.bin' '*.iso' '*.img' | wc -l); \
+	  if [ "$$n" -ne 0 ]; then echo "$$n artefactos versionados"; exit 1; fi; \
+	  echo "0 artefactos versionados"
+
 # ---- Cleanup ----
 clean:
 	rm -f $(OBJS) $(KERNEL) $(ISO)
 	rm -rf iso
 
-.PHONY: all run run-curses run-iso iso clean
+.PHONY: all run run-curses run-iso iso clean smoke audit

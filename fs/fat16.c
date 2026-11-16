@@ -528,10 +528,32 @@ void fat16_init(void)
         }
     }
 
-    if (ata_read_sectors(partition_lba, 1, buf) != 0) return;
+    /* ---- Validación del BPB (v0.6) ----
+     * Antes se copiaba el BPB a ciegas: un disco con MBR pero sin FAT (o con
+     * basura en el sector 0 de la partición) hacía que `total_sectors -
+     * data_start_lba` se desbordara (underflow de uint32) y que
+     * `fat16_read_dir(0,true)` devolviera NULL al que luego se le hacía
+     * `strcpy(fat_root_node->name, ...)` -> escritura en la dirección 0.
+     * También se aceptaba FAT12/FAT32 como si fueran FAT16. */
+    if (ata_read_sectors(partition_lba, 1, buf) != 0) {
+        kprintf("  [ .. ] FAT16: cannot read boot sector (LBA %u)\n", partition_lba);
+        partition_lba = 0;
+        return;
+    }
     memcpy(&bpb, buf, sizeof(struct fat_bpb));
 
-    if (bpb.bytes_per_sector != 512) return;
+    if (bpb.bytes_per_sector != 512) {
+        kprintf("  [ .. ] FAT16: bad BPB (bytes_per_sector=%u)\n",
+                bpb.bytes_per_sector);
+        partition_lba = 0;
+        return;
+    }
+    if (bpb.sectors_per_cluster == 0 || bpb.sectors_per_fat_16 == 0 ||
+        bpb.reserved_sectors == 0 || bpb.fat_count == 0) {
+        kprintf("  [ .. ] FAT16: bad BPB (no FAT geometry)\n");
+        partition_lba = 0;
+        return;
+    }
 
     fat_start_lba    = bpb.reserved_sectors;
     root_dir_lba     = fat_start_lba + (uint32_t)(bpb.fat_count * bpb.sectors_per_fat_16);
@@ -540,10 +562,33 @@ void fat16_init(void)
 
     uint32_t total_sectors = bpb.total_sectors_16
                              ? bpb.total_sectors_16 : bpb.total_sectors_32;
+
+    /* Si la geometría no cabe en el disco -> no es FAT16, no insistir. */
+    if (total_sectors <= data_start_lba ||
+        data_start_lba > 0x1000000 || root_dir_sectors == 0) {
+        kprintf("  [ .. ] FAT16: inconsistent BPB (total=%u data_start=%u)\n",
+                total_sectors, data_start_lba);
+        partition_lba = 0;
+        return;
+    }
+
     uint32_t data_sectors  = total_sectors - data_start_lba;
     total_clusters         = data_sectors / bpb.sectors_per_cluster;
 
+    /* FAT12 < 4085 clusters <= FAT16 < 65525 <= FAT32.  Solo montamos FAT16. */
+    if (total_clusters < 4085 || total_clusters >= 65525) {
+        kprintf("  [ .. ] FAT%s detected (%u clusters) - only FAT16 is supported\n",
+                total_clusters < 4085 ? "12" : "32", total_clusters);
+        partition_lba = 0;
+        return;
+    }
+
     fat_root_node = fat16_read_dir(0, true);
+    if (!fat_root_node) {
+        kprintf("  [ .. ] FAT16: cannot read root directory\n");
+        partition_lba = 0;
+        return;
+    }
     strcpy(fat_root_node->name, "fat");
     fat_root_node->readdir = fat16_vfs_readdir;
 

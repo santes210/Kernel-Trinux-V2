@@ -15,6 +15,7 @@
  * supervisor-only (U/S=0), pages at or above are user-accessible (U/S=1).
  */
 #include "vmm.h"
+#include "../include/userlayout.h"
 #include "../lib/string.h"
 #include "../lib/printf.h"
 #include "../cpu/isr.h"
@@ -28,22 +29,15 @@
 /* Kernel/user boundary: pages < KERNEL_END_VIRT are supervisor-only (U/S=0).
  * This covers BIOS (1 MB) + kernel code/data (~32 MB) + kernel heap (~32 MB) = ~80 MB.
  * 0x05000000 = 80 MiB = 20480 pages = 20 page tables (0-19).
- * We use a generous boundary to ensure all kernel structures are protected. */
-#define KERNEL_END_VIRT  0x05000000U    /* 80 MiB */
+ * We use a generous boundary to ensure all kernel structures are protected.
+ * ¡Ojo! Debe coincidir con USER_SPACE_START de include/userlayout.h. */
+#define KERNEL_END_VIRT  USER_SPACE_START /* 0x05000000, ver userlayout.h */
 #define KERNEL_END_TABLE (KERNEL_END_VIRT >> 22)  /* 20 = page table index */
-
-/* Extra page tables for on-demand MMIO mappings (AHCI ABAR, etc.).
- * These cover addresses above the 1 GiB identity-mapped region.
- * We keep a small pool of 8 tables — enough for mapping a handful of
- * MMIO regions without needing the heap or the PMM. */
-#define EXTRA_TABLES    8
 
 static uint32_t page_directory[TABLES_PER_DIR] __attribute__((aligned(4096)));
 static uint32_t page_tables[IDENTITY_TABLES][PAGES_PER_TABLE]
     __attribute__((aligned(4096)));
-static uint32_t extra_tables[EXTRA_TABLES][PAGES_PER_TABLE]
-    __attribute__((aligned(4096)));
-static uint32_t extra_used;   /* how many extra tables have been allocated */
+
 
 
 
@@ -138,6 +132,31 @@ void vmm_init(void)
     paging_enabled = true;
 }
 
+/* Crea una page table propia para `dir_idx` en el page directory `pd_phys`:
+ * pide un frame al PMM, copia las entradas de la page table MAESTRA del
+ * kernel (para heredar el identity-map) y devuelve la dirección virtual de la
+ * nueva tabla.  Devuelve NULL si no hay memoria.
+ *
+ * Antes, vmm_map_page()/vmm_map_page_in() reciclaban un pool estático de 8
+ * tablas EXTRA de 4 KB cada una para TODO el sistema.  Con 32 bps (1366x768)
+ * el framebuffer necesita ~3 de esas tablas y el heap de usuario (SYS_BRK)
+ * otra; dos procesos y regiones MMIO de AHCI/xHCI y el pool se agotaba. */
+static uint32_t *new_page_table_for(uint32_t *pd, uint32_t dir_idx)
+{
+    extern uint32_t pmm_alloc_frame(void);
+    uint32_t pt_phys = pmm_alloc_frame();
+    if (!pt_phys) return NULL;
+
+    uint32_t *pt = (uint32_t *)pt_phys;
+    if (dir_idx < IDENTITY_TABLES) {
+        memcpy(pt, page_tables[dir_idx], PAGES_PER_TABLE * 4);
+    } else {
+        memset(pt, 0, PAGES_PER_TABLE * 4);
+    }
+    pd[dir_idx] = pt_phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+    return pt;
+}
+
 void vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags)
 {
     uint32_t dir_idx = virt >> 22;
@@ -148,18 +167,17 @@ void vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags)
         page_tables[dir_idx][tbl_idx] = (phys & ~0xFFF) | (flags & 0xFFF)
                                         | PAGE_PRESENT;
     } else {
-        /* Higher addresses (e.g. MMIO like AHCI ABAR at 0xFEBxxxxx).
-         * Allocate an extra page table from the static pool if needed. */
+        /* Higher addresses (MMIO like AHCI ABAR at 0xFEBxxxxx, or the VBE
+         * framebuffer at 0xFDxxxxxx).  Pedimos la page table al PMM: antes
+         * se tiraba de un pool estático de 8 tablas que se agotaba con un
+         * framebuffer de 1366x768 + un par de regiones MMIO. */
+        uint32_t *pt;
         if (!(page_directory[dir_idx] & PAGE_PRESENT)) {
-            if (extra_used >= EXTRA_TABLES)
-                return;   /* out of extra tables */
-            memset(extra_tables[extra_used], 0, sizeof(extra_tables[0]));
-            page_directory[dir_idx] = ((uint32_t)extra_tables[extra_used])
-                                      | PAGE_PRESENT | PAGE_RW;
-            extra_used++;
+            pt = new_page_table_for(page_directory, dir_idx);
+            if (!pt) return;              /* out of memory */
+        } else {
+            pt = (uint32_t *)(page_directory[dir_idx] & ~0xFFF);
         }
-        /* Find the page table for this directory entry. */
-        uint32_t *pt = (uint32_t *)(page_directory[dir_idx] & ~0xFFF);
         pt[tbl_idx] = (phys & ~0xFFF) | (flags & 0xFFF) | PAGE_PRESENT;
     }
 
@@ -216,6 +234,62 @@ uint32_t vmm_create_address_space(void) {
     return pd_phys;
 }
 
+/* ============================================================================
+ * vmm_map_page_private_in — mapea `virt -> phys` en una page table PRIVADA
+ * del pd indicado (nunca en la tabla global compartida del kernel).
+ *
+ * Por qué existe: vmm_create_address_space() hace una copia *superficial* del
+ * kernel, así que las entradas del hijo apuntan a las mismas page_tables[]
+ * estáticas.  En el modelo actual (espacio de direcciones único
+ * identity-mapped) eso es justo lo que queremos para exec/brk: phys == virt,
+ * el PTE que se escribe es idéntico al que ya había y el mapeo se ve en
+ * cualquier contexto.  Pero en fork() phys != virt: escribir ahí cambiaba el
+ * PTE de la tabla GLOBAL del kernel, es decir, un solo fork() remapeaba
+ * 0x08048000..0x0F000000 a los frames privados del hijo para TODOS los
+ * procesos (padre incluido) -> corrupción silenciosa de memoria.
+ *
+ * Esta función copia la tabla compartida a un frame propio antes de tocar
+ * el PTE, de modo que el hijo obtiene páginas realmente privadas.
+ * ========================================================================== */
+void vmm_map_page_private_in(uint32_t pd_phys, uint32_t virt,
+                             uint32_t phys, uint32_t flags)
+{
+    extern uint32_t pmm_alloc_frame(void);
+    uint32_t *pd = (uint32_t *)pd_phys;
+    uint32_t dir_idx = virt >> 22;
+    uint32_t tbl_idx = (virt >> 12) & 0x3FF;
+    if (dir_idx >= 1024) return;
+
+    bool shared_with_kernel = (pd[dir_idx] & PAGE_PRESENT) &&
+                              ((pd[dir_idx] & ~0xFFFu) ==
+                               (page_directory[dir_idx] & ~0xFFFu));
+
+    if (!(pd[dir_idx] & PAGE_PRESENT) || shared_with_kernel) {
+        uint32_t pt_phys = pmm_alloc_frame();
+        if (!pt_phys) return;
+        uint32_t *pt = (uint32_t *)pt_phys;
+        if (shared_with_kernel)
+            memcpy(pt, (void *)(pd[dir_idx] & ~0xFFFu), PAGES_PER_TABLE * 4);
+        else
+            memset(pt, 0, PAGES_PER_TABLE * 4);
+        pd[dir_idx] = pt_phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+    }
+
+    uint32_t *pt = (uint32_t *)(pd[dir_idx] & ~0xFFF);
+    pt[tbl_idx] = (phys & ~0xFFF) | (flags & 0xFFF) | PAGE_PRESENT;
+
+    /* Si estamos tocando el pd activo, invalidar la entrada en la TLB. */
+    if (pd_phys == current_page_directory)
+        __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
+}
+
+/* Mapea `virt -> phys` en el pd indicado.  OJO: si la entrada del pd ya
+ * apunta a una page table compartida con el kernel (lo normal, porque
+ * vmm_create_address_space() clona el identity-map), el PTE se escribe en esa
+ * tabla GLOBAL.  Eso es correcto —y deliberado— solo cuando phys == virt
+ * (modelo identity-mapped actual: el mapeo ya era exactamente ese, así que
+ * es idempotente y visible en todos los contextos).  Para mapear un frame
+ * distinto (fork) usar vmm_map_page_private_in(). */
 void vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t flags) {
     extern uint32_t pmm_alloc_frame(void);
     uint32_t* pd = (uint32_t*)pd_phys;
@@ -223,11 +297,14 @@ void vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t fl
     uint32_t tbl_idx = (virt >> 12) & 0x3FF;
 
     if (!(pd[dir_idx] & PAGE_PRESENT)) {
-        uint32_t pt_phys = pmm_alloc_frame();
-        if (!pt_phys) return;
-        uint32_t* pt = (uint32_t*)pt_phys;
-        for (int i = 0; i < 1024; i++) pt[i] = 0;
-        pd[dir_idx] = pt_phys | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+        uint32_t* pt = new_page_table_for(pd, dir_idx);
+        if (!pt) return;
+        /* La tabla nueva se hereda del kernel y conserva su bit U/S, así que
+         * si intentamos mapear una página de USUARIO en una zona marcada
+         * como supervisor-only el acceso desde ring 3 daría page fault más
+         * tarde y de forma difícil de depurar. Lo arreglamos aquí. */
+        if (flags & PAGE_USER)
+            pd[dir_idx] |= PAGE_USER;
     }
 
     uint32_t* pt = (uint32_t*)(pd[dir_idx] & ~0xFFF);
@@ -236,17 +313,50 @@ void vmm_map_page_in(uint32_t pd_phys, uint32_t virt, uint32_t phys, uint32_t fl
 
 void vmm_free_address_space(uint32_t pd_phys) {
     extern void pmm_free_frame(uint32_t);
+    extern bool pmm_is_allocated(uint32_t addr);
+
+    if (!pd_phys || pd_phys == (uint32_t)page_directory) return;
     uint32_t* pd = (uint32_t*)pd_phys;
+
+    /* Liberar SOLO lo que este address space posee de verdad.
+     *
+     * vmm_create_address_space() hace una copia SUPERFICIAL del kernel: las
+     * entradas comparten las page tables globales page_tables[] (memoria
+     * estática del .bss, no frames del PMM).  Por eso:
+     *
+     *   1. Si la entrada apunta a la MISMA page table que el directorio
+     *      maestro, esa tabla y todas sus páginas son del kernel (o del
+     *      identity-map compartido) → no se tocan.
+     *   2. Si la tabla es privada, sus páginas solo se liberan cuando el
+     *      frame está marcado como asignado en el PMM y el mapeo NO es el
+     *      mismo que el del kernel para esa dirección virtual.
+     *
+     * La versión anterior recorría desde IDENTITY_TABLES y liberaba cada
+     * página presente: como en el identity-map TODO está presente, cada
+     * process_exit() devolvía al PMM memoria que nunca le perteneció
+     * (kstack, heap, frames de otros procesos), y el kernel acababa
+     * entregando el mismo frame a dos usuarios. */
     for (int i = IDENTITY_TABLES; i < 1024; i++) {
-        if (pd[i] & PAGE_PRESENT) {
-            uint32_t* pt = (uint32_t*)(pd[i] & ~0xFFF);
-            for (int j = 0; j < 1024; j++) {
-                if (pt[j] & PAGE_PRESENT) {
-                    pmm_free_frame(pt[j] & ~0xFFF);
-                }
-            }
-            pmm_free_frame(pd[i] & ~0xFFF);
+        if (!(pd[i] & PAGE_PRESENT)) continue;
+        if ((pd[i] & ~0xFFFu) == (page_directory[i] & ~0xFFFu)) continue;  /* compartida */
+
+        uint32_t pt_phys = pd[i] & ~0xFFF;
+        if (!pmm_is_allocated(pt_phys)) continue;
+
+        uint32_t* pt = (uint32_t*)pt_phys;
+        for (int j = 0; j < 1024; j++) {
+            if (!(pt[j] & PAGE_PRESENT)) continue;
+            uint32_t frame = pt[j] & ~0xFFF;
+
+            /* ¿El kernel mapea exactamente lo mismo en esta VA? */
+            uint32_t master = page_tables[i][j];
+            if ((master & PAGE_PRESENT) && (master & ~0xFFF) == frame)
+                continue;                              /* página compartida  */
+
+            if (pmm_is_allocated(frame))
+                pmm_free_frame(frame);
         }
+        pmm_free_frame(pt_phys);
     }
     pmm_free_frame(pd_phys);
 }

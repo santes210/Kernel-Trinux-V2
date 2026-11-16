@@ -46,6 +46,7 @@ typedef struct multiboot_mmap_entry {
     uint32_t type;          /* 1 = available */
 } __attribute__((packed)) multiboot_mmap_entry_t;
 
+#define MULTIBOOT_FLAG_CMDLINE 0x004    /* bit 2: cmdline field is valid */
 #define MULTIBOOT_FLAG_MEM  0x001
 #define MULTIBOOT_FLAG_MMAP 0x040
 #define MULTIBOOT_FLAG_VBE  0x800        /* bit 11: vbe_* fields valid */

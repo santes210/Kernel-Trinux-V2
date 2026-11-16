@@ -37,6 +37,11 @@ void vga_capture_begin(char *buf, uint32_t cap)
 
 int vga_capture_active(void) { return capture_buf != NULL; }
 
+/* Acceso de solo lectura al contenido capturado (para SYS_VFS_CAP).
+ * Devuelve NULL si no hay captura activa. */
+const char *vga_capture_data(void) { return capture_buf; }
+uint32_t    vga_capture_len(void)  { return capture_len; }
+
 uint32_t vga_capture_end(void)
 {
     uint32_t n = capture_len;

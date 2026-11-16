@@ -121,10 +121,18 @@ extern void smp_ap_entry(void);
 #define TRAMP_PARAM_GDT    0xF0   /* 6 bytes */
 #define TRAMP_PARAM_ENTRY  0xF6   /* 4 bytes */
 #define TRAMP_PARAM_STACK  0xFA   /* 4 bytes */
-#define TRAMP_PARAM_CR3    0xFE   /* 4 bytes — nota: 0x100 = 256 bytes total */
+#define TRAMP_PARAM_CR3    0xFE   /* 4 bytes: 0xFE..0x101 -> el bloque NO son 256 B */
+/* Tamaño REAL del trampoline: el último parámetro acaba en 0xFE+4 = 0x102, así
+ * que hacen falta 0x102 bytes.  Con `[256]` los 2 últimos bytes del CR3 caían
+ * FUERA del array: `memcpy(tramp + 0xFE, &cr3, 4)` escribía en 0x8100..0x8101,
+ * que es memoria del BIOS/EBDA, no nuestra. */
+#define TRAMP_SIZE         (TRAMP_PARAM_CR3 + 4)
 
 /* Trampoline en real mode (16 bits). Los offsets asumen base 0x8000. */
-static const uint8_t trampoline_code[256] = {
+/* Antes el array declaraba 256 bytes pero inicializaba 265 (nueve ceros de
+ * relleno de más), así que GCC tiraba "excess elements in array initializer" y
+ * los descartaba en silencio. */
+static const uint8_t trampoline_code[TRAMP_SIZE] = {
     /* 0x00: cli */
     0xFA,
     /* 0x01: lgdt [0x8000 + TRAMP_PARAM_GDT]
@@ -158,27 +166,14 @@ static const uint8_t trampoline_code[256] = {
     /* Habilitar paginación (CR0.PG ya estaba en la GDT del BSP): no-op aquí */
     /* Saltar a la función ap_main del kernel: jmp [0x80F6] */
     0xFF, 0x25, 0xF6, 0x80, 0x00, 0x00,   /* jmp dword [0x80F6] */
-    /* Relleno hasta 0xF0 */
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    /* 0xF0: GDT ptr (6 bytes) — se rellena en smp_boot_aps() */
-    0, 0, 0, 0, 0, 0,
-    /* 0xF6: ap_entry (4 bytes) */
-    0, 0, 0, 0,
-    /* 0xFA: stack top (4 bytes) */
-    0, 0, 0, 0,
-    /* 0xFE: cr3 (4 bytes) */
-    0, 0, 0, 0
+    /* Relleno hasta el offset 0xF0 (el código de 32 bits acaba en 0x37).
+     * Se usan inicializadores designados para que la posición de cada hueco
+     * de parámetros NO dependa de contar ceros a mano (era justo el bug:
+     * 9 ceros de más => "excess elements in array initializer"). */
+    [TRAMP_PARAM_GDT + 0 ... TRAMP_PARAM_GDT + 5] = 0,   /* 0xF0: GDT ptr  (6 B) */
+    [TRAMP_PARAM_ENTRY + 0 ... TRAMP_PARAM_ENTRY + 3] = 0, /* 0xF6: ap_entry (4 B) */
+    [TRAMP_PARAM_STACK + 0 ... TRAMP_PARAM_STACK + 3] = 0, /* 0xFA: stack top (4 B) */
+    [TRAMP_PARAM_CR3 + 0 ... TRAMP_PARAM_CR3 + 3] = 0      /* 0xFE: cr3      (4 B) */
 };
 
 /* Entry point C para los APs — llamado desde el trampoline. */
@@ -254,7 +249,7 @@ int smp_boot_aps(void)
         uint32_t stack_top = (uint32_t)ap_stacks[ap_idx] + AP_STACK_SIZE;
 
         /* Copiar trampoline a 0x8000 */
-        memcpy((void *)AP_TRAMPOLINE_ADDR, trampoline_code, 256);
+        memcpy((void *)AP_TRAMPOLINE_ADDR, trampoline_code, TRAMP_SIZE);
 
         /* Rellenar parámetros al final del trampoline */
         uint8_t *tramp = (uint8_t *)AP_TRAMPOLINE_ADDR;

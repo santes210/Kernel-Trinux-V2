@@ -1,0 +1,105 @@
+name: Trinux — Auditoría estática
+
+# Comprobaciones que no necesitan arrancar el kernel y que hasta ahora solo se
+# hacían a mano durante la auditoría:
+#   • los 73 syscalls de user/trinux.h tienen handler en cpu/syscall.c
+#   • los headers con fuentes embebidos (kernel/*_src.h) están sincronizados
+#   • no hay objetos .o / binarios compilados colándose en el repo
+#   • no quedan llamadas implícitas (= prototipos olvidados) en el kernel
+#   • el userland sigue compilando entero (71 programas)
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - 'arena/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: 🔎 Auditoría estática
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📦 Dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-multilib binutils
+          gcc --version | head -1
+
+      # ---------------------------------------------------------------------
+      # 1. Cada SYS_* declarado tiene su `case` en el dispatcher.
+      # ---------------------------------------------------------------------
+      - name: 🔢 Syscalls declarados vs implementados
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          h = open('user/trinux.h').read()
+          c = open('cpu/syscall.c').read()
+          declared = {int(n): name for name, n in
+                      re.findall(r'#define\s+(SYS_\w+)\s+(\d+)', h)}
+          impl = set(re.findall(r'case\s+(SYS_\w+)\s*:', c))
+          missing = [(declared[n], n) for n in sorted(declared)
+                     if declared[n] not in impl]
+          print(f"declarados: {len(declared)}  con handler: {len(declared)-len(missing)}")
+          for name, n in missing:
+              print(f"  ❌ {name} ({n}) sin handler en cpu/syscall.c")
+          sys.exit(1 if missing else 0)
+          PY
+
+      # ---------------------------------------------------------------------
+      # 2. Headers embebidos sincronizados (scripts/gen_embedded.py).
+      # ---------------------------------------------------------------------
+      - name: 🧩 Fuentes embebidos actualizados
+        run: python3 scripts/gen_embedded.py --check
+
+      # ---------------------------------------------------------------------
+      # 3. Nada de artefactos de compilación versionados.
+      # ---------------------------------------------------------------------
+      - name: 🧹 Sin .o / binarios en el repo
+        run: |
+          bad=$(git ls-files '*.o' '*.bin' '*.iso' '*.img' | tr '\n' ' ')
+          if [ -n "$bad" ]; then
+            echo "❌ Artefactos versionados: $bad"
+            exit 1
+          fi
+          echo "✅ limpio"
+
+      # ---------------------------------------------------------------------
+      # 4. El kernel compila SIN llamadas implícitas (un prototipo olvidado
+      #    trunca punteros: pasó con kprintf y con tss_set_kernel_stack).
+      # ---------------------------------------------------------------------
+      - name: 🧠 Sin llamadas implícitas en el kernel
+        run: |
+          set -o pipefail
+          rc=0
+          for f in boot/*.c kernel/*.c drivers/*.c cpu/*.c mm/*.c \
+                   fs/*.c process/*.c shell/*.c auth/*.c lib/*.c user/*.c; do
+            out=$(gcc -m32 -std=gnu11 -ffreestanding -O2 -Wall -Wextra \
+                        -nostdlib -fno-builtin -fno-stack-protector -fno-pic \
+                        -fno-asynchronous-unwind-tables -Iinclude -Ilib \
+                        -c "$f" -o /dev/null 2>&1 || true)
+            if echo "$out" | grep -q 'implicit declaration'; then
+              echo "❌ $f:"
+              echo "$out" | grep 'implicit declaration' | head -3
+              rc=1
+            fi
+          done
+          [ $rc -eq 0 ] && echo "✅ ninguna llamada implícita"
+          exit $rc
+
+      # ---------------------------------------------------------------------
+      # 5. El userland (71 programas ring 3) sigue compilando.
+      # ---------------------------------------------------------------------
+      - name: 👤 Compilar userland (71 programas)
+        run: |
+          cd user/coreutils
+          bash build.sh
+          ls bin | wc -l

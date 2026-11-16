@@ -62,15 +62,15 @@ typedef int            int32_t;
 #define SYS_GETUID    25   /* -> uid del proceso actual                        */
 #define SYS_GETUSER   26   /* ebx=buf, ecx=max  -> length (login name)         */
 #define SYS_RENAME    27   /* ebx=src, ecx=dst  -> 0/-1                        */
-#define SYS_TIME      28   /* -> uptime en ticks (deprec, usar uptime)         */
-#define SYS_PUTPIXEL  29   /* reservado para futuro vbe                        */
+#define SYS_TIME      28   /* -> ticks del PIT desde el boot                   */
+#define SYS_PUTPIXEL  29   /* ebx=x, ecx=y, edx=rgb -> 0/-1 (solo con FB)      */
 #define SYS_CLEAR     30   /* limpia pantalla VGA                              */
 
 /* --- ABI 3.0: shell en ring-3 (fase 2) --- */
 #define SYS_SPAWN     31   /* ebx=path, ecx=argv, edx=flags -> pid o -1        */
 #define SYS_WAITPID   32   /* ebx=pid, ecx=&exit_code -> 0/-1                  */
 #define SYS_SPAWN_R   33   /* ebx=&spawn_req_t -> pid o -1   (con I/O redir)   */
-#define SYS_DUP2_FD   34   /* (placeholder, no usado aún)                      */
+#define SYS_DUP2_FD   34   /* ebx=oldfd, ecx=newfd -> newfd/-1 (archivo o pipe)*/
 #define SYS_FILE_OPEN  35  /* ebx=path, ecx=mode -> fd o -1                    */
 #define SYS_FILE_READ  36  /* ebx=fd, ecx=buf, edx=len -> bytes o -1           */
 #define SYS_FILE_WRITE 37  /* ebx=fd, ecx=buf, edx=len -> bytes o -1           */
@@ -82,7 +82,7 @@ typedef int            int32_t;
 #define SYS_PASSWD     43  /* ebx=&passwd_req_t -> 0/-1                        */
 #define SYS_LISTPROC  44  /* ebx=&plist_req_t -> n procesos                   */
 #define SYS_LOGIN     45  /* ebx=user, ecx=pass -> 0 / -1                     */
-#define SYS_VFS_CAP   46  /* ebx=&out (char**, &len) - dump vga capture       */
+#define SYS_VFS_CAP   46  /* ebx=buf, ecx=&len, edx=cap -> 0 (dump captura)   */
 #define SYS_CHMOD     47  /* ebx=path, ecx=perms -> 0/-1                      */
 #define SYS_CHOWN     48  /* ebx=path, ecx=uid, edx=gid -> 0/-1               */
 #define SYS_MEMINFO   49  /* ebx=&mem_info_t -> 0                              */
@@ -110,6 +110,7 @@ typedef int            int32_t;
 #define SYS_SIGNAL     71  /* ebx=sig, ecx=handler -> old_handler              */
 #define SYS_BRK        72  /* ebx=new_brk -> old_brk (0 on error)              */
 #define SYS_EXECVE     73  /* ebx=path, ecx=argv -> no regresa si éxito, -1/-2/-3/-4/-5 si falla */
+#define SYS_NET_PING   74  /* ebx=ip[4] (a.b.c.d), ecx=timeout_ms -> rtt_ms o -1 */
 
 /* Opciones para waitpid */
 #define WNOHANG        1   /* no bloquear si no hay hijos terminados           */
@@ -297,6 +298,14 @@ static inline int  getpid(void)         { return _syscall0(SYS_GETPID); }
 static inline void msleep(int ms)       { _syscall1(SYS_SLEEP, ms); }
 static inline int  getchar(void)        { return _syscall0(SYS_GETC); }
 static inline uint32_t uptime(void)     { return (uint32_t)_syscall0(SYS_UPTIME); }
+
+/* int ping_(const unsigned char ip[4], int timeout_ms) -> rtt en ms o -1
+ * (sin NIC, sin respuesta o timeout).  El array tiene que estar en memoria
+ * de usuario; el kernel valida el puntero con uaccess_ok(). */
+static inline int ping_(const unsigned char ip[4], int timeout_ms)
+{
+    return _syscall2(SYS_NET_PING, (int)ip, timeout_ms);
+}
 static inline int  getuid(void)         { return _syscall0(SYS_GETUID); }
 static inline int  getuser(char *b, int m){ return _syscall2(SYS_GETUSER,(int)b,m); }
 static inline int  hostname(char *b, int m){return _syscall2(SYS_HOSTNAME,(int)b,m);}
@@ -402,6 +411,14 @@ static inline int smp_info(smp_info_t *out){ return _syscall1(SYS_SMP_INFO, (int
 static inline int fb_info(fb_info_t *out){ return _syscall1(SYS_FB_INFO, (int)out); }
 static inline int pipe_(int fds[2]){ return _syscall1(SYS_PIPE, (int)fds); }
 static inline int pipe_close_(int fd){ return _syscall1(SYS_PIPE_CLOSE, fd); }
+
+/* int dup2_(int oldfd, int newfd)
+ *   Duplica `oldfd` sobre `newfd`. Con esto se puede redirigir stdout de un
+ *   pipe: pipe_(fds); dup2_(fds[1], 1); write(1, ...) -> va al pipe. */
+static inline int dup2_(int oldfd, int newfd)
+{
+    return (int)_syscall3(SYS_DUP2_FD, (uint32_t)oldfd, (uint32_t)newfd, 0);
+}
 
 /* fork/waitpid/getppid (v0.3.1 — fork real) */
 static inline int fork_(void){ return _syscall0(SYS_FORK); }

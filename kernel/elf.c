@@ -19,6 +19,11 @@
  *     (shallow copy), so loading via virtual addresses works in both contexts.
  */
 #include "elf.h"
+
+/* Defined in boot/gdt.c; declared once here instead of locally so every use
+ * in this file sees the real prototype (antes se llamaba en la línea 178 sin
+ * declaración previa: GCC asumía int/void* y tiraba -Wimplicit-function-declaration). */
+extern void tss_set_kernel_stack(uint32_t esp0);
 #include "../fs/vfs.h"
 #include "../mm/kheap.h"
 #include "../mm/vmm.h"
@@ -40,12 +45,10 @@
  * Las VAs estan dentro del identity-map de 1 GiB, asi que el CPU las ve
  * en cualquier momento. La proteccion de aislamiento depende del bit User
  * de las paginas (ya activado en vmm_init para el identity map). */
-#define USER_STACK_SIZE     0x10000   /* 64 KiB por nivel */
-#define USER_STACK_TOP_L0   0x0F000000U
-#define USER_STACK_TOP_L1   0x0EE00000U
-#define USER_STACK_TOP_L2   0x0EC00000U
-#define USER_STACK_TOP_L3   0x0EA00000U   /* por si acaso */
-#define USER_STACK_TOP_FALLBACK 0x0E800000U
+/* Los valores viven en include/userlayout.h (fuente única, compartida con
+ * uaccess.h, vmm.c, fork.c y syscall.c) para que no vuelvan a
+ * desincronizarse. */
+#include "../include/userlayout.h"
 
 /* Rebase del segundo nivel de recursion (cuando un ELF ring-3 hace
  * SPAWN de otro ELF): cargamos al hijo a OFFSET arriba de donde linkeo,
@@ -356,7 +359,6 @@ static int elf_exec_argv_inner(const char *path, vfs_node_t *cwd, int argc, char
                   entry, user_esp);
 
     /* ---- Drop to ring 3 using save/restore mechanism ---- */
-    extern void tss_set_kernel_stack(uint32_t esp0);
     extern int  usermode_save_and_enter(uint32_t entry, uint32_t user_stack,
                                         uint32_t *save_esp);
     extern void elf_arm_exit_jmp(void);

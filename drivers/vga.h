@@ -56,6 +56,8 @@ void vga_printf(const char *fmt, ...);
  * instead of to the screen. Used to implement shell pipes (cmd1 | cmd2). */
 void vga_capture_begin(char *buf, uint32_t cap);
 uint32_t vga_capture_end(void);   /* returns number of bytes captured */
+const char *vga_capture_data(void);  /* buffer capturado (NULL si no hay) */
+uint32_t    vga_capture_len(void);   /* bytes capturados hasta ahora */
 int      vga_capture_active(void);
 
 #endif /* DRIVERS_VGA_H */

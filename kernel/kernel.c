@@ -250,8 +250,29 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
 
     install_builtin_apps();  ok("Built-in apps installed in /bin");
 
+    /* FAT16: solo si hay disco Y el BPB es válido (ver fs/fat16.c) */
     extern void fat16_init(void);
     fat16_init();
+
+    /* ---- Red (v0.6): antes esto NO se llamaba nunca ----
+     * El driver RTL8139 y el stack ARP/IP/ICMP existían pero eran código
+     * muerto: nadie hacía rtl8139_init() ni net_init(), así que `ping` no
+     * existía en la práctica.  La IP se toma de la cmdline del kernel
+     * (trinux.ip=..., trinux.gw=..., trinux.mask=...) o de los valores por
+     * defecto de QEMU user-mode networking. */
+    {
+        extern bool net_init_from_cli(const char *cmdline);
+        const char *cl = "";
+        if (magic == MULTIBOOT_BOOTLOADER_MAGIC) {
+            multiboot_info_t *mbi = (multiboot_info_t *)mb_info_addr;
+            if ((mbi->flags & MULTIBOOT_FLAG_CMDLINE) && mbi->cmdline)
+                cl = (const char *)mbi->cmdline;
+        }
+        if (net_init_from_cli(cl))
+            ok("Network stack (ARP + IPv4 + ICMP) ready");
+        else
+            ok("No network adapter (RTL8139 not present)");
+    }
 
     /* Users (reads /etc/passwd which may now come from disk) */
     users_init();            ok("User accounts (/etc/passwd, /etc/shadow)");

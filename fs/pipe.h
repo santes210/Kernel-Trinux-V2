@@ -49,6 +49,13 @@ int  pipe_write(int fd, const void *buf, uint32_t len);
 /* Cierra un extremo del pipe. Libera el pipe_t si refcount llega a 0. */
 void pipe_close(int fd);
 
+/* dup2() para pipes: mapea `newfd` (0..7) al pipe `oldfd`. */
+int  pipe_dup2(int oldfd, int newfd);
+
+/* Traduce un fd lógico (0..7) al fd de pipe real; si no hay redirección
+ * devuelve el mismo fd.  Úsalo en read()/write() antes de pipe_is_pipe(). */
+int  pipe_low_fd(int fd);
+
 /* Devuelve true si `fd` es un pipe (lectura o escritura). */
 bool pipe_is_pipe(int fd);
 

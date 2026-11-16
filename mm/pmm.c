@@ -59,21 +59,46 @@ void pmm_reserve_region(uint32_t addr, uint32_t len)
     }
 }
 
+/* Devuelve la dirección física de un frame libre, ya **puesto a cero**.
+ *
+ * Zeroear aquí (y no en cada llamante) arregla dos clases de bug:
+ *   - el page directory / las page tables nuevas de vmm_create_address_space()
+ *     se llenaban con basura del frame anterior -> entradas PAGE_PRESENT
+ *     espurias y #PF aleatorios;
+ *   - vmm_copy_region() en fork() podía "copiar" memoria de otro proceso.
+ * El coste es un memset de 4 KiB por asignación, despreciable frente al
+ * resto del camino (y los frames suelen venir ya a cero la primera vez).
+ * Devuelve 0 si no hay memoria (0 nunca es un frame válido: ver pmm_init). */
 uint32_t pmm_alloc_frame(void)
 {
-    for (uint32_t i = 0; i < total_frames; i++) {
+    for (uint32_t i = 1; i < total_frames; i++) {  /* el frame 0 está reservado */
         if (!bitmap_test(i)) {
             bitmap_set(i);
             used_frames++;
-            return i * PMM_FRAME_SIZE;
+            uint32_t addr = i * PMM_FRAME_SIZE;
+            memset((void *)addr, 0, PMM_FRAME_SIZE);
+            return addr;
         }
     }
     return 0;   /* out of memory */
 }
 
+/* ¿Este frame físico está asignado actualmente?  Lo usan vmm_free_address_space()
+ * (para no liberar page tables compartidas del kernel que nunca salieron del
+ * PMM) y el chequeo defensivo de doble liberación. */
+bool pmm_is_allocated(uint32_t addr)
+{
+    uint32_t frame = addr / PMM_FRAME_SIZE;
+    if (frame >= total_frames) return false;
+    return bitmap_test(frame);
+}
+
 void pmm_free_frame(uint32_t addr)
 {
     uint32_t frame = addr / PMM_FRAME_SIZE;
+    /* El frame 0 es el "null" del PMM: nunca se libera ni se entrega. */
+    if (frame == 0) return;
+    if ((addr % PMM_FRAME_SIZE) != 0) return;   /* dirección no alineada */
     if (frame < total_frames && bitmap_test(frame)) {
         bitmap_clear(frame);
         if (used_frames > 0)

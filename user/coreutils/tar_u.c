@@ -235,7 +235,7 @@ static int cmd_tar_extract(const char *filename)
         if (typeflag == '5' || typeflag == 0) {
             /* Directorio */
             if (typeflag == '5') {
-                sys_mkdir_(fullname);
+                mkdir(fullname);
                 print("d "); uprintn(fullname);
             } else {
                 /* Archivo regular */
@@ -267,14 +267,16 @@ int main(int argc, char **argv)
     }
 
     const char *flags = argv[1];
-    bool do_create  = false;
-    bool do_extract = false;
-    bool do_list    = false;
+    /* Sin <stdbool.h> (build freestanding) no existe `bool`: este archivo no
+     * compilaba y por eso `tar` nunca llegaba a /bin. */
+    int do_create  = 0;
+    int do_extract = 0;
+    int do_list    = 0;
 
     for (int i = 0; flags[i]; i++) {
-        if (flags[i] == 'c') do_create  = true;
-        if (flags[i] == 'x') do_extract = true;
-        if (flags[i] == 't') do_list    = true;
+        if (flags[i] == 'c') do_create  = 1;
+        if (flags[i] == 'x') do_extract = 1;
+        if (flags[i] == 't') do_list    = 1;
     }
 
     if (do_create) {

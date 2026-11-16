@@ -25,12 +25,39 @@
 static pipe_t pipes[PIPE_MAX_OPEN];
 static bool   pipe_used[PIPE_MAX_OPEN];
 
+/* Redirección de pipes sobre fds bajos (0/1/2).
+ * `low_fd_map[fd]` = fd de pipe real (>= PIPE_FD_BASE), o -1 si no hay.
+ * Se usa para `cmd | cmd` dentro de un proceso: dup2(pipe_fd, 1) hace que
+ * SYS_FILE_WRITE(1, ...) vaya al pipe en vez de a la VGA. */
+#define LOW_FD_MAX 8
+static int low_fd_map[LOW_FD_MAX];
+
 void pipe_init(void)
 {
     for (int i = 0; i < PIPE_MAX_OPEN; i++) {
         pipe_used[i] = false;
         memset(&pipes[i], 0, sizeof(pipe_t));
     }
+    for (int i = 0; i < LOW_FD_MAX; i++)
+        low_fd_map[i] = -1;
+}
+
+/* dup2() para descriptores de pipe: redirige `newfd` (normalmente 0/1/2)
+ * al pipe `oldfd`.  Devuelve 0 si OK, -1 si no. */
+int pipe_dup2(int oldfd, int newfd)
+{
+    if (newfd < 0 || newfd >= LOW_FD_MAX) return -1;
+    low_fd_map[newfd] = pipe_is_pipe(oldfd) ? oldfd : -1;
+    return 0;
+}
+
+/* Traduce un fd "lógico" al fd de pipe real, o lo devuelve tal cual.
+ * Así read(0)/write(1) funcionan igual con o sin redirección. */
+int pipe_low_fd(int fd)
+{
+    if (fd >= 0 && fd < LOW_FD_MAX && low_fd_map[fd] >= 0)
+        return low_fd_map[fd];
+    return fd;
 }
 
 /* Convierte un fd de pipe a índice en la tabla. */

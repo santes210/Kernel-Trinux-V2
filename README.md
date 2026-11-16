@@ -2141,7 +2141,7 @@ en ring 0.  En ring 3 cada una debe pasar por un syscall.
 #### 3. ~~Solo hay 10 syscalls; faltan ~30~~ (ACTUALIZADO — mayoría ya implementada)
 
 > **Nota de auditoría (2026-07-29)**: esta tabla quedó desactualizada.
-> Hoy Trinux tiene **73 syscalls** (`user/trinux.h`), y casi todo lo
+> Hoy Trinux tiene **74 syscalls** (`user/trinux.h`), y casi todo lo
 > que se listaba aquí como "faltante" ya está en `cpu/syscall.c` desde
 > hace varias fases. Se deja la tabla corregida para que el roadmap no
 > mienta:
@@ -2695,13 +2695,23 @@ Kernel-Trinux-V2/
 - [ ] Modo gráfico VBE (640×480 o mayor)
 - [ ] NVMe (almacenamiento de siguiente generación)
 - [ ] Soporte para más de 256 MiB de RAM
-- [ ] Más comandos: `tar`, `ping`, `wget`, `ssh`...
+- [x] `tar` y `ping`
+- [ ] Más comandos: `wget`, `ssh`, `curl`...
 
 
 ## 📋 Tabla completa de Syscalls
 
-Trinux implementa **10 syscalls** accesibles vía `int 0x80` (DPL=3,
-invocables desde ring 3):
+> **Nota (auditoría v0.5.2 / ronda 2)**: esta tabla solo documenta los 10
+> syscalls originales de la v0.2. La lista **completa y actual** (74 syscalls)
+> está en [`user/trinux.h`](user/trinux.h) y sus handlers en `cpu/syscall.c`.
+> Los 74 tienen handler (comprobado por `.github/workflows/audit.yml`). Lo que
+> sigue es histórico, se conserva por completitud. El detalle de los que se
+> implementaron en la ronda 2 (`TIME`, `PUTPIXEL`, `DUP2_FD`, `VFS_CAP`,
+> `NET_PING`) está en
+> [`AUDITORIA_FUNCIONAL.md` §6.7](AUDITORIA_FUNCIONAL.md).
+
+Trinux implementa **74 syscalls** accesibles vía `int 0x80` (DPL=3,
+invocables desde ring 3). Los 10 primeros:
 
 | # | Nombre | Regs | Args | Descripción |
 |---|---|---|---|---|
@@ -2931,7 +2941,8 @@ git add . && git commit -m "feat: mi feature" && git push origin feature/mi-feat
 
 ### Áreas donde se necesita ayuda
 
-- [ ] Más comandos (`tar`, `ping`, `wget`, `ssh`)
+- [x] `tar`, `ping`
+- [ ] Más comandos (`wget`, `ssh`)
 - [ ] Driver de red (NE2000 / virtio-net)
 - [ ] Modo gráfico VBE (640×480+)
 - [ ] Soporte para más de 256 MiB de RAM

@@ -21,6 +21,7 @@
 #include "../cpu/syscall.h"
 #include "../user/userprog.h"
 #include "../drivers/acpi_ec.h"
+#include "../drivers/net.h"
 #include "../kernel/elf.h"
 #include "tasm.h"
 #include "tcc.h"
@@ -2449,7 +2450,78 @@ static int cmd_battery(int argc, char **argv)
     return 0;
 }
 
+
+/* ---------- red: ifconfig / ping (v0.6) ----------
+ * El stack existía en drivers/net.c pero era inalcanzable desde la shell;
+ * ahora kernel_main() lo arranca y aquí se expone. */
+static int cmd_ifconfig(int argc, char **argv)
+{
+    uint8_t ip[4], gw[4], mask[4], mac[6];
+    if (!net_status(ip, gw, mask, mac)) {
+        kprintf("ifconfig: no network adapter (RTL8139 not present)\n");
+        kprintf("  pista: QEMU lo emula con  -nic user,model=rtl8139\n");
+        return 1;
+    }
+    kprintf("eth0: RTL8139\n");
+    kprintf("  MAC: %x:%x:%x:%x:%x:%x\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    kprintf("  IP:  %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+    kprintf("  GW:  %d.%d.%d.%d\n", gw[0], gw[1], gw[2], gw[3]);
+    kprintf("  MSK: %d.%d.%d.%d\n", mask[0], mask[1], mask[2], mask[3]);
+    kprintf("  RX: %u  TX: %u frames\n", net_rx_frames(), net_tx_frames());
+    return 0;
+}
+
+static int cmd_ping(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("uso: ping <a.b.c.d> [-c count]\n");
+        return 1;
+    }
+    if (!net_ready()) {
+        kprintf("ping: network not initialized\n");
+        return 1;
+    }
+    uint8_t dst[4];
+    if (!parse_ipv4(argv[1], dst)) {
+        kprintf("ping: '%s' no es una IPv4 válida\n", argv[1]);
+        return 1;
+    }
+    int count = 4;
+    for (int i = 2; i + 1 < argc; i++)
+        if (strcmp(argv[i], "-c") == 0)
+            count = atoi(argv[i + 1]);
+
+    kprintf("PING %d.%d.%d.%d: %d paquetes ICMP de 56 bytes\n",
+            dst[0], dst[1], dst[2], dst[3], count);
+
+    int sent = 0, recv = 0;
+    uint32_t best = 0, worst = 0, sum = 0;
+    for (int i = 0; i < count; i++) {
+        sent++;
+        int rtt = net_ping(dst, 1000);
+        if (rtt >= 0) {
+            recv++;
+            uint32_t r = (uint32_t)rtt;
+            sum += r;
+            if (!best || r < best)  best = r;
+            if (r > worst)          worst = r;
+            kprintf("  64 bytes de %d.%d.%d.%d: seq=%d ttl=64 tiempo=%u ms\n",
+                    dst[0], dst[1], dst[2], dst[3], i + 1, r);
+        } else {
+            kprintf("  timeout: seq=%d sin respuesta\n", i + 1);
+        }
+    }
+    kprintf("--- %d.%d.%d.%d estadísticas ---\n", dst[0], dst[1], dst[2], dst[3]);
+    kprintf("%d enviados, %d recibidos, %d%% pérdida\n",
+            sent, recv, sent ? (100 * (sent - recv)) / sent : 0);
+    if (recv)
+        kprintf("rtt min/avg/max = %u/%u/%u ms\n", best, sum / (uint32_t)recv, worst);
+    return recv ? 0 : 1;
+}
+
 static int cmd_help(int argc, char **argv);   /* fwd */
+
 
 /* ---------- command table ---------- */
 
@@ -2526,6 +2598,8 @@ static const command_t table[] = {
     {"asm",      cmd_asm,      "assemble x86 ASM source into ELF binary"},
     {"tcc",      cmd_tcc,      "compile C source into ELF binary"},
     {"battery",  cmd_battery,  "show battery status (laptop only)"},
+    {"ifconfig", cmd_ifconfig, "show IP/MAC/gateway of the RTL8139 NIC"},
+    {"ping",     cmd_ping,     "ICMP echo request (ping <ip> [-c n])"},
     {"help",     cmd_help,     "show this help"},
 };
 

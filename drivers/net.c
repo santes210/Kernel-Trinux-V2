@@ -26,7 +26,8 @@ typedef struct {
 static arp_entry_t arp_table[ARP_TABLE_SIZE];
 
 /* ---- Estado de red ---- */
-static bool    net_ready = false;
+static bool    net_ready_flag = false;
+static uint32_t rx_frames, tx_frames;
 static uint8_t my_ip[4];
 static uint8_t my_mac[6];
 static uint8_t my_gw[4];
@@ -146,7 +147,7 @@ static void arp_send_request(const uint8_t target_ip[4])
     memset(arp->tha, 0, 6);
     memcpy(arp->tpa, target_ip, 4);
 
-    rtl8139_send(frame, 42);
+    { rtl8139_send(frame, 42); tx_frames++; }
 }
 
 static void arp_send_reply(const uint8_t dst_mac[6], const uint8_t dst_ip[4])
@@ -169,7 +170,7 @@ static void arp_send_reply(const uint8_t dst_mac[6], const uint8_t dst_ip[4])
     memcpy(arp->tha, dst_mac, 6);
     memcpy(arp->tpa, dst_ip, 4);
 
-    rtl8139_send(frame, 42);
+    { rtl8139_send(frame, 42); tx_frames++; }
 }
 
 /* ---- ICMP ---- */
@@ -178,6 +179,14 @@ static void icmp_send_reply(const uint8_t dst_mac[6], const uint8_t dst_ip[4],
                             uint16_t id, uint16_t seq,
                             const uint8_t *payload, uint16_t plen)
 {
+    /* El tamaño del payload lo decide el peer que nos envió el echo request,
+     * no nosotros. Hay que recortarlo a lo que cabe en la trama, o un ping
+     * con payload grande desborda `frame` (buffer overflow de pila en
+     * ring 0 = corrupción del kernel). 1500 - 14 (eth) - 20 (ip) - 8 (icmp)
+     * = 1458 bytes de payload como máximo. */
+    if (plen > 1458)
+        plen = 1458;
+
     uint16_t total_ip  = (uint16_t)(20 + 8 + plen);
     uint16_t frame_len = (uint16_t)(14 + total_ip);
     uint8_t  frame[1500];
@@ -211,7 +220,7 @@ static void icmp_send_reply(const uint8_t dst_mac[6], const uint8_t dst_ip[4],
     memcpy(icmp->data, payload, plen);
     icmp->checksum = inet_checksum(icmp, (uint32_t)(8 + plen));
 
-    rtl8139_send(frame, frame_len);
+    { rtl8139_send(frame, frame_len); tx_frames++; }
 }
 
 /* ---- Procesamiento de frames recibidos ---- */
@@ -240,7 +249,14 @@ static void process_frame(const uint8_t *frame, uint16_t len)
 
         if (ip->proto == 1 && len >= 34 + 8) {  /* ICMP */
             const icmp_t *icmp = (const icmp_t *)(frame + 34);
-            uint16_t icmp_len  = (uint16_t)(ntohs(ip->total_len) - 20);
+            /* ip->total_len viene de la red: no se puede restar 20 a ciegas
+             * (si llega < 20 el uint16_t se desborda y luego se copia
+             * basura hasta 65535 bytes). Acotar al frame realmente
+             * recibido, que es lo único que está en memoria. */
+            uint16_t ip_total = ntohs(ip->total_len);
+            if (ip_total < 28 || (uint32_t)ip_total + 14 > len)
+                return;
+            uint16_t icmp_len  = (uint16_t)(ip_total - 20);
 
             if (icmp->type == 8) {  /* Echo Request: responder */
                 uint16_t plen = (icmp_len > 8) ? (uint16_t)(icmp_len - 8) : 0;
@@ -270,7 +286,7 @@ bool net_init(const uint8_t ip[4], const uint8_t gw[4], const uint8_t mask[4])
     rtl8139_mac(my_mac);
     memset(arp_table, 0, sizeof(arp_table));
 
-    net_ready = true;
+    net_ready_flag = true;
     kprintf("  [ OK ] Network: IP %u.%u.%u.%u MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
             ip[0], ip[1], ip[2], ip[3],
             my_mac[0], my_mac[1], my_mac[2],
@@ -280,19 +296,20 @@ bool net_init(const uint8_t ip[4], const uint8_t gw[4], const uint8_t mask[4])
 
 void net_poll(void)
 {
-    if (!net_ready) return;
+    if (!net_ready_flag) return;
     uint8_t buf[1518];
     int n;
     for (int i = 0; i < 8; i++) {  /* procesar hasta 8 frames por llamada */
         n = rtl8139_recv(buf, sizeof(buf));
         if (n <= 0) break;
+        rx_frames++;
         process_frame(buf, (uint16_t)n);
     }
 }
 
 bool net_arp_resolve(const uint8_t ip[4], uint8_t mac_out[6], uint32_t timeout_ms)
 {
-    if (!net_ready) return false;
+    if (!net_ready_flag) return false;
 
     arp_entry_t *e = arp_lookup(ip);
     if (e) { memcpy(mac_out, e->mac, 6); return true; }
@@ -310,7 +327,7 @@ bool net_arp_resolve(const uint8_t ip[4], uint8_t mac_out[6], uint32_t timeout_m
 
 int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
 {
-    if (!net_ready) return -1;
+    if (!net_ready_flag) return -1;
 
     /* Resolver MAC destino (o del gateway si está fuera de la LAN) */
     uint8_t target_ip[4];
@@ -329,7 +346,11 @@ int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
     ping_seq++;
     ping_reply_got = false;
 
-    uint8_t frame[64];
+    /* 14 (eth) + 20 (ip) + 8 (icmp hdr) + 32 (icmp->data) = 74 bytes.
+     * Antes era `uint8_t frame[64]`: struct icmp_t es packed y mide 40
+     * (8 + 32 de data), así que a partir del byte 64 se escribía fuera del
+     * array (stack smash silencioso que GCC avisaba con -Warray-bounds). */
+    uint8_t frame[14 + 20 + sizeof(icmp_t)];
     eth_t  *eth  = (eth_t  *)frame;
     ipv4_t *ip   = (ipv4_t *)(frame + 14);
     icmp_t *icmp = (icmp_t *)(frame + 34);
@@ -340,7 +361,7 @@ int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
 
     ip->ihl_ver    = 0x45;
     ip->dscp       = 0;
-    ip->total_len  = htons(20 + 8 + 32);
+    ip->total_len  = htons(20 + sizeof(icmp_t));
     ip->id         = htons(ping_seq);
     ip->flags_frag = 0;
     ip->ttl        = 64;
@@ -355,11 +376,11 @@ int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
     icmp->checksum = 0;
     icmp->id       = htons(0x5472);   /* "Tr" */
     icmp->seq      = htons(ping_seq);
-    memset(icmp->data, 0xAB, 32);     /* payload de relleno */
-    icmp->checksum = inet_checksum(icmp, 40);
+    memset(icmp->data, 0xAB, sizeof(icmp->data));   /* payload de relleno */
+    icmp->checksum = inet_checksum(icmp, sizeof(icmp_t));
 
     uint32_t t_start = timer_get_ticks();
-    rtl8139_send(frame, 60);
+    { rtl8139_send(frame, (uint16_t)sizeof(frame)); tx_frames++; }
 
     /* Esperar reply */
     uint32_t hz = timer_get_freq();
@@ -374,6 +395,91 @@ int net_ping(const uint8_t dst_ip[4], uint32_t timeout_ms)
         }
     }
     return -1;   /* timeout */
+}
+
+bool net_ready(void) { return net_ready_flag; }
+uint32_t net_rx_frames(void) { return rx_frames; }
+uint32_t net_tx_frames(void) { return tx_frames; }
+
+/* "a.b.c.d" -> out[4]; estricto (0-255, exactamente 4 octetos). */
+bool parse_ipv4(const char *str, uint8_t out[4])
+{
+    if (!str || !out) return false;
+    const char *c = str;
+    for (int n = 0; n < 4; n++) {
+        if (*c < '0' || *c > '9') return false;
+        int val = 0, digits = 0;
+        while (*c >= '0' && *c <= '9') {
+            val = val * 10 + (*c - '0');
+            if (++digits > 3 || val > 255) return false;
+            c++;
+        }
+        out[n] = (uint8_t)val;
+        if (n < 3) { if (*c != '.') return false; c++; }
+    }
+    return *c == '\0';
+}
+
+bool net_status(uint8_t ip[4], uint8_t gw[4], uint8_t mask[4], uint8_t mac[6])
+{
+    if (!net_ready_flag) return false;
+    if (ip)   memcpy(ip,   my_ip,   4);
+    if (gw)   memcpy(gw,   my_gw,   4);
+    if (mask) memcpy(mask, my_mask, 4);
+    if (mac)  rtl8139_mac(mac);
+    return true;
+}
+
+/* ---- parser de cmdline: busca "clave=a.b.c.d" ---- */
+static bool parse_ip_arg(const char *cmdline, const char *key, uint8_t out[4])
+{
+    if (!cmdline || !key) return false;
+    int klen = 0;
+    while (key[klen]) klen++;
+
+    for (const char *p = cmdline; *p; p++) {
+        /* ¿empieza aquí la clave seguida de '=' ? */
+        int i = 0;
+        while (i < klen && p[i] && p[i] == key[i]) i++;
+        if (i != klen || p[i] != '=') continue;
+
+        const char *v = p + klen + 1;
+        int octet[4] = {0, 0, 0, 0};
+        int n = 0;
+        const char *c = v;
+        while (n < 4) {
+            if (*c < '0' || *c > '9') return false;
+            int val = 0;
+            while (*c >= '0' && *c <= '9') { val = val * 10 + (*c - '0'); c++; }
+            if (val > 255) return false;
+            octet[n++] = val;
+            if (n < 4) {
+                if (*c != '.') return false;
+                c++;
+            }
+        }
+        if (*c && *c != ' ') return false;   /* basura detrás */
+        for (int j = 0; j < 4; j++) out[j] = (uint8_t)octet[j];
+        return true;
+    }
+    return false;
+}
+
+bool net_init_from_cli(const char *cmdline)
+{
+    uint8_t ip[4]   = {10, 0, 2, 15};        /* QEMU user-mode networking */
+    uint8_t gw[4]   = {10, 0, 2, 2};
+    uint8_t mask[4] = {255, 255, 255, 0};
+
+    parse_ip_arg(cmdline, "trinux.ip",   ip);
+    parse_ip_arg(cmdline, "trinux.gw",   gw);
+    parse_ip_arg(cmdline, "trinux.mask", mask);
+
+    if (!rtl8139_init()) {
+        kprintf("[net] no RTL8139 NIC found (no networking this session)\n");
+        return false;
+    }
+    return net_init(ip, gw, mask);
 }
 
 void net_get_ip(uint8_t ip[4])  { memcpy(ip, my_ip, 4); }

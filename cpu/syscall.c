@@ -2,9 +2,11 @@
 #include "uaccess.h"
 #include "idt.h"
 #include "../drivers/vga.h"
+#include "../drivers/fb.h"        /* fb_put_pixel (SYS_PUTPIXEL) */
 #include "../drivers/serial.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/timer.h"
+#include "../drivers/net.h"
 #include "ports.h"
 #include "../mm/kheap.h"
 #include "../process/process.h"
@@ -105,10 +107,10 @@ static uint32_t    dh_idx[DH_MAX];   /* índice del siguiente readdir */
  * write en 1/2 -> VGA + serial.  Esos no consumen slot.
  */
 #define FD_MAX 64
-/* Límite superior del heap de userland gestionado por SYS_BRK (v0.5.2):
- * debe quedar por debajo de la región más baja usada como stack de
- * usuario (ver USER_STACK_TOP_* en kernel/elf.c), con margen de sobra. */
-#define BRK_MAX_ADDR 0x0E000000U
+/* Límite superior del heap de userland gestionado por SYS_BRK.
+ * Viene de include/userlayout.h: queda por debajo del stack de usuario más
+ * bajo (USER_STACK_TOP_FALLBACK = 0x0E800000). */
+#define BRK_MAX_ADDR USER_BRK_MAX
 typedef struct {
     vfs_node_t *node;
     uint32_t    pos;
@@ -117,6 +119,50 @@ typedef struct {
     uint32_t    owner_pid;    /* CRITICAL: track which process owns this fd */
 } kfd_t;
 static kfd_t kfds[FD_MAX];
+
+/* Copia del argv de usuario a memoria del kernel mientras el proceso que
+ * llama sigue vivo.
+ *
+ * Por qué existe: SYS_SPAWN/SPAWN_R reciben un `char **` que apunta al stack
+ * de ring 3 del shell. Pero elf_exec_argv() CARGA el ELF hijo en la misma
+ * dirección virtual (0x08048000) y usa una pila de usuario distinta, así que
+ * al leer argv dentro del loader ya estamos leyendo memoria que el hijo
+ * acaba de sobrescribir: el shell crasheaba o el programa recibía argumentos
+ * basura. Aquí se copian en orden: primero los punteros (validados con
+ * uaccess), después cada string, todo a un array estático del kernel.
+ *
+ * Devuelve el argc (0 si no hay argv) y deja los punteros en `out`.
+ * En error devuelve -1 (puntero inválido) o -2 (demasiados argumentos). */
+#define KARGV_MAX 32
+static char  kargv_store[KARGV_MAX][128];
+static char *kargv_ptrs[KARGV_MAX + 1];
+
+/* Devuelve argc (0 si user_argv == NULL), -1 si algún puntero no es de
+ * usuario.  Los argumentos quedan en kargv_ptrs[], listos para pasar a
+ * elf_exec_argv() — que los volverá a copiar al kheap. */
+static int copy_user_argv(char **user_argv)
+{
+    kargv_ptrs[0] = NULL;
+    if (!user_argv) return 0;
+
+    int argc = 0;
+    while (argc < KARGV_MAX) {
+        /* Validar el hueco del puntero ANTES de leerlo. */
+        if (!uaccess_ok((uint8_t *)user_argv + (uint32_t)argc * 4, sizeof(char *)))
+            return -1;
+        char *p;
+        memcpy(&p, (uint8_t *)user_argv + (uint32_t)argc * 4, 4);
+        if (!p) break;
+        int len = uaccess_strnlen(p, sizeof(kargv_store[0]) - 1);
+        if (len < 0) return -1;
+        for (int i = 0; i <= len; i++)
+            kargv_store[argc][i] = p[i];
+        kargv_ptrs[argc] = kargv_store[argc];
+        argc++;
+    }
+    kargv_ptrs[argc] = NULL;
+    return argc;
+}
 
 static int alloc_fd(void) {
     process_t *cur = process_get_current();
@@ -206,8 +252,15 @@ void syscall_handler(registers_t *regs)
         regs->eax = uptime();
         break;
 
+    case SYS_TIME:
+        /* Ticks del PIT desde el boot (100 Hz). Deprecado en favor de
+         * uptime(), pero existía en la tabla sin handler desde la v0.2. */
+        regs->eax = timer_get_ticks();
+        break;
+
     /* ---- io básico ---- */
     case SYS_WRITE: {
+        a1 = (uint32_t)pipe_low_fd((int)a1);
         const char *buf = (const char *)a2;
         uint32_t len = a3;
         /* CAMBIO #2: validar puntero de usuario antes de leer */
@@ -492,6 +545,41 @@ void syscall_handler(registers_t *regs)
     /* ============================================================
      * ABI 3.0  -  shell en ring-3
      * ============================================================ */
+    /* ---- dup2 (v0.6): antes era un placeholder que devolvía -1 ----
+     *
+     * Clona un fd de archivo y, sobre todo, permite REDIRIGIR un extremo de
+     * pipe sobre 0/1/2, que es lo que hacía falta para `cmd | cmd` dentro de
+     * un mismo proceso (el shell lo emulaba capturando la VGA). */
+    case SYS_DUP2_FD: {
+        int oldfd = (int)a1;
+        int newfd = (int)a2;
+        if (oldfd < 0 || newfd < 0 || newfd >= FD_MAX) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        if (oldfd == newfd) { regs->eax = (uint32_t)newfd; break; }
+
+        int src_is_pipe = pipe_is_pipe(oldfd);
+        int src_is_file = (oldfd >= 3 && oldfd < FD_MAX && kfds[oldfd].used);
+        if (!src_is_pipe && !src_is_file) { regs->eax = (uint32_t)-1; break; }
+
+        if (kfds[newfd].used) {
+            kfds[newfd].used = 0;
+            kfds[newfd].node = NULL;
+        }
+        pipe_dup2(oldfd, newfd);
+
+        if (src_is_file) {
+            kfds[newfd].node  = kfds[oldfd].node;
+            kfds[newfd].pos   = kfds[oldfd].pos;
+            kfds[newfd].flags = kfds[oldfd].flags;
+            kfds[newfd].used  = 1;
+            process_t *cur = process_get_current();
+            kfds[newfd].owner_pid = cur ? cur->pid : 0;
+        }
+        regs->eax = (uint32_t)newfd;
+        break;
+    }
+
     case SYS_FILE_OPEN: {
         const char *path = (const char *)a1;
         int flags = (int)a2;
@@ -525,6 +613,7 @@ void syscall_handler(registers_t *regs)
 
     case SYS_FILE_READ: {
         int fd = (int)a1;
+        fd = pipe_low_fd(fd);          /* ¿stdin redirigido a un pipe? */
         if (fd == 0) {
             char *b = (char *)a2;
             int len = (int)a3;
@@ -556,6 +645,7 @@ void syscall_handler(registers_t *regs)
 
     case SYS_FILE_WRITE: {
         int fd = (int)a1;
+        fd = pipe_low_fd(fd);          /* ¿stdout/stderr redirigido a un pipe? */
         const char *buf = (const char *)a2;
         uint32_t len = a3;
         if (len > 0 && !uaccess_ok(buf, len)) { regs->eax = (uint32_t)-14; break; }
@@ -654,9 +744,9 @@ void syscall_handler(registers_t *regs)
         /* Copia local de path por la misma razón que SPAWN_R */
         static char k_path2[128];
         int i=0; while (path[i] && i<127){ k_path2[i]=path[i]; i++; } k_path2[i]=0;
-        int argc = 0;
-        if (argv) while (argv[argc]) argc++;
-        int rc = elf_exec_argv(k_path2, cwd_of_caller(), argc, argv);
+        int argc = copy_user_argv(argv);
+        if (argc < 0) { regs->eax = (uint32_t)-14; break; }
+        int rc = elf_exec_argv(k_path2, cwd_of_caller(), argc, kargv_ptrs);
         regs->eax = (uint32_t)rc;
         break;
     }
@@ -678,8 +768,8 @@ void syscall_handler(registers_t *regs)
         spawn_req_t *r = (spawn_req_t *)a1;
         if (!uaccess_ok(r, sizeof(spawn_req_t))) { regs->eax = (uint32_t)-14; break; }
         if (!r || !r->path) { regs->eax = (uint32_t)-1; break; }
-        int argc = 0;
-        if (r->argv) while (r->argv[argc]) argc++;
+        int argc = copy_user_argv(r->argv);
+        if (argc < 0) { regs->eax = (uint32_t)-14; break; }
 
         /* COPIAMOS los punteros y campos críticos a memoria local del kernel
          * porque la memoria del shell padre se RESPALDA y se restaura
@@ -705,8 +795,10 @@ void syscall_handler(registers_t *regs)
             int i=0; while (src[i] && i<127){ k_inpath[i]=src[i]; i++; } k_inpath[i]=0;
         }
 
-        char **argv_user = r->argv;   /* elf_exec_argv copia argv en kheap
-                                         si g_nest >= 1, así que está OK */
+        /* argv ya está copiado a memoria del kernel por copy_user_argv()
+         * arriba: el ELF hijo se carga en 0x08048000 y machacaría las
+         * strings del shell padre si leyéramos r->argv directamente. */
+        char **argv_user = kargv_ptrs;
 
         /* Stdin redirection: read file into buffer and set keyboard override */
         static uint8_t stdin_buf[4096];
@@ -1071,6 +1163,35 @@ void syscall_handler(registers_t *regs)
         break;
     }
 
+    case SYS_PUTPIXEL: {
+        /* ebx=x, ecx=y, edx=color RGB. En modo texto no hay píxeles: si no
+         * hay framebuffer se devuelve -1 en vez de inventarse algo. */
+        int x = (int)a1, y = (int)a2;
+        uint32_t rgb = a3;
+        if (!display_using_fb()) { regs->eax = (uint32_t)-1; break; }
+        fb_put_pixel(x, y, rgb);
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_VFS_CAP: {
+        /* ebx = buffer de usuario, ecx = &len (uint32_t), edx = capacidad.
+         * Trinidad de la captura de VGA (usada por el shell ring-3 para
+         * `cmd > fichero`): copia lo capturado al buffer del usuario. */
+        char *out = (char *)a1;
+        uint32_t *lenp = (uint32_t *)a2;
+        uint32_t cap = a3;
+        if (!uaccess_ok(out, cap) || !uaccess_ok(lenp, sizeof(uint32_t))) {
+            regs->eax = (uint32_t)-14; break;
+        }
+        uint32_t n = vga_capture_len();
+        if (n > cap) n = cap;
+        if (n) memcpy(out, vga_capture_data(), n);
+        *lenp = n;
+        regs->eax = 0;
+        break;
+    }
+
     case SYS_VGA_CLEAR: {
         extern void vga_clear(void);
         vga_clear();
@@ -1184,6 +1305,22 @@ void syscall_handler(registers_t *regs)
     case SYS_FORK: {
         int child_pid = process_fork();
         regs->eax = (uint32_t)child_pid;
+        break;
+    }
+
+    /* === Red: ICMP echo request desde ring 3 (v0.6) ===
+     * ebx = puntero a uint8_t[4] en memoria de usuario, ecx = timeout_ms.
+     * Devuelve el RTT en ms, o -1 si no hay NIC / no hay respuesta.
+     * Sirve para que /bin/ping (userland) no tenga que hablar con el
+     * driver directamente. */
+    case SYS_NET_PING: {
+        const uint8_t *ip = (const uint8_t *)a1;
+        uint32_t timeout = a2 ? a2 : 1000;
+        if (!uaccess_ok(ip, 4)) { regs->eax = (uint32_t)-1; break; }
+        uint8_t dst[4];
+        dst[0] = ip[0]; dst[1] = ip[1]; dst[2] = ip[2]; dst[3] = ip[3];
+        int rtt = net_ping(dst, timeout);
+        regs->eax = (uint32_t)rtt;
         break;
     }
 

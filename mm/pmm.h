@@ -6,8 +6,9 @@
 #define PMM_FRAME_SIZE 4096
 
 void     pmm_init(uint32_t total_memory_bytes);
-uint32_t pmm_alloc_frame(void);              /* returns physical addr or 0 */
+uint32_t pmm_alloc_frame(void);   /* addr física de un frame YA ZEROEADO, o 0 si no hay memoria */
 void     pmm_free_frame(uint32_t addr);
+bool     pmm_is_allocated(uint32_t addr);     /* ¿frame asignado? */
 uint32_t pmm_get_free_memory(void);          /* bytes */
 uint32_t pmm_get_used_memory(void);          /* bytes */
 uint32_t pmm_get_total_memory(void);         /* bytes */

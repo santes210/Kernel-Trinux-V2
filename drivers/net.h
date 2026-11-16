@@ -25,6 +25,28 @@
  * Devuelve true si hay NIC disponible. */
 bool net_init(const uint8_t ip[4], const uint8_t gw[4], const uint8_t mask[4]);
 
+/* Arranca el stack tomando la configuración de la cmdline del kernel:
+ *   trinux.ip=10.0.2.15  trinux.gw=10.0.2.2  trinux.mask=255.255.255.0
+ * Si no se pasa nada usa 10.0.2.15/24 gw 10.0.2.2 (la red por defecto de
+ * QEMU con `-nic user`), que es lo que hace falta para que `ping` funcione
+ * "out of the box" en la VM.  Devuelve false si no hay NIC.
+ * Se llama desde kernel_main() — antes NADIE llamaba a rtl8139_init() ni a
+ * net_init(), así que el stack de red era código muerto. */
+bool net_init_from_cli(const char *cmdline);
+
+/* Parsea "a.b.c.d" en out[4]. Devuelve false si el formato es inválido. */
+bool parse_ipv4(const char *str, uint8_t out[4]);
+
+/* Contadores de tráfico (para `ifconfig`). */
+uint32_t net_rx_frames(void);
+uint32_t net_tx_frames(void);
+
+/* ¿Hay NIC inicializada? */
+bool net_ready(void);
+
+/* Estado actual (para `ifconfig`). Devuelve false si no hay red. */
+bool net_status(uint8_t ip[4], uint8_t gw[4], uint8_t mask[4], uint8_t mac[6]);
+
 /* Envía un ping ICMP Echo Request a `dst_ip`.
  * Espera la respuesta hasta `timeout_ms` ms.
  * Devuelve el tiempo de ida y vuelta en ms, o -1 si no hubo respuesta. */

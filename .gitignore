@@ -8,19 +8,13 @@
 *.iso
 *.img
 
-# Excepciones: los .o de ASM precompilados están en el repo
-# para compilar sin nasm en entornos de desarrollo local.
-# En CI se usa nasm directamente para compilar todo limpio.
-!boot/boot.o
-!boot/kernel_entry.o
-!boot/gdt_flush.o
-!cpu/idt_flush.o
-!cpu/isr_asm.o
-!cpu/irq_asm.o
-!cpu/syscall_asm.o
-!cpu/elf_jmp.o
-!process/switch.o
-!process/thread_exit.o
+# OJO: NO se versionan .o, ni siquiera los de los .asm.
+# Antes se hacía (con excepciones "!boot/boot.o" etc.) y el resultado era que
+# el repo llevaba 35 objetos binarios que `make` no reconstruía: si tocabas un
+# .asm o un .h, el .o viejo seguía usándose y el kernel salía incoherente
+# (Unicorn/producción VS local). Ahora todo se ensambla en cada build con nasm,
+# que el CI instala.  Si necesitas compilar SIN nasm, genera los objetos en
+# local y no los commitees.
 
 # Directorio temporal de la ISO
 iso/
@@ -37,3 +31,8 @@ disk.img
 # Artefactos de CI
 checksums.txt
 trinux-usb-*.img
+
+# Logs del smoke test (scripts/smoke_test.sh)
+boot.log
+boot-full.log
+boot-serial.log

@@ -73,7 +73,8 @@ jobs:
             mtools \
             dosfstools \
             truncate \
-            file
+            file \
+            qemu-system-x86
           echo "── Versiones instaladas ──"
           gcc --version  | head -1
           nasm --version | head -1
@@ -111,6 +112,23 @@ jobs:
           echo "📏 Tamaño: $((SIZE/1024)) KiB"
           [ "$SIZE" -gt 102400 ] || { echo "❌ Kernel demasiado pequeño"; exit 1; }
           echo "✅ OK"
+
+      - name: 🚀 Smoke test de arranque (QEMU)
+        # Antes solo se medía el tamaño del .bin: un kernel que enlazaba pero
+        # hacía panic al montar el scheduler se publicaba como release bueno.
+        run: bash scripts/smoke_test.sh
+
+      - name: 📤 Subir log de arranque
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log
+          path: |
+            boot.log
+            boot-full.log
+            boot-serial.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: 💿 Generar ISO GRUB (BIOS + UEFI hybrid)
         run: |
