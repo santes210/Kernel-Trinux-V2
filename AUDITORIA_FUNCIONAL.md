@@ -312,10 +312,10 @@ mkdir /root/persist && echo hola > /root/persist/a.txt && sync
 |---|---|---|
 | Boot Multiboot + GDT/TSS | ✅ | Verificado en emulación |
 | IDT/ISR/IRQ/PIC | ✅ | Verificado (IRQ0 entregada y atendida) |
-| Paging + PMM + heap | ✅ / 🔧 | Liberación de address spaces corregida |
-| VFS + ramfs + diskfs | ✅ | Persistencia sin probar en hardware real |
+| Paging + PMM + heap | ✅ / 🔧 | Liberación de address spaces, heap (§10) y detección de RAM por mmap (§11) corregidos |
+| VFS + ramfs + diskfs | ✅ / 🔧 | `vfs_get_path`/`path_*`/`ramfs_write` acotados (§7.5-7.7); escritura sin permisos cerrada (§7.4). Persistencia sin probar en hardware real |
 | FAT16 | ✅ / 🔧 | Valida BPB, geometría y `total_clusters` antes de montar (§6.2) |
-| Procesos + scheduler | ✅ / 🔧 | Contexto de `fork()` corregido; preemption real |
+| Procesos + scheduler | ✅ / 🔧 | Contexto de `fork()` corregido; `longjmp` por nivel (§7.1); `process_init` sin NULL deref (§8.1); preemption real |
 | Ring 3 + 74 syscalls | ✅ / 🔧 | 74/74 con handler (§6.7); falta unificar con el camino setjmp |
 | `fork`/`execve`/`waitpid` | ⚠️ | Sincrónicos, sin COW |
 | Aislamiento de memoria | ❌ | Page tables compartidas |
@@ -323,9 +323,9 @@ mkdir /root/persist && echo hola > /root/persist/a.txt && sync
 | SMP | ⚠️ | APs arrancan y duermen; sin locks |
 | VBE/framebuffer | ⚠️ | Requiere que GRUB dé el modo; pool de tablas corregido |
 | ACPI/batería | ✅ | |
-| TCC/TASM | ✅ | `kprintf` arreglado; compila 72/72 |
+| TCC/TASM | ✅ / 🔧 | `kprintf` arreglado; `patch32`/fixups acotados (§7.9); compila 72/72 |
 | Editor/`cide`/`tar` | ✅ | Añadidos a `build.sh` |
-| CI | ✅ / 🔧 | Compila + **arranca en QEMU** (`scripts/smoke_test.sh`) + auditoría estática (§6.8) |
+| CI | ✅ / 🔧 | Compila + **arranca en QEMU** (`scripts/smoke_test.sh`) + auditoría estática + `-fanalyzer` + regresiones (§6.8, §8.4) |
 
 ### Lo que le faltaba al CI — ✅ resuelto en la ronda 2
 
