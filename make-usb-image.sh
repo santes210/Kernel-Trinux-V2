@@ -298,6 +298,18 @@ TARGET_BYTES=$((SIZE_MB * 1024 * 1024))
 if [ "$TARGET_BYTES" -gt "$CUR_BYTES" ]; then
     info "Extendiendo a ${SIZE_MB} MiB (zona de persistencia al final)..."
     truncate -s "${SIZE_MB}M" "$OUT"
+    # OJO: al crecer la imagen, la GPT de RESPALDO se queda donde estaba el
+    # final del ISO. QEMU/OVMF lo tolera, pero algunos firmwares UEFI reales
+    # (y Windows al insertar el USB) lo detectan como tabla danada.
+    # `sgdisk -e` la mueve al final nuevo. Es opcional: si no esta, avisamos.
+    if command -v sgdisk >/dev/null 2>&1; then
+        sgdisk -e "$OUT" >/dev/null 2>&1 \
+            && info "  GPT de respaldo reubicada al final (sgdisk -e)" \
+            || warn "  sgdisk -e fallo; la GPT de respaldo queda descolocada"
+    else
+        warn "sgdisk no instalado: la GPT de respaldo queda descolocada."
+        warn "  Inofensivo en QEMU; instala gdisk para dejarla correcta."
+    fi
 elif [ "$TARGET_BYTES" -lt "$CUR_BYTES" ]; then
     warn "la imagen base ya ocupa $((CUR_BYTES/1024/1024)) MiB; no se recorta a ${SIZE_MB}"
     SIZE_MB=$(( (CUR_BYTES + 1024*1024 - 1) / 1024 / 1024 ))

@@ -133,9 +133,14 @@ run-usb:
 # Version UEFI (necesita OVMF instalado: apt install ovmf)
 run-usb-uefi:
 	@[ -f mykernel-usb.img ] || { echo "falta mykernel-usb.img; ejecuta 'make usb'"; exit 1; }
-	@OVMF=$$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd \
-	              /usr/share/edk2/ovmf/OVMF_CODE.fd 2>/dev/null | head -1); \
-	 [ -n "$$OVMF" ] || { echo "OVMF no encontrado: apt install ovmf"; exit 1; }; \
+# OVMF cambia de nombre y de carpeta segun la distro. Ubuntu/Debian en
+# mayusculas (/usr/share/OVMF/), Fedora/Arch en minusculas (/usr/share/ovmf/,
+# /usr/share/edk2/). Se prueban todas antes de rendirse.
+	@OVMF=$$(ls /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF_CODE.fd \
+	              /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.fd \
+	              /usr/share/OVMF/OVMF.fd /usr/share/ovmf/OVMF.fd 2>/dev/null | head -1); \
+	 [ -n "$$OVMF" ] || { echo "OVMF no encontrado: apt install ovmf (o edk2-ovmf)"; exit 1; }; \
+	 echo "OVMF: $$OVMF"; \
 	 $(QEMU_SYS64) -nographic -bios "$$OVMF" \
 		-drive file=mykernel-usb.img,format=raw,if=ide -m 512M
 
