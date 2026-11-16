@@ -174,11 +174,24 @@ menuentry "Trinux — Shell ring-0 (debug)" {
   boot
 }
 
-menuentry "Trinux — Diagnostico (lista dispositivos)" {
-  echo "root=$root"
+# Esta entrada NO toca `multiboot`. Sirve para separar dos fallos que se ven
+# igual desde fuera (pantalla negra / texto clavado):
+#   - si ESTA entrada dibuja el menu y responde, GRUB esta sano y el problema
+#     es del kernel o del handoff Multiboot;
+#   - si ni siquiera aqui hay menu, el roto es GRUB/carga del ISO.
+menuentry "Trinux — Diagnostico de GRUB (no arranca el kernel)" {
+  echo "Trinux: GRUB ha cargado y ejecuta este menu."
+  echo "  root   = $root"
+  echo "  prefix = $prefix"
+  echo "--- dispositivos (ls) ---"
   ls
+  echo "--- contenido de /boot ---"
   ls /boot
-  sleep 30
+  echo "--- cabecera del kernel (cat, 64 bytes) ---"
+  cat /boot/__KERNEL__
+  echo ""
+  echo "Si ves esto, GRUB funciona. Pulsa Enter para volver."
+  sleep 60
 }
 GRUBEOF
 
