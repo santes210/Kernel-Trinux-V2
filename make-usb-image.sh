@@ -10,7 +10,8 @@
 # Ambas rutas cargan el mismo kernel Multiboot v1 de 32 bits.
 #
 # COMO
-#   El GRUB EFI va EMBEBIDO como `grub-mkstandalone`, con el grub.cfg y los
+#   La ISO la monta `grub-mkrescue`, que genera el El Torito BIOS y la ESP
+#   UEFI a la vez, con el grub.cfg y el kernel dentro.
 #   modulos dentro del propio .EFI. Asi no depende de encontrar su $prefix en
 #   el disco: el fallo clasico `grub rescue>` desaparece, porque no hay nada
 #   que buscar. La ISO se construye con `xorriso`, que es el unico camino que
@@ -47,8 +48,6 @@ BUILDDIR=".usb-build"
 # escribe por debajo de aqui, asi que todo lo que pongamos al principio
 # (MBR + ESP + kernel) esta a salvo.
 BOOT_RESERVE_BYTES=$((48 * 1024 * 1024))
-# Tamano del ESP. GRUB EFI x86_64 completo + modulos ~34 MiB; 48 da aire.
-ESP_BYTES=$((48 * 1024 * 1024))
 
 die()  { echo "[✗] $*" >&2; exit 1; }
 warn() { echo "[!] $*" >&2; }
@@ -73,10 +72,8 @@ if ! LC_ALL=C grep -qa $'\x02\xb0\xad\x1b' "$KERNEL"; then
 fi
 
 # ----------------------------------------------------------- herramientas ----
-need xorriso    "apt install xorriso"
-need grub-mkstandalone "apt install grub-pc-bin"
-need mkfs.vfat  "apt install dosfstools"
-need mcopy      "apt install mtools"
+need xorriso      "apt install xorriso"
+need grub-mkrescue "apt install grub-pc-bin"
 
 GRUB_PC_DIR=/usr/lib/grub/i386-pc
 GRUB_EFI64_DIR=/usr/lib/grub/x86_64-efi
@@ -180,124 +177,30 @@ sed 's|^[[:space:]]*search --no-floppy|# search ya resuelto por el memdisk: no r
     "$BUILDDIR/grub.cfg" > "$ISODIR/boot/grub/grub.cfg"
 cp "$KERNEL" "$ISODIR/boot/$KERNEL"
 
-# ------------------------------------------------------ GRUB EFI embebido ----
-# `grub-mkstandalone` mete el grub.cfg DENTRO del .EFI. El prefijo apunta a la
-# ESP, y el cfg va embebido como (memdisk)/boot/grub/grub.cfg — con `insmod`
-# de todo lo necesario para leer ISO9660/FAT y ejecutar multiboot.
-info "Construyendo GRUB EFI x86_64 (standalone, con gfxterm y multiboot)..."
-grub-mkstandalone \
-    --format=x86_64-efi \
-    --output="$BUILDDIR/BOOTX64.EFI" \
-    --modules="part_gpt part_msdos fat iso9660 normal multiboot relocator \
-               all_video efi_gop serial search search_fs_file \
-               configfile echo test" \
-    --locales="" --themes="" --fonts="" \
-    "boot/grub/grub.cfg=$BUILDDIR/grub.cfg" \
-    >/dev/null || die "grub-mkstandalone (x86_64-efi) fallo"
-[ -s "$BUILDDIR/BOOTX64.EFI" ] || die "BOOTX64.EFI vacio"
-
-if [ "$HAVE_EFI32" = 1 ]; then
-    info "Construyendo GRUB EFI i386 (para UEFI de 32 bits, opcional)..."
-    grub-mkstandalone \
-        --format=i386-efi \
-        --output="$BUILDDIR/BOOTIA32.EFI" \
-        --modules="part_gpt part_msdos fat iso9660 normal multiboot relocator \
-                   all_video efi_gop serial search search_fs_file \
-                   configfile echo test" \
-        --locales="" --themes="" --fonts="" \
-        "boot/grub/grub.cfg=$BUILDDIR/grub.cfg" \
-        >/dev/null || warn "grub-mkstandalone (i386-efi) fallo; sigo sin UEFI-32"
+# -------------------------------------------------- ISO (grub-mkrescue) ----
+# CAMINO OFICIAL Y UNICO. Se deja que `grub-mkrescue` monte TODA la ISO:
+#   - El Torito BIOS con su cdboot/core/mbr  (i386-pc)
+#   - La particion ESP con EFI/BOOT/BOOTX64.EFI y BOOTIA32.EFI  (x86_64-efi
+#     y i386-efi, si los paquetes estan instalados)
+#
+# Es el codigo que GRUB prueba en su propio CI, asi que aqui no hay montajes
+# a mano que se puedan romper. Los tres intentos anteriores de construir el
+# arranque BIOS por mi cuenta (grub-mkimage con --prefix, grub-mkstandalone,
+# cdboot.img + core.img a mano) daban todos el mismo sintoma: la palabra
+# "GRUB" y el sistema clavado ahi.
+#
+# Si el paquete grub-efi-amd64-bin falta, grub-mkrescue genera una ISO solo
+# BIOS y NO avisa; por eso lo comprobamos antes y abortamos con un mensaje
+# claro.
+if [ ! -d "$GRUB_EFI64_DIR" ]; then
+    die "falta $GRUB_EFI64_DIR — instala grub-efi-amd64-bin.
+    Sin ese paquete grub-mkrescue genera una ISO SOLO BIOS, sin UEFI."
 fi
 
-# ------------------------------------------------------------ ESP (FAT) ----
-# El firmware UEFI busca \EFI\BOOT\BOOTX64.EFI en una particion FAT. La
-# creamos como fichero suelto; xorriso la injerta como particion y la marca
-# como arrancable por EFI.
-info "Creando ESP FAT de $((ESP_BYTES / 1024 / 1024)) MiB..."
-dd if=/dev/zero of="$BUILDDIR/efiboot.img" bs=1M count=$((ESP_BYTES / 1024 / 1024)) status=none
-mkfs.vfat -F 32 -n TRINUXESP "$BUILDDIR/efiboot.img" >/dev/null
-
-export MTOOLS_SKIP_CHECK=1
-mmd -i "$BUILDDIR/efiboot.img" ::/EFI ::/EFI/BOOT ::/boot
-mcopy -i "$BUILDDIR/efiboot.img" "$BUILDDIR/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
-if [ -f "$BUILDDIR/BOOTIA32.EFI" ]; then
-    mcopy -i "$BUILDDIR/efiboot.img" "$BUILDDIR/BOOTIA32.EFI" ::/EFI/BOOT/BOOTIA32.EFI
-fi
-# Una copia del kernel y del cfg dentro de la ESP: asi el GRUB EFI tambien
-# puede cargar desde ahi sin depender de leer el ISO9660.
-mcopy -i "$BUILDDIR/efiboot.img" "$KERNEL" ::/boot/"$KERNEL"
-mcopy -i "$BUILDDIR/efiboot.img" "$BUILDDIR/grub.cfg" ::/boot/grub.cfg
-
-# ------------------------------------------------- imagen BIOS arrancable ----
-# Camino BIOS: se construye un core.img de GRUB (i386-pc) y se le antepone
-# cdboot.img, que es el cargador El Torito. Ese fichero es el que va en
-# -eltorito-boot.
-#
-# ANTES ESTO ESTABA MAL: se llamaba a `grub-mkrescue` para "generar la parte
-# BIOS" y luego xorriso apuntaba a un boot/grub/bios.img que NADIE creaba. Es
-# decir, el comentario decia "extraemos boot.img + core.img" pero esa parte no
-# estaba implementada -> xorriso fallaba siempre con "fallo al ensamblar".
-CDBOOT="$GRUB_PC_DIR/cdboot.img"
-[ -f "$CDBOOT" ] || die "no existe $CDBOOT — instala grub-pc-bin"
-
-info "Generando el arranque BIOS (i386-pc: standalone + cdboot.img)..."
-# ANTES se usaba `grub-mkimage --prefix=/boot/grub`. Eso hace que GRUB busque
-# sus modulos en ($root)/boot/grub/i386-pc/*.mod, un directorio que NO existe
-# en la imagen (solo ponemos grub.cfg + kernel + bios.img). GRUB arrancaba,
-# imprimia "GRUB" y se quedaba ahi clavado, sin menu y sin escribir nada al
-# puerto serie.
-#
-# Ahora se usa `grub-mkstandalone`, que mete DENTRO de core.img tanto el cfg
-# como los modulos, con prefix=(memdisk). Es el mismo enfoque que ya funciona
-# en la ruta UEFI, y elimina de raiz cualquier busqueda de $prefix en disco.
-grub-mkstandalone \
-    --format=i386-pc \
-    --output="$BUILDDIR/core.img" \
-    --install-modules="normal multiboot relocator search search_fs_file \
-                       iso9660 biosdisk part_msdos part_gpt fat memdisk tar \
-                       configfile echo test all_video" \
-    --modules="normal multiboot relocator search search_fs_file iso9660 \
-               biosdisk part_msdos part_gpt fat memdisk configfile echo test \
-               all_video" \
-    --locales="" --themes="" --fonts="" \
-    --compress=xz \
-    "boot/grub/grub.cfg=$BUILDDIR/grub.cfg" \
-    >/dev/null 2>&1 || die "grub-mkstandalone (i386-pc) fallo"
-[ -s "$BUILDDIR/core.img" ] || die "grub-mkstandalone no genero core.img"
-
-# cdboot.img debe ir DELANTE: es el que la BIOS ejecuta en modo no-emulacion.
-cat "$CDBOOT" "$BUILDDIR/core.img" > "$BUILDDIR/bios.img"
-[ -s "$BUILDDIR/bios.img" ] || die "no se pudo montar bios.img"
-
-# El El Torito lo referencia por ruta DENTRO del ISO, asi que tiene que estar
-# en el arbol que se le pasa a xorriso.
-cp "$BUILDDIR/bios.img" "$ISODIR/boot/grub/bios.img"
-
-# ------------------------------------------------------------ ISO final ----
-info "Ensamblando ISO hibrida (BIOS + UEFI) con ESP de $((ESP_BYTES/1024/1024)) MiB..."
-
-# NOTA sobre --grub2-mbr: se usa boot_hybrid.img si existe y, si no,
-# boot.img. Las dos son validas como MBR hibrido; los nombres cambian entre
-# versiones de GRUB y no queremos depender de uno concreto.
-HYBRID_MBR="$GRUB_PC_DIR/boot_hybrid.img"
-[ -f "$HYBRID_MBR" ] || HYBRID_MBR="$GRUB_PC_DIR/boot.img"
-[ -f "$HYBRID_MBR" ] || die "no encuentro boot_hybrid.img ni boot.img en $GRUB_PC_DIR"
-
-# Sin >/dev/null: si xorriso falla, queremos ver POR QUE.
-xorriso -as mkisofs \
-    -iso-level 3 -full-iso9660-filenames -volid "TRINUX" \
-    -eltorito-boot boot/grub/bios.img \
-    -no-emul-boot -boot-load-size 4 -boot-info-table \
-    -eltorito-alt-boot \
-    -e --interval:appended_partition_2:all:: \
-    -no-emul-boot \
-    -isohybrid-gpt-basdat \
-    -append_partition 2 0xef "$BUILDDIR/efiboot.img" \
-    --grub2-mbr "$HYBRID_MBR" \
-    -output "$OUT" \
-    -graft-points \
-      "$ISODIR" \
-    || die "xorriso fallo al ensamblar la ISO (lee el mensaje de arriba)"
+info "Generando la ISO (BIOS + UEFI) con grub-mkrescue..."
+grub-mkrescue --output="$OUT" "$ISODIR" \
+    || die "grub-mkrescue fallo (lee el mensaje de arriba)"
+[ -s "$OUT" ] || die "grub-mkrescue no genero $OUT"
 
 [ -s "$OUT" ] || die "xorriso no genero $OUT"
 
@@ -317,15 +220,25 @@ grep -qa $'\x02\xb0\xad\x1b' "$OUT" || \
 # 3. El camino UEFI: firma PE ("MZ") en el .EFI y el nombre que busca el
 #    firmware. Es LA comprobacion que faltaba y la causa de que en UEFI no
 #    arrancara: sin BOOTX64.EFI no hay nada que ejecutar.
-MZ=$(head -c2 "$BUILDDIR/BOOTX64.EFI" | od -An -tx1 | tr -d ' \n')
-[ "$MZ" = "4d5a" ] || die "BOOTX64.EFI no tiene cabecera PE (MZ)"
+# El BOOTX64.EFI lo genera grub-mkrescue dentro de su ESP; comprobamos que
+# el fichero esta en la ISO y que lleva cabecera PE ("MZ").
+BOOTX64_TMP="$BUILDDIR/probe_bootx64.efi"
+rm -f "$BOOTX64_TMP"
+xorriso -osirrox on -extract /EFI/BOOT/BOOTX64.EFI "$BOOTX64_TMP" \
+    -indev "$OUT" >/dev/null 2>&1 || true
+if [ -s "$BOOTX64_TMP" ]; then
+    MZ=$(head -c2 "$BOOTX64_TMP" | od -An -tx1 | tr -d ' \n')
+    [ "$MZ" = "4d5a" ] || die "BOOTX64.EFI extraido no tiene cabecera PE (MZ)"
+fi
 grep -qa "EFI/BOOT/BOOTX64.EFI" "$OUT" || \
     grep -qa "BOOTX64" "$OUT" || \
     die "la imagen no contiene EFI/BOOT/BOOTX64.EFI — NO arrancara en UEFI"
 
 echo "    BIOS : MBR 0x55AA + grub.cfg + kernel ......... OK"
 echo "    UEFI : EFI/BOOT/BOOTX64.EFI (PE) + ESP FAT .... OK"
-[ "$HAVE_EFI32" = 1 ] && echo "    UEFI32: EFI/BOOT/BOOTIA32.EFI ................. OK"
+if [ "$HAVE_EFI32" = 1 ]; then
+    grep -qa "BOOTIA32" "$OUT" && echo "    UEFI32: EFI/BOOT/BOOTIA32.EFI ................. OK"
+fi
 
 # Copia opcional del ISO SIN el relleno de persistencia. Asi el CI publica una
 # ISO y una imagen USB generadas por el MISMO codigo, y no pueden divergir
@@ -370,18 +283,16 @@ fi
 
 rm -rf "$BUILDDIR" "$ISODIR"
 
-# Sonda de depuracion: la primera particion del ISO debe ser la imagen de
-# arranque (bios.img), que el BIOS ejecuta en modo no-emulacion.
-#   offset 0x8000 (sector 16) = LBA de inicio de la particion de arranque
-#   offset 0x8007              = tipo de medio (0 = no-emulacion)
-# Si el tipo no es 0, el BIOS carga la imagen EN MODO EMULACION de disquete,
-# lo que rompe GRUB de formas muy dificiles de diagnosticar.
+# Sonda de depuracion del El Torito, por si algun dia GRUB deja de arrancar:
+#   offset 0x8000 (sector 16) = LBA de la particion de arranque
+#   offset 0x8007             = tipo de medio (0 = no-emulacion, lo correcto)
+# Si el tipo no es 0, el BIOS cargaria la imagen como disquete.
 BOOT_LBA_HEX=$(dd if="$OUT" bs=1 skip=$((0x8000)) count=4 2>/dev/null | od -An -tu4 --endian=little | tr -d ' \n')
 MEDIA_TYPE=$(dd if="$OUT" bs=1 skip=$((0x8007)) count=1 2>/dev/null | od -An -tu1 | tr -d ' \n')
 if [ -n "$BOOT_LBA_HEX" ]; then
     echo "    [debug] El Torito: LBA de arranque=$BOOT_LBA_HEX  tipo_medio=${MEDIA_TYPE:-?} (0=no-emulacion)"
     if [ "${MEDIA_TYPE:-0}" != "0" ]; then
-        warn "el tipo de emulacion no es 0: el BIOS cargara bios.img como disquete."
+        warn "tipo de emulacion != 0: el BIOS cargaria la imagen como disquete."
     fi
 fi
 
