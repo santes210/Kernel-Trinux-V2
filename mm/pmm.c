@@ -49,6 +49,17 @@ void pmm_init(uint32_t total_memory_bytes)
 
 void pmm_reserve_region(uint32_t addr, uint32_t len)
 {
+    /* `addr + len + 4095` desborda con addr/len altos (p.ej. reservar la
+     * región del framebuffer si GRUB la coloca cerca de 4 GiB, o una
+     * llamada con len = 0xFFFFFFFF): `end` daba la vuelta a un valor
+     * pequeño y la región NO se reservaba, dejando el PMM entregando frames
+     * que pertenecen a otra cosa. Se acota explícitamente a 4 GiB. */
+    if (len == 0) return;
+    if (addr >= 0xFFFFF000u || len > 0xFFFFF000u - addr) {
+        /* Cubre hasta el final del espacio físico. */
+        len = 0xFFFFF000u - (addr & ~0xFFFu);
+        if (len == 0) len = PMM_FRAME_SIZE;
+    }
     uint32_t start = addr / PMM_FRAME_SIZE;
     uint32_t end   = (addr + len + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE;
     for (uint32_t f = start; f < end && f < total_frames; f++) {

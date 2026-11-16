@@ -120,14 +120,65 @@ static bool cmdline_has(const char *cmdline, const char *word)
     return false;
 }
 
+/* Devuelve la RAM utilizable **contigua desde la dirección 0**, que es lo que
+ * asume pmm_init() (su bitmap indexa frames desde 0).
+ *
+ * Antes se usaba `mem_upper * 1024 + 1 MiB`, que es "toda la RAM por encima
+ * de 1 MiB" ignorando los huecos del mapa de memoria. En hardware real esos
+ * huecos existen (el clásico 0xA0000-0xFFFFF del VGA/BIOS, el 0xFEE00000 del
+ * LAPIC, MMIO de PCI por debajo de 4 GiB...), así que el PMM acababa marcando
+ * como libres frames que no son RAM: la primera asignación ahí y el kernel
+ * escribe en un agujero. En QEMU con -m 512M casi todo es contiguo y no se
+ * nota, pero en un portátil sí.
+ *
+ * Con mmap disponible se recorre y se corta en el primer hueco; si no, se
+ * cae al comportamiento anterior (mem_upper), que sigue sirviendo para
+ * QEMU/GRUB. */
 static uint32_t detect_memory(uint32_t magic, uint32_t mb_addr)
 {
     if (magic != MULTIBOOT_BOOTLOADER_MAGIC)
         return 16 * 1024 * 1024;   /* fallback 16 MiB */
 
     multiboot_info_t *mbi = (multiboot_info_t *)mb_addr;
+
+    if ((mbi->flags & MULTIBOOT_FLAG_MMAP) && mbi->mmap_length) {
+        /* Recorremos los tramos en orden y nos quedamos con el final del
+         * tramo que CONTIENE la dirección 1 MiB, que es donde empieza el
+         * kernel y, por tanto, lo que pmm_init() va a poder usar.
+         *
+         * Ojo con dos tentaciones que rompen esto:
+         *   - "cortar en el primer hueco" no sirve: TODOS los mapas reales
+         *     tienen un hueco en 0x9FC00..0x100000 (EBDA/VGA), así que
+         *     devolvería 640 KiB y el PMM se quedaría sin memoria.
+         *   - `mem_upper` (lo que se usaba antes) sí acierta en tamaño,
+         *     pero ignora los huecos de MMIO PCI por encima de ~3 GiB, que
+         *     es donde el PMM acababa entregando frames que no son RAM. */
+        uint8_t  *p   = (uint8_t *)mbi->mmap_addr;
+        uint8_t  *end = p + mbi->mmap_length;
+        uint32_t usable_end = 0;
+
+        while (p + sizeof(multiboot_mmap_entry_t) <= end) {
+            multiboot_mmap_entry_t *e = (multiboot_mmap_entry_t *)p;
+            uint64_t inicio = e->addr;
+            uint64_t fin    = e->addr + e->len;
+            if (fin > 0xFFFFFFFFull)
+                fin = 0xFFFFFFFFull;   /* el PMM es de 32 bits */
+
+            if (e->type == MULTIBOOT_MEMORY_AVAILABLE &&
+                inicio <= 0x100000ull && fin > 0x100000ull) {
+                usable_end = (uint32_t)fin;
+                break;
+            }
+            /* `size` no incluye el propio campo size (spec Multiboot 1). */
+            p += e->size + 4u;
+        }
+
+        if (usable_end > 2 * 1024 * 1024)
+            return usable_end;
+    }
+
     if (mbi->flags & MULTIBOOT_FLAG_MEM) {
-        /* mem_upper is KiB above 1 MiB */
+        /* mem_upper es KiB por encima de 1 MiB */
         return (mbi->mem_upper * 1024) + (1024 * 1024);
     }
     return 16 * 1024 * 1024;

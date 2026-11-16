@@ -723,3 +723,37 @@ kernel:    51 .c → 0 errores, 0 implícitas, 0 warnings en kheap.c
 link:      OK
 arranque:  21 × [ OK ], sin panic, hasta "launching /bin/sh in RING 3"
 ```
+
+## 11. Ronda 3e — el PMM reservaba RAM que no existe (hardware real)
+
+`detect_memory()` decidía cuánta memoria tiene la máquina con
+`mem_upper * 1024 + 1 MiB`, es decir **"toda la RAM por encima de 1 MiB"**,
+ignorando el mapa de memoria (`mmap`) que Multiboot ya entrega.
+
+`pmm_init()` indexa su bitmap como "frames contiguos desde la dirección 0",
+así que esa cifra se interpreta como *memoria contigua utilizable*. En QEMU
+(con `-m 512M` casi todo es contiguo) da igual. En un portátil real no: los
+huecos de MMIO de PCI están en ~3–4 GiB, y el PMM acababa marcando como
+libres frames del hueco. La primera asignación que cayera ahí escribía en un
+agujero del mapa, no en RAM.
+
+Arreglo: si hay `mmap`, se busca el tramo **disponible que contiene 0x100000**
+(donde empieza el kernel) y se usa su final; si no, se mantiene `mem_upper`.
+
+Medido con mapas simulados:
+
+| Mapa | Antes (`mem_upper`) | Ahora (mmap) |
+|---|---|---|
+| QEMU `-m 512M` | 512 MiB | 512 MiB |
+| Portátil 4 GiB (hueco PCI 3–4 GiB) | **4096 MiB** ❌ | 3071 MiB ✅ |
+| Máquina pequeña 64 MiB | **64 MiB** ❌ | 49 MiB ✅ |
+
+**Ojo con el arreglo "obvio"**: cortar en el primer hueco del mapa no vale,
+porque *todos* los mapas reales tienen un hueco en `0x9FC00..0x100000`
+(EBDA/VGA). Lo escribí así primero y el resultado eran 640 KiB — el kernel se
+quedaba sin memoria. Se ve en la traza que hice antes de dar con la versión
+buena; el comentario del código lo explica para que no se repita.
+
+También se acotó `pmm_reserve_region()`: `addr + len + 4095` desbordaba
+`uint32` y `end` daba la vuelta, dejando la región **sin reservar** (p. ej. al
+reservar el framebuffer si GRUB lo coloca cerca de 4 GiB).
