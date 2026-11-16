@@ -194,32 +194,62 @@ fi
 mcopy -i "$BUILDDIR/efiboot.img" "$KERNEL" ::/boot/"$KERNEL"
 mcopy -i "$BUILDDIR/efiboot.img" "$BUILDDIR/grub.cfg" ::/boot/grub.cfg
 
-# ------------------------------------------------- imagen BIOS de GRUB ----
-# `grub-mkrescue` hace esto por nosotros y ademas nos deja el MBR híbrido.
-# Lo usamos solo para generar la parte BIOS, en un directorio aparte: su ISO
-# se descarta y de el extraemos boot.img + core.img para xorriso.
-info "Generando el arranque BIOS (i386-pc)..."
-grub-mkrescue --output="$BUILDDIR/bios.iso" "$ISODIR" >/dev/null 2>&1 || \
-    die "grub-mkrescue fallo (revisa que grub-pc-bin este instalado)"
-[ -s "$BUILDDIR/bios.iso" ] || die "grub-mkrescue no genero imagen"
+# ------------------------------------------------- imagen BIOS arrancable ----
+# Camino BIOS: se construye un core.img de GRUB (i386-pc) y se le antepone
+# cdboot.img, que es el cargador El Torito. Ese fichero es el que va en
+# -eltorito-boot.
+#
+# ANTES ESTO ESTABA MAL: se llamaba a `grub-mkrescue` para "generar la parte
+# BIOS" y luego xorriso apuntaba a un boot/grub/bios.img que NADIE creaba. Es
+# decir, el comentario decia "extraemos boot.img + core.img" pero esa parte no
+# estaba implementada -> xorriso fallaba siempre con "fallo al ensamblar".
+CDBOOT="$GRUB_PC_DIR/cdboot.img"
+[ -f "$CDBOOT" ] || die "no existe $CDBOOT — instala grub-pc-bin"
+
+info "Generando el arranque BIOS (i386-pc: core.img + cdboot.img)..."
+grub-mkimage \
+    --format=i386-pc \
+    --output="$BUILDDIR/core.img" \
+    --prefix=/boot/grub \
+    --compress=xz \
+    biosdisk iso9660 part_msdos part_gpt fat normal multiboot relocator \
+    search search_fs_file configfile echo test \
+    >/dev/null 2>&1 || die "grub-mkimage (i386-pc) fallo"
+[ -s "$BUILDDIR/core.img" ] || die "grub-mkimage no genero core.img"
+
+# cdboot.img debe ir DELANTE: es el que la BIOS ejecuta en modo no-emulacion.
+cat "$CDBOOT" "$BUILDDIR/core.img" > "$BUILDDIR/bios.img"
+[ -s "$BUILDDIR/bios.img" ] || die "no se pudo montar bios.img"
+
+# El El Torito lo referencia por ruta DENTRO del ISO, asi que tiene que estar
+# en el arbol que se le pasa a xorriso.
+cp "$BUILDDIR/bios.img" "$ISODIR/boot/grub/bios.img"
 
 # ------------------------------------------------------------ ISO final ----
 info "Ensamblando ISO hibrida (BIOS + UEFI) con ESP de $((ESP_BYTES/1024/1024)) MiB..."
+
+# NOTA sobre --grub2-mbr: se usa boot_hybrid.img si existe y, si no,
+# boot.img. Las dos son validas como MBR hibrido; los nombres cambian entre
+# versiones de GRUB y no queremos depender de uno concreto.
+HYBRID_MBR="$GRUB_PC_DIR/boot_hybrid.img"
+[ -f "$HYBRID_MBR" ] || HYBRID_MBR="$GRUB_PC_DIR/boot.img"
+[ -f "$HYBRID_MBR" ] || die "no encuentro boot_hybrid.img ni boot.img en $GRUB_PC_DIR"
+
+# Sin >/dev/null: si xorriso falla, queremos ver POR QUE.
 xorriso -as mkisofs \
     -iso-level 3 -full-iso9660-filenames -volid "TRINUX" \
     -eltorito-boot boot/grub/bios.img \
     -no-emul-boot -boot-load-size 4 -boot-info-table \
-    --eltorito-catalog boot/grub/boot.cat \
-    --grub2-boot-info \
-    --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
     -eltorito-alt-boot \
     -e --interval:appended_partition_2:all:: \
     -no-emul-boot \
+    -isohybrid-gpt-basdat \
     -append_partition 2 0xef "$BUILDDIR/efiboot.img" \
+    --grub2-mbr "$HYBRID_MBR" \
     -output "$OUT" \
     -graft-points \
       "$ISODIR" \
-    >/dev/null 2>&1 || die "xorriso fallo al ensamblar la ISO"
+    || die "xorriso fallo al ensamblar la ISO (lee el mensaje de arriba)"
 
 [ -s "$OUT" ] || die "xorriso no genero $OUT"
 
@@ -253,8 +283,20 @@ echo "    UEFI : EFI/BOOT/BOOTX64.EFI (PE) + ESP FAT .... OK"
 # ISO y una imagen USB generadas por el MISMO codigo, y no pueden divergir
 # (que es como se colo antes una imagen que no arrancaba).
 if [ -n "${ISO_OUT:-}" ]; then
-    cp "$OUT" "$ISO_OUT"
-    info "ISO copiada a $ISO_OUT ($(stat -c%s "$ISO_OUT") bytes)"
+    # OJO: la copia debe hacerse ANTES de extender con truncate, y ademas no
+    # puede caer "dentro" de $OUT. Si ISO_OUT llega como ruta relativa (p.ej.
+    # "trinux-usb.img") y OUT ya vale lo mismo, el cp daria "son el mismo
+    # fichero" o, peor, el truncate posterior cortaria el ISO. Se compara la
+    # ruta ya resuelta y se descarta la copia en ese caso (no es necesaria:
+    # el .img empieza siendo exactamente el ISO).
+    out_abs=$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")
+    iso_abs=$(cd "$(dirname "$ISO_OUT")" && pwd)/$(basename "$ISO_OUT")
+    if [ "$out_abs" = "$iso_abs" ]; then
+        warn "ISO_OUT apunta al mismo fichero que la imagen; se omite la copia."
+    else
+        cp "$OUT" "$ISO_OUT"
+        info "ISO copiada a $ISO_OUT ($(stat -c%s "$ISO_OUT") bytes)"
+    fi
 fi
 
 # ---------------------------------------------- zona de persistencia -------
