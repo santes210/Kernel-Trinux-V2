@@ -72,8 +72,13 @@ if ! LC_ALL=C grep -qa $'\x02\xb0\xad\x1b' "$KERNEL"; then
 fi
 
 # ----------------------------------------------------------- herramientas ----
-need xorriso      "apt install xorriso"
+need xorriso       "apt install xorriso"
 need grub-mkrescue "apt install grub-pc-bin"
+# grub-mkrescue construye su propia ESP con `mformat` + `mcopy`
+# (util/grub-mkrescue.c: mformat -C -f 2880 ... / mcopy -s -i ...). Sin mtools
+# falla con un error opaco, asi que lo comprobamos aqui.
+need mformat       "apt install mtools"
+need mcopy         "apt install mtools"
 
 GRUB_PC_DIR=/usr/lib/grub/i386-pc
 GRUB_EFI64_DIR=/usr/lib/grub/x86_64-efi
