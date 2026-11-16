@@ -54,7 +54,7 @@ warn() { echo "[!] $*" >&2; }
 info() { echo "[*] $*"; }
 
 need() {
-    command -v "$1" >/dev/null 2>&1 || die "falta '$1' — instala: $2"
+    command -v "$1" >/dev/null 2>&1 || die "falta '$1' - instala: $2"
 }
 
 # ---------------------------------------------------------------- kernel ----
@@ -82,8 +82,8 @@ need mcopy         "apt install mtools"
 
 GRUB_PC_DIR=/usr/lib/grub/i386-pc
 GRUB_EFI64_DIR=/usr/lib/grub/x86_64-efi
-[ -d "$GRUB_PC_DIR" ]    || die "no existe $GRUB_PC_DIR — instala grub-pc-bin"
-[ -d "$GRUB_EFI64_DIR" ] || die "no existe $GRUB_EFI64_DIR — instala grub-efi-amd64-bin"
+[ -d "$GRUB_PC_DIR" ]    || die "no existe $GRUB_PC_DIR - instala grub-pc-bin"
+[ -d "$GRUB_EFI64_DIR" ] || die "no existe $GRUB_EFI64_DIR - instala grub-efi-amd64-bin"
 
 # Soporte UEFI de 32 bits: opcional (solo para maquinas EFI-IA32 antiguas,
 # tipo algunos Atom/TabletPC). Avisamos pero no abortamos.
@@ -159,17 +159,17 @@ insmod relocator
 # no del terminal de GRUB. Menos piezas = menos formas de fallar.
 insmod all_video
 
-menuentry "Trinux — Arranque normal" {
+menuentry "Trinux: Arranque normal" {
   multiboot /boot/__KERNEL__
   boot
 }
 
-menuentry "Trinux — Modo single-user (recovery)" {
+menuentry "Trinux: Modo single-user (recovery)" {
   multiboot /boot/__KERNEL__ single
   boot
 }
 
-menuentry "Trinux — Shell ring-0 (debug)" {
+menuentry "Trinux: Shell ring-0 (debug)" {
   multiboot /boot/__KERNEL__ oldsh
   boot
 }
@@ -179,7 +179,7 @@ menuentry "Trinux — Shell ring-0 (debug)" {
 #   - si ESTA entrada dibuja el menu y responde, GRUB esta sano y el problema
 #     es del kernel o del handoff Multiboot;
 #   - si ni siquiera aqui hay menu, el roto es GRUB/carga del ISO.
-menuentry "Trinux — Diagnostico de GRUB (no arranca el kernel)" {
+menuentry "Trinux: Diagnostico de GRUB (no arranca el kernel)" {
   echo "Trinux: GRUB ha cargado y ejecuta este menu."
   echo "  root   = $root"
   echo "  prefix = $prefix"
@@ -222,7 +222,7 @@ cp "$KERNEL" "$ISODIR/boot/$KERNEL"
 # BIOS y NO avisa; por eso lo comprobamos antes y abortamos con un mensaje
 # claro.
 if [ ! -d "$GRUB_EFI64_DIR" ]; then
-    die "falta $GRUB_EFI64_DIR — instala grub-efi-amd64-bin.
+    die "falta $GRUB_EFI64_DIR - instala grub-efi-amd64-bin.
     Sin ese paquete grub-mkrescue genera una ISO SOLO BIOS, sin UEFI."
 fi
 
@@ -261,7 +261,7 @@ if [ -s "$BOOTX64_TMP" ]; then
 fi
 grep -qa "EFI/BOOT/BOOTX64.EFI" "$OUT" || \
     grep -qa "BOOTX64" "$OUT" || \
-    die "la imagen no contiene EFI/BOOT/BOOTX64.EFI — NO arrancara en UEFI"
+    die "la imagen no contiene EFI/BOOT/BOOTX64.EFI - NO arrancara en UEFI"
 
 echo "    BIOS : MBR 0x55AA + grub.cfg + kernel ......... OK"
 echo "    UEFI : EFI/BOOT/BOOTX64.EFI (PE) + ESP FAT .... OK"
