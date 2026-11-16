@@ -172,22 +172,6 @@ jobs:
           echo "✅ UEFI : EFI/BOOT/BOOTX64.EFI presente"
           echo "✅ USB  : $((FINAL/1024/1024)) MiB listos"
           
-      - name: 🔌 Nombre final de la imagen USB + verificación
-        run: |
-          # El script ya generó mykernel-usb.img: solo hay que darle el nombre
-          # que espera el resto del workflow (env.USB_IMG).
-          if [ "mykernel-usb.img" != "${{ env.USB_IMG }}" ]; then
-            mv -f mykernel-usb.img ${{ env.USB_IMG }}
-          fi
-
-          SIG=$(dd if=${{ env.USB_IMG }} bs=1 skip=510 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
-          [ "$SIG" = "55aa" ] || { echo "❌ imagen USB sin firma 0x55AA"; exit 1; }
-          grep -qa "BOOTX64" ${{ env.USB_IMG }} \
-            || { echo "❌ imagen USB sin BOOTX64.EFI"; exit 1; }
-
-          FINAL=$(stat -c%s ${{ env.USB_IMG }})
-          echo "✅ Imagen USB lista: $((FINAL/1024/1024)) MiB (BIOS + UEFI)"
-
       - name: 🔐 Checksums SHA-256
         run: |
           sha256sum \
