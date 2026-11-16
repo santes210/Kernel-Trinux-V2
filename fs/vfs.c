@@ -85,26 +85,54 @@ int vfs_chown(const char *path, vfs_node_t *cwd, uint32_t uid, uint32_t gid)
     return 0;
 }
 
-/* Reconstruct the absolute path of a node by walking parents. */
+/* Reconstruct the absolute path of a node by walking parents.
+ *
+ * La versión anterior hacía, por cada nivel, strcpy(tmp, piece) +
+ * strcat(tmp, rev) + strcpy(rev, tmp) sobre buffers de PATH_MAX. Con 64
+ * niveles de anidamiento (VFS_MAX_DEPTH) y nombres de hasta 64 bytes, cada
+ * iteración podía pasarse y el strcat desbordaba la pila del kernel. Suele
+ * ser alcanzable desde userland con `mkdir -p` + `cd` en bucle.
+ *
+ * Ahora se escribe de atrás hacia delante en un único buffer acotado. */
 void vfs_get_path(vfs_node_t *node, char *out)
 {
+    if (!out)
+        return;
     if (!node || !node->parent) {
-        strcpy(out, "/");
+        out[0] = '/';
+        out[1] = '\0';
         return;
     }
-    char rev[PATH_MAX] = "";
-    char tmp[PATH_MAX] = "";
+
+    /* Recolectar los nodos de la raíz hacia abajo (máx. VFS_MAX_DEPTH). */
+    enum { MAXD = 64 };
+    vfs_node_t *chain[MAXD];
+    int depth = 0;
     vfs_node_t *n = node;
-    while (n && n->parent) {
-        char piece[VFS_NAME_MAX + 1];
-        piece[0] = '/';
-        strcpy(piece + 1, n->name);
-        strcpy(tmp, piece);
-        strcat(tmp, rev);
-        strcpy(rev, tmp);
+    while (n && n->parent && depth < MAXD) {
+        chain[depth++] = n;
         n = n->parent;
     }
-    strcpy(out, rev[0] ? rev : "/");
+
+    uint32_t pos = 0;
+    bool truncated = false;
+    for (int i = depth - 1; i >= 0; i--) {
+        const char *nm = chain[i]->name;
+        uint32_t nl = (uint32_t)strlen(nm);
+        /* '/' + nombre + NUL */
+        if (pos + 1 + nl >= PATH_MAX) {
+            truncated = true;
+            break;
+        }
+        out[pos++] = '/';
+        memcpy(out + pos, nm, nl);
+        pos += nl;
+    }
+    if (pos == 0) {
+        out[pos++] = '/';
+    }
+    out[pos] = '\0';
+    (void)truncated;
 }
 
 uint32_t vfs_read(vfs_node_t *node, uint32_t off, uint32_t size, uint8_t *buf)

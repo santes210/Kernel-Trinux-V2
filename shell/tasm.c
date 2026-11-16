@@ -384,6 +384,14 @@ int tasm_assemble(const char *src_path, const char *out_path)
             continue;
         }
         uint32_t target = labels[li].offset;
+        /* Defensa: emit8() ya descarta bytes cuando el buffer se llena, pero
+         * si el código se truncó los fixups apuntan más allá del final y
+         * escribir el parche ahí se saldría de `code[]`. */
+        if (fixups[i].code_offset + 4u > (uint32_t)code_pos) {
+            kprintf("asm: fixup '%s' fuera del codigo generado\n", fixups[i].name);
+            errors++;
+            continue;
+        }
         uint32_t *patch = (uint32_t *)&code[fixups[i].code_offset];
         if (fixups[i].rel) {
             /* relative: target - (current_addr + 4) */

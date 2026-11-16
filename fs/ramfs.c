@@ -10,6 +10,11 @@
  */
 #include "ramfs.h"
 #include "blockfs.h"
+
+/* Tope de tamaño de un archivo en RAM. Evita que un write() con un `off`
+ * absurdo intente un krealloc de cientos de MiB (o desborde uint32 en
+ * `off + size`). */
+#define RAMFS_MAX_FILE_BYTES (16u * 1024u * 1024u)
 #include "../mm/kheap.h"
 #include "../lib/string.h"
 #include "../drivers/timer.h"
@@ -72,6 +77,13 @@ static uint32_t diskfile_read(vfs_node_t *node, uint32_t off, uint32_t size,
 static uint32_t diskfile_write(vfs_node_t *node, uint32_t off, uint32_t size,
                                uint8_t *buf)
 {
+    /* Mismo overflow de uint32 que en ramfs_write: `off + size` podía dar la
+     * vuelta y hacer un ensure_blocks() con un `nblocks` pequeño pero un
+     * memcpy de GB. Se acota antes de tocar nada. */
+    if (size > RAMFS_MAX_FILE_BYTES) return 0;
+    if (off > RAMFS_MAX_FILE_BYTES || size > RAMFS_MAX_FILE_BYTES - off)
+        return 0;
+
     uint32_t needed = off + size;
     uint32_t nblocks = (needed + BLOCK_SIZE - 1) / BLOCK_SIZE;
     if (!ensure_blocks(node, nblocks))
@@ -129,9 +141,19 @@ static uint32_t ramfs_write(vfs_node_t *node, uint32_t off, uint32_t size,
     if (node->disk_backed)
         return diskfile_write(node, off, size, buf);
 
+    /* OJO: `off + size` puede desbordar a 32 bits. Un proceso podía pedir
+     * `write(fd, buf, 0xFFFFFFF0)` sobre un archivo vacío: needed quedaba en
+     * ~0xFFFFFFF0 (o daba la vuelta a un valor pequeño), krealloc devolvía
+     * un buffer minúsculo y el memcpy escribía GB de datos del usuario
+     * encima del heap del kernel.  Se valida explícitamente. */
+    if (size > RAMFS_MAX_FILE_BYTES) return 0;
+    if (off > RAMFS_MAX_FILE_BYTES || size > RAMFS_MAX_FILE_BYTES - off)
+        return 0;
+
     uint32_t needed = off + size;
     if (needed > node->capacity) {
         uint32_t newcap = needed + 64;
+        if (newcap < needed) newcap = needed;      /* sin vuelta de tuerca */
         uint8_t *nd = (uint8_t *)krealloc(node->data, newcap);
         if (!nd)
             return 0;

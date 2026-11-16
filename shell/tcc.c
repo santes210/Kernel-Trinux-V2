@@ -247,9 +247,33 @@ static uint32_t dp;   /* data position */
 static void e8(uint8_t b)   { if (cp < MAX_CODE) code[cp++] = b; }
 static void e32(uint32_t v) { e8(v&0xFF); e8((v>>8)&0xFF); e8((v>>16)&0xFF); e8((v>>24)&0xFF); }
 
+/* ---- Estado de error del compilador ----
+ * e8() ya descartaba bytes cuando el buffer de código se llenaba (programa
+ * demasiado grande), pero el resto del compilador seguía generando parches
+ * de 4 bytes y emitiendo un ELF "válido" con el código truncado.  Peor:
+ * patch32() escribía code[off..off+3] sin comprobar NADA, así que cualquier
+ * offset que se pasara del buffer (por ejemplo tras el truncado, o un
+ * fixup calculado antes de llegar al límite) escribía fuera de `code[]`,
+ * encima de `data_sec[]`/`locals[]`/`globals[]` (que están justo detrás en
+ * .bss) o más allá, en el heap del kernel.  Desde la shell eso es un
+ * `tcc archivo.c` con un fuente grande, es decir, al alcance de cualquiera.
+ *
+ * Ahora: `tcc_error` enciende una bandera pegajosa y patch32() es no-op
+ * fuera de rango; al terminar de compilar, si hay error, no se emite ELF. */
+static int tcc_error;
+
 static void patch32(uint32_t off, uint32_t val) {
-    code[off]=val&0xFF; code[off+1]=(val>>8)&0xFF;
-    code[off+2]=(val>>16)&0xFF; code[off+3]=(val>>24)&0xFF;
+    if (off + 4 > MAX_CODE) {
+        if (!tcc_error)
+            kprintf("[tcc] error interno: patch fuera del buffer de codigo "
+                    "(off=%u, max=%u)\n", off, (uint32_t)MAX_CODE);
+        tcc_error = 1;
+        return;
+    }
+    code[off]   = val & 0xFF;
+    code[off+1] = (val >> 8)  & 0xFF;
+    code[off+2] = (val >> 16) & 0xFF;
+    code[off+3] = (val >> 24) & 0xFF;
 }
 
 /* Store string in data section, return its offset from data_sec start */
@@ -1590,6 +1614,7 @@ int tcc_compile(const char *src_path, const char *out_path)
     line_num = 1;
     err_count = 0;
     cp = 0; dp = 0;
+    tcc_error = 0;                 /* bandera pegajosa de patch/emit inválido */
     nlocals = 0; stack_offset = 0;
     nfuncs = 0; ncall_fixups = 0; nstr_fixups = 0;
     nglobals = 0; bss_size = 0; nglob_fixups = 0;
@@ -1705,6 +1730,14 @@ int tcc_compile(const char *src_path, const char *out_path)
         kprintf("tcc: %d error(s); aborting (no output written).\n", err_count);
         return -1;
     }
+    /* Si el buffer de código se llenó (programa demasiado grande) el stream
+     * está truncado y los parches ya no cuadran: generar un ELF aquí produce
+     * un binario que salta a mitad de instrucción. Abortar. */
+    if (tcc_error) {
+        kprintf("tcc: el programa no cabe (codigo max %u bytes); "
+                "no se genera salida.\n", (uint32_t)MAX_CODE);
+        return -1;
+    }
 
     /* Fix call to main */
     int main_idx = -1;
@@ -1716,6 +1749,7 @@ int tcc_compile(const char *src_path, const char *out_path)
         return -1;
     }
     patch32(call_main_pos, funcs[main_idx].code_offset - call_main_pos - 4);
+    if (tcc_error) { kprintf("tcc: error de emision; sin salida\n"); return -1; }
 
     /* Fix user function call fixups */
     for (int i = 0; i < ncall_fixups; i++) {

@@ -535,6 +535,10 @@ static int tokenize(char *line, char **argv)
     char *dst = scratch;
     int   argc = 0;
     const char *src = line;
+    /* Dejar SIEMPRE un byte para el NUL de cierre: con el límite anterior
+     * (`dst < scratch_end` también para el terminador) el último token de una
+     * línea larga quedaba SIN terminar y cualquier strlen() posterior se iba
+     * leyendo la pila hasta encontrar un cero. */
     const char *scratch_end = scratch + sizeof(scratch) - 1;
 
     while (*src && argc < SHELL_MAX_ARGS - 1 && dst < scratch_end) {
@@ -549,7 +553,7 @@ static int tokenize(char *line, char **argv)
             *dst++ = '>';
             src++;
             if (*src == '>' && dst < scratch_end) { *dst++ = '>'; src++; }
-            if (dst < scratch_end) *dst++ = '\0';
+            if (dst <= scratch_end) *dst++ = '\0';
             continue;
         }
 
@@ -558,7 +562,7 @@ static int tokenize(char *line, char **argv)
             argv[argc++] = dst;
             *dst++ = '<';
             src++;
-            if (dst < scratch_end) *dst++ = '\0';
+            if (dst <= scratch_end) *dst++ = '\0';
             continue;
         }
 
@@ -571,7 +575,7 @@ static int tokenize(char *line, char **argv)
             if (!in_quotes && *src == '<') break;   /* break BEFORE the '<' */
             *dst++ = *src++;
         }
-        if (dst < scratch_end) *dst++ = '\0';
+        if (dst <= scratch_end) *dst++ = '\0';
     }
     argv[argc] = NULL;
     return argc;

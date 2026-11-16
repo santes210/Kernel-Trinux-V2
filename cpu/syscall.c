@@ -33,38 +33,82 @@ extern void tss_set_kernel_stack(uint32_t esp0);
 
 static bool g_in_usermode;        /* unused now but kept for sig */
 
-/* ---- ELF exit jump buffer ----
- * (Misma maquinaria que antes; ver elf_jmp.asm para el setjmp/longjmp.) */
+/* ---- Buffer de salida de ring 3 (setjmp/longjmp, ver elf_jmp.asm) ----
+ *
+ * PROBLEMA QUE ARREGLA ESTO: el buffer era UNO GLOBAL (`g_elf_jmp`).  Como
+ * elf_exec_argv() se puede anidar (el shell ring 3 hace SYS_SPAWN de otro
+ * ELF, y ese otro hace otro spawn), cada nivel llamaba a elf_arm_exit_jmp()
+ * y SOBRESCRIBÍA el buffer del nivel anterior.  Al terminar el hijo, su
+ * SYS_EXIT hacía longjmp contra el buffer del padre: saltaba a un EIP/ESP
+ * del *otro* marco de pila -> corrupción de pila del kernel (o salto a
+ * basura) justo al volver de un `exec` anidado.
+ *
+ * Ahora hay una PILA de buffers, uno por nivel de anidamiento.  El nivel N
+ * arma su buffer y `elf_get_exit_code()`/`disarm` operan siempre sobre el
+ * tope, que es el nivel que está ejecutándose.
+ */
+#define ELF_EXIT_MAX_NEST 8
+
 typedef struct {
     uint32_t valid;
     uint32_t esp, ebp, ebx, esi, edi, eip;
     int      exit_code;
 } elf_jmp_t;
 
-static elf_jmp_t g_elf_jmp;
+static elf_jmp_t g_exit_stack[ELF_EXIT_MAX_NEST];
+static int       g_exit_depth;          /* nº de buffers armados (0..MAX) */
 
 extern int  elf_jmp_setjmp (elf_jmp_t *dst);
 extern void elf_jmp_longjmp(elf_jmp_t *src) __attribute__((noreturn));
 
 void elf_arm_exit_jmp(void)
 {
-    g_elf_jmp.valid = 0;
-    if (elf_jmp_setjmp(&g_elf_jmp) == 0)
-        g_elf_jmp.valid = 1;
+    if (g_exit_depth >= ELF_EXIT_MAX_NEST) {
+        /* Demasiado anidado: no se puede recuperar, mejor avisar que
+         * machacar el buffer del nivel de abajo. */
+        kprintf("[elf] WARNING: anidamiento > %d, no se arma el longjmp\n",
+                ELF_EXIT_MAX_NEST);
+        return;
+    }
+    elf_jmp_t *jb = &g_exit_stack[g_exit_depth];
+    jb->valid = 0;
+    if (elf_jmp_setjmp(jb) == 0) {
+        jb->valid = 1;
+        g_exit_depth++;
+    }
 }
 
-int elf_get_exit_code(void) { return g_elf_jmp.exit_code; }
+int elf_get_exit_code(void)
+{
+    return g_exit_depth > 0 ? g_exit_stack[g_exit_depth - 1].exit_code : -1;
+}
 
-void elf_disarm_exit_jmp(void) { g_elf_jmp.valid = 0; }
+void elf_disarm_exit_jmp(void)
+{
+    if (g_exit_depth > 0) {
+        g_exit_depth--;
+        g_exit_stack[g_exit_depth].valid = 0;
+    }
+}
+
+/* Desarma el tope y salta (usado por SYS_EXIT y por el manejador de #PF de
+ * userland).  Nunca regresa si había un buffer armado. */
+static bool elf_unwind(int code)
+{
+    if (g_exit_depth <= 0)
+        return false;
+    elf_jmp_t *jb = &g_exit_stack[--g_exit_depth];
+    jb->exit_code = code;
+    jb->valid     = 0;
+    elf_jmp_longjmp(jb);        /* no vuelve */
+    return true;
+}
 
 bool usermode_fault_kill(int signal_code)
 {
     process_exit(signal_code);
-    if (g_elf_jmp.valid) {
-        g_elf_jmp.exit_code = signal_code;
-        g_elf_jmp.valid     = 0;
-        elf_jmp_longjmp(&g_elf_jmp);
-    }
+    if (elf_unwind(signal_code))
+        return true;
     schedule();
     return true;
 }
@@ -119,6 +163,23 @@ typedef struct {
     uint32_t    owner_pid;    /* CRITICAL: track which process owns this fd */
 } kfd_t;
 static kfd_t kfds[FD_MAX];
+
+/* Devuelve el kfd apuntado por `fd` SI el proceso actual es su dueño.
+ *
+ * Antes, CUALQUIER proceso podía read()/write()/close() el fd de otro: bastaba
+ * con adivinar el número (la tabla es global, 0..63) para leer archivos
+ * abiertos por el shell, cerrarlos y dejarle el fd roto, o robarle el offset.
+ * Como la tabla sigue siendo global (no hay fds por proceso todavía), el
+ * mínimo imprescindible es comprobar `owner_pid`. */
+static kfd_t *kfd_get(int fd)
+{
+    if (fd < 3 || fd >= FD_MAX) return NULL;
+    if (!kfds[fd].used) return NULL;
+    process_t *p = process_get_current();
+    uint32_t me = p ? p->pid : 0;
+    if (kfds[fd].owner_pid != me) return NULL;
+    return &kfds[fd];
+}
 
 /* Copia del argv de usuario a memoria del kernel mientras el proceso que
  * llama sigue vivo.
@@ -226,11 +287,10 @@ void syscall_handler(registers_t *regs)
     /* ---- proceso ---- */
     case SYS_EXIT:
         process_exit((int)a1);
-        if (g_elf_jmp.valid) {
-            g_elf_jmp.exit_code = (int)a1;
-            g_elf_jmp.valid     = 0;
-            elf_jmp_longjmp(&g_elf_jmp);   /* nunca regresa */
-        }
+        /* Desarmar SOLO el buffer de este nivel de anidamiento (antes era
+         * uno global y el longjmp podía irse al marco del padre). */
+        if (elf_unwind((int)a1))
+            break;                      /* inalcanzable: nunca regresa */
         schedule();
         break;
 
@@ -323,6 +383,11 @@ void syscall_handler(registers_t *regs)
         if (len > 0 && !uaccess_ok(buf, len)) { regs->eax = (uint32_t)-14; break; }
         vfs_node_t *n = vfs_create(path, cwd_of_caller());
         if (!n) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: faltaba el chequeo de escritura que sí tiene
+         * SYS_READFILE para lectura. Un proceso sin privilegios podía hacer
+         * writefile("/etc/shadow", ...) y reescribir las contraseñas, o
+         * sobrescribir /bin/... (vfs_create devuelve el nodo existente). */
+        if (!vfs_check_access(n, ACC_WRITE)) { regs->eax = (uint32_t)-1; break; }
         n->size = 0;
         regs->eax = vfs_write(n, 0, len, buf);
         break;
@@ -559,7 +624,9 @@ void syscall_handler(registers_t *regs)
         if (oldfd == newfd) { regs->eax = (uint32_t)newfd; break; }
 
         int src_is_pipe = pipe_is_pipe(oldfd);
-        int src_is_file = (oldfd >= 3 && oldfd < FD_MAX && kfds[oldfd].used);
+        /* Solo se puede duplicar un fd propio (la tabla es global). */
+        kfd_t *src = kfd_get(oldfd);
+        int src_is_file = (src != NULL);
         if (!src_is_pipe && !src_is_file) { regs->eax = (uint32_t)-1; break; }
 
         if (kfds[newfd].used) {
@@ -569,9 +636,9 @@ void syscall_handler(registers_t *regs)
         pipe_dup2(oldfd, newfd);
 
         if (src_is_file) {
-            kfds[newfd].node  = kfds[oldfd].node;
-            kfds[newfd].pos   = kfds[oldfd].pos;
-            kfds[newfd].flags = kfds[oldfd].flags;
+            kfds[newfd].node  = src->node;
+            kfds[newfd].pos   = src->pos;
+            kfds[newfd].flags = src->flags;
             kfds[newfd].used  = 1;
             process_t *cur = process_get_current();
             kfds[newfd].owner_pid = cur ? cur->pid : 0;
@@ -606,6 +673,10 @@ void syscall_handler(registers_t *regs)
         kfds[fd].pos = (flags & O_APPEND) ? n->size : 0;
         if (flags & O_TRUNC) n->size = 0;
         kfds[fd].flags = flags;
+        {   /* Dueño del fd: sin esto, kfd_get() no dejaría usarlo a nadie. */
+            process_t *cur = process_get_current();
+            kfds[fd].owner_pid = cur ? cur->pid : 0;
+        }
         kfds[fd].used = 1;
         regs->eax = (uint32_t)fd;
         break;
@@ -629,14 +700,14 @@ void syscall_handler(registers_t *regs)
             regs->eax = (uint32_t)got;
             break;
         }
-        if (fd < 3 || fd >= FD_MAX || !kfds[fd].used) {
-            regs->eax = (uint32_t)-1; break;
-        }
-        kfd_t *k = &kfds[fd];
+        kfd_t *k = kfd_get(fd);
+        if (!k || !k->node) { regs->eax = (uint32_t)-1; break; }
         if (k->pos >= k->node->size) { regs->eax = 0; break; }
         uint32_t want = a3;
         if (!uaccess_ok((void *)a2, want)) { regs->eax = (uint32_t)-14; break; }
-        if (k->pos + want > k->node->size) want = k->node->size - k->pos;
+        /* OJO: `k->pos + want` desborda a 32 bits con want ~0xFFFFFFFF. */
+        uint32_t avail = k->node->size - k->pos;
+        if (want > avail) want = avail;
         uint32_t got = vfs_read(k->node, k->pos, want, (uint8_t *)a2);
         k->pos += got;
         regs->eax = got;
@@ -670,10 +741,8 @@ void syscall_handler(registers_t *regs)
             regs->eax = (uint32_t)wrote;
             break;
         }
-        if (fd < 3 || fd >= FD_MAX || !kfds[fd].used) {
-            regs->eax = (uint32_t)-1; break;
-        }
-        kfd_t *k = &kfds[fd];
+        kfd_t *k = kfd_get(fd);
+        if (!k || !k->node) { regs->eax = (uint32_t)-1; break; }
         uint32_t wrote = vfs_write(k->node, k->pos, len, (uint8_t *)buf);
         k->pos += wrote;
         regs->eax = wrote;
@@ -685,7 +754,11 @@ void syscall_handler(registers_t *regs)
         if (pipe_is_pipe(fd)) {
             pipe_close(fd);
         } else if (fd >= 3 && fd < FD_MAX) {
-            kfds[fd].used = 0;
+            kfd_t *k = kfd_get(fd);
+            if (!k) { regs->eax = (uint32_t)-1; break; }   /* no es tuyo */
+            k->used = 0;
+            k->node = NULL;
+            k->owner_pid = 0;
         }
         regs->eax = 0;
         break;
@@ -695,16 +768,22 @@ void syscall_handler(registers_t *regs)
         int fd = (int)a1;
         int off = (int)a2;
         int whence = (int)a3;
-        if (fd < 3 || fd >= FD_MAX || !kfds[fd].used) {
-            regs->eax = (uint32_t)-1; break;
-        }
-        kfd_t *k = &kfds[fd];
-        uint32_t newpos = k->pos;
-        if (whence == SEEK_SET) newpos = (uint32_t)off;
-        else if (whence == SEEK_CUR) newpos = k->pos + off;
-        else if (whence == SEEK_END) newpos = k->node->size + off;
-        k->pos = newpos;
-        regs->eax = newpos;
+        /* Solo el dueño puede mover el offset: antes cualquier proceso podía
+         * hacer seek() sobre el fd del shell y descolocarle la lectura. */
+        kfd_t *k = kfd_get(fd);
+        if (!k || !k->node) { regs->eax = (uint32_t)-1; break; }
+        int64_t base;
+        if (whence == SEEK_SET)      base = 0;
+        else if (whence == SEEK_CUR) base = (int64_t)k->pos;
+        else if (whence == SEEK_END) base = (int64_t)k->node->size;
+        else { regs->eax = (uint32_t)-1; break; }
+        /* Aritmética de 64 bits: seek(-N) con N grande desbordaba uint32 y
+         * dejaba k->pos apuntando por encima del tamaño del archivo. */
+        int64_t np = base + (int64_t)off;
+        if (np < 0) np = 0;
+        if (np > (int64_t)0x7FFFFFFF) np = 0x7FFFFFFF;
+        k->pos = (uint32_t)np;
+        regs->eax = (uint32_t)np;
         break;
     }
 
@@ -1436,13 +1515,11 @@ void syscall_handler(registers_t *regs)
     /* Check for pending signals before returning to usermode.
      * If a signal was delivered (e.g., Ctrl-C), terminate the process. */
     if (process_check_signal()) {
-        /* Process was killed by signal. Force exit via longjmp. */
-        if (g_elf_jmp.valid) {
-            process_t *p = process_get_current();
-            g_elf_jmp.exit_code = p ? p->exit_code : 128 + SIGINT;
-            g_elf_jmp.valid = 0;
-            elf_jmp_longjmp(&g_elf_jmp);
-        }
+        /* Proceso muerto por señal: desarmar el buffer de ESTE nivel y
+         * longjmp (nunca regresa si había uno armado). */
+        process_t *p = process_get_current();
+        if (elf_unwind(p ? p->exit_code : 128 + SIGINT))
+            return;                 /* inalcanzable */
     }
 }
 

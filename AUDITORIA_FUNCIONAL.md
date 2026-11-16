@@ -478,9 +478,9 @@ panic en `process_init()` pasaba en verde. Ahora:
 | Hueco | Estado | Motivo |
 |---|---|---|
 | Aislamiento de memoria real (§3.1) | ❌ abierto | Requiere ELF en VA por proceso + `cr3` por proceso. Cambia el modelo de ejecución completo (hoy `exec` es síncrono con `setjmp/longjmp`); sin poder arrancar en QEMU ni ensamblar NASM aquí, es demasiado riesgo para ir a ciegas. |
-| `fork()` devuelve 0 al hijo | ❌ abierto | El scheduler sí puede correr al hijo, pero el `ret` del hijo en ring 3 necesita fabricar un trap frame; verificado el diseño, no la implementación. |
+| `fork()` devuelve 0 al hijo | ❌ abierto | El scheduler sí puede correr al hijo, pero el `ret` del hijo en ring 3 necesita fabricar un trap frame; verificado el diseño, no la implementación. **Nota**: el `longjmp` de un solo nivel que lo habría roto está arreglado (§7.1). |
 | SMP con locks (§3.5) | ❌ abierto | Los APs siguen en `sti; hlt`. Añadir spinlocks sin poder probar concurrencia es empeorar el riesgo. |
-| fds por proceso | ❌ abierto | `kfds[]` es global; hay `owner_pid`, pero migrarlo toca todos los handlers de archivo. |
+| fds por proceso | ⚠️ parcial | `kfds[]` sigue siendo global, pero desde la ronda 3 `kfd_get()` **valida `owner_pid`** en read/write/close/seek/dup2: un proceso ya no puede usar los fds de otro. Falta la tabla completa por proceso. |
 | `SYS_BRK` no desmapea | ❌ abierto | Conservador a propósito: desmapear liberaría frames del identity-map compartido. |
 | Relocación de ELF (`.rel`) | ❌ abierto | Solo valen binarios a `0x08048000`. |
 | Prueba en hardware real | ❌ no hecho | No hay acceso a hardware ni a QEMU en este entorno (ver §4). |
@@ -494,3 +494,97 @@ arranque:   21 × [ OK ], sin panic, hasta "[init] launching /bin/sh in RING 3"
 userland:   72/72 programas + sh (8456 B) + 2 alias
 syscalls:   74 declarados / 74 con handler
 ```
+
+## 7. Ronda 3 — bugs encontrados revisando, no solo listando
+
+Segunda pasada buscando activamente (no leyendo la lista de pendientes). Todo
+compila (`0` fallos, `0` implícitas), enlaza y arranca hasta `/bin/sh` en
+ring 3 con 21 `[ OK ]`.
+
+### 7.1 🔴 La pila de `setjmp/longjmp` de ring 3 era de un solo nivel
+
+`cpu/syscall.c` tenía **un** `g_elf_jmp` global. `SYS_EXIT` y el manejador de
+`#PF` de userland hacían `longjmp(&g_elf_jmp)`. Como `elf_exec_argv()` se
+anida (shell ring 3 → `SYS_SPAWN` → el hijo hace otro spawn), cada nivel
+llamaba a `elf_arm_exit_jmp()` y **sobrescribía el buffer del nivel anterior**.
+Al terminar el hijo, el `longjmp` saltaba a un `EIP`/`ESP` del *otro* marco
+de pila: corrupción de la pila del kernel justo al volver de un `exec`
+anidado. Ahora es una pila de `ELF_EXIT_MAX_NEST` buffers (`g_exit_stack[]`),
+y `elf_unwind()` solo desarma el tope.
+
+### 7.2 🔴 Cualquier proceso podía robar/cerrar los fds de otro
+
+`kfds[]` es una tabla global con `owner_pid`, pero **nadie lo comprobaba**:
+`SYS_FILE_READ`, `SYS_FILE_WRITE`, `SYS_FILE_CLOSE` y `SYS_FILE_SEEK` solo
+miraban `used`. Un proceso sin privilegios podía cerrar el fd que el shell
+tuviera abierto sobre `/etc/shadow`, leerlo o moverle el offset. Se añadió
+`kfd_get(fd)`, que valida `owner_pid`, y los cuatro handlers lo usan.
+
+### 7.3 🔴 `SYS_FILE_SEEK` desbordaba `k->pos`
+
+`newpos = k->pos + off` en `uint32_t` con `off` negativo grande daba la vuelta
+y dejaba el offset por encima del tamaño del archivo (el siguiente `read`
+leía con `off` fuera de rango). Reescrito con aritmética `int64_t` y
+saturación a `[0, 0x7FFFFFFF]`.
+
+### 7.4 🔴 `SYS_WRITEFILE` no comprobaba permisos de escritura
+
+`SYS_READFILE` sí tenía `vfs_check_access(n, ACC_READ)`, pero el de escritura
+**no tenía el equivalente**. `writefile("/etc/shadow", ...)` reescribía las
+contraseñas, y `writefile("/bin/ls", ...)` truncaba binarios del sistema
+(`vfs_create` devuelve el nodo existente). Añadido `ACC_WRITE`.
+
+### 7.5 🔴 Overflow de `uint32` en `ramfs_write` / `diskfile_write`
+
+`needed = off + size` con `size = 0xFFFFFFF0` daba la vuelta; `krealloc`
+devolvía un buffer minúsculo y el `memcpy` copiaba GB desde el buffer del
+usuario **encima del heap del kernel**. En el camino con disco, el mismo
+desbordamiento hacía un `ensure_blocks()` con un `nblocks` pequeño y luego
+un `memcpy` gigante. Ambas rutas acotan ahora a `RAMFS_MAX_FILE_BYTES`
+(16 MiB) con la resta protegida.
+
+### 7.6 Overflow de pila en `vfs_get_path()`
+
+Reconstruía la ruta con `strcpy(tmp, piece); strcat(tmp, rev); strcpy(rev, tmp)`
+sobre buffers de `PATH_MAX`. Con anidamiento profundo (64 niveles) y nombres
+de 64 bytes cada iteración se pasa: desbordamiento de la pila del kernel
+alcanzable con `mkdir -p` + `cd`. Reescrito en un solo buffer acotado.
+
+### 7.7 `path_normalize()` / `path_join()` sin límites
+
+`strcpy(out, ...)` + `strcat(out, ...)` con `out` de tamaño desconocido desde
+la firma: cualquier ruta de más de 256 bytes desbordaba el buffer del
+llamante. Ahora todo se copia acotado y se trunca en un límite de componente
+(con aviso por serial). Verificado con un banco de pruebas fuera del kernel
+(`/tmp/normtest.c`) sobre los 6 casos típicos + una ruta de 1200 bytes.
+
+### 7.8 El tokenizador del shell dejaba tokens sin terminar
+
+En `tokenize()`, el test `dst < scratch_end` se usaba también para escribir el
+`'\0'` final, así que en una línea larga el último token quedaba **sin
+terminador** y cualquier `strlen()` posterior leía la pila hasta encontrar un
+cero. Corregido a `dst <= scratch_end`.
+
+### 7.9 `patch32()` del `tcc` in-kernel escribía fuera de `code[]`
+
+`e8()` descartaba bytes al llenarse el buffer, pero `patch32(off, ...)`
+escribía `code[off..off+3]` **sin comprobar nada**. Con un fuente grande, los
+offsets de los fixups se salían del array y escribían encima de `data_sec[]`,
+`locals[]` o `globals[]` (están juntos en `.bss`). Ahora hay una bandera
+`tcc_error` pegajosa: `patch32()` es no-op fuera de rango y `tcc_compile()`
+aborta sin escribir salida. Mismo guardia añadido a los fixups de `tasm.c`.
+
+### 7.10 Verificación de esta ronda
+
+```
+kernel:     51 .c → 0 errores, 0 llamadas implícitas
+link:       OK (620 KB)
+arranque:   21 × [ OK ], hasta "[init] launching /bin/sh in RING 3"
+userland:   72/72 + sh
+make audit: OK (syscalls 74/74, headers, artefactos, regresiones)
+```
+
+Los chequeos de §7.1–7.9 están automatizados en `.github/workflows/audit.yml`
+(paso "Regresiones de seguridad / robustez"): si alguien vuelve a introducir
+el `longjmp` global, el `owner_pid` sin comprobar o el `strcat` sin límite, el
+CI falla.
