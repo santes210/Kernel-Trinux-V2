@@ -1,10 +1,10 @@
 # `grub rescue>` al arrancar el USB de Trinux
 
-> **Nota:** la imagen que genera `make usb` a partir de esta versión ya no
-> debería llegar aquí: usa `grub-mkstandalone`, que lleva el menú y los módulos
-> **dentro** del `.EFI`, así que GRUB no tiene que buscar su `/boot/grub` en el
-> disco. Este documento sigue siendo útil para imágenes antiguas o para el
-> camino BIOS. Estado actual del soporte UEFI: `DIAGNOSTICO_UEFI.md`.
+> **Nota:** desde `f3a5bd4` la imagen la monta `grub-mkrescue`, que genera el
+> El Torito BIOS y la ESP UEFI a la vez y deja todos los módulos en
+> `/boot/grub/i386-pc/` **dentro** del ISO, con `prefix` apuntando ahí. Este
+> documento sigue siendo útil para imágenes antiguas. Para diagnosticar un
+> arranque que se queda en `GRUB ` sin menú, usa `PROBAR_ARRANQUE.md`.
 
 ## Qué significa
 

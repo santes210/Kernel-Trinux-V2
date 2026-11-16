@@ -166,7 +166,7 @@ log y lo miro.
 | Lo que ves | Qué pasó | Qué hacer |
 |---|---|---|
 | Actions no muestra ningún workflow | El `build.yml` sigue inválido | Rehacer el paso 2 y comprobar el aviso "Invalid workflow file" |
-| `❌ falta grub-mkstandalone` o `xorriso` | Falta una dependencia | Ya están en el `build.yml` bueno; confirma que pegaste el completo |
+| `❌ falta grub-mkrescue`, `mformat` o `xorriso` | Falta una dependencia | Instala `grub-pc-bin`, `mtools` y `xorriso`; el `build.yml` bueno ya los pide |
 | `❌ La ISO NO contiene EFI/BOOT/BOOTX64.EFI` | El GRUB EFI no se generó | Pásame el log; suele ser `grub-efi-amd64-bin` ausente |
 | El pendrive no arranca y no sale ni el menú | Secure Boot activo, o el firmware no ve el medio | Desactiva Secure Boot; prueba F12 para elegir el pendrive |
 | Menú GRUB y `error: file not found` | No encontró el kernel | `ls` para ver las particiones; ver `GRUB_RESCUE.md` |
