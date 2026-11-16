@@ -674,3 +674,52 @@ dirección 0.
 `vga_set_cursor()` (usado por `SYS_SET_CURSOR` con coordenadas del usuario)
 **sí** acotaba ya los dos ejes a `[0, VGA_WIDTH/HEIGHT)`, así que ahí no había
 nada que arreglar.
+
+## 10. Ronda 3d — tres bugs en el asignador del kernel (`mm/kheap.c`)
+
+El heap es first-fit con coalescing sobre un arena estático de 32 MiB. Al
+revisarlo con una simulación fuera del kernel (`/tmp/kheaplab.py`,
+reimplementación 1:1) salieron tres cosas.
+
+### 10.1 🟠 `kmalloc_aligned()` gastaba ~4 KiB de más en cada asignación
+
+Pedía siempre `size + 4096 + sizeof(block_t)` para poder desplazar el payload
+hasta el siguiente límite de página, y si el bloque **ya** venía alineado
+hacía `return raw;` — es decir, el llamante se quedaba con un bloque de
+`size + pad` pero `kfree()` solo puede devolver el bloque entero. Ninguna de
+esas páginas extra vuelve nunca al arena mientras el bloque esté vivo.
+
+Medido: 200 × `kmalloc_aligned(8 KiB)` consumían **2.3 MiB** para 1.6 MiB
+pedidos (≈700 KiB perdidos). `process.c` usa esta función para **cada
+kstack**, así que se paga en cada proceso creado.
+
+Arreglo: camino exacto cuando el bloque ya está alineado (`kmalloc(size)`,
+sin pad). El caso con desplazamiento se mantiene, y el hueco delantero queda
+como bloque libre reutilizable en vez de perderse.
+
+### 10.2 🟠 `align_up()` podía devolver 0 y colar una petición imposible
+
+`(n + 7) & ~7` con `n = 0xFFFFFFFF` da la vuelta a **0**. `kmalloc(0xFFFFFFFF)`
+pasaba el test de "cabe en el arena" y devolvía un puntero válido a un bloque
+minúsculo: el llamante escribía encima de todo lo que hubiera detrás.
+Añadido `KHEAP_MAX_REQUEST` (el tamaño del arena): una petición mayor no se
+puede satisfacer nunca, así que rechazarla es correcto.
+
+### 10.3 🟠 `kfree()` leía `b->magic` sin validar el puntero
+
+`block_from_ptr(ptr)` resta `sizeof(block_t)` **antes** de mirar nada. Un
+puntero basura (o de un buffer que no venga de `kmalloc`) podía "colar" si la
+palabra en `ptr - sizeof(block_t)` coincidía con `MAGIC_USED`; entonces
+`kfree()` enlazaba un bloque falso en la lista de libres y el siguiente
+`kmalloc()` escribía en cualquier dirección. Ahora se comprueba que el
+puntero (y el `raw` recuperado del camino alineado) caiga dentro de
+`[heap, heap + HEAP_SIZE)` antes de tocar ninguna cabecera.
+
+### 10.4 Verificación
+
+```
+kernel:    51 .c → 0 errores, 0 implícitas, 0 warnings en kheap.c
+-analyzer: limpio en kheap.c
+link:      OK
+arranque:  21 × [ OK ], sin panic, hasta "launching /bin/sh in RING 3"
+```

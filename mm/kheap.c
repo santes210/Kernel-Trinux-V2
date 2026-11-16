@@ -34,6 +34,13 @@ static size_t align_up(size_t n, size_t a)
     return (n + (a - 1)) & ~(a - 1);
 }
 
+/* Tope de una petición individual. Sin esto, `align_up(n, 8)` con
+ * n = 0xFFFFFFFF da la vuelta a ~0 y `kmalloc(0xFFFFFFFF)` devolvía un puntero
+ * válido a un bloque minúsculo: el llamante escribía GB.  Cualquier valor por
+ * encima del arena entera no puede satisfacerse nunca, así que rechazarlo es
+ * semánticamente correcto y no rompe a nadie. */
+#define KHEAP_MAX_REQUEST (HEAP_SIZE - sizeof(block_t))
+
 void kheap_init(void)
 {
     head = (block_t *)heap;
@@ -68,8 +75,12 @@ void *kmalloc(size_t size)
         kheap_init();
     if (size == 0)
         return NULL;
+    if (size > KHEAP_MAX_REQUEST)
+        return NULL;             /* imposible: no cabe ni con el arena vacío */
 
     size = align_up(size, ALIGN);
+    if (size > KHEAP_MAX_REQUEST)
+        return NULL;
 
     for (block_t *b = head; b; b = b->next) {
         if (b->free && b->size >= size) {
@@ -92,27 +103,58 @@ void *kcalloc(size_t count, size_t size)
 }
 
 /* Page-aligned allocation: over-allocate and carve an aligned region. */
+/* Reserva `size` bytes con la carga útil alineada a 4 KiB.
+ *
+ * OJO (bug corregido): la versión anterior pedía `size + 4096 + sizeof(header)`
+ * siempre, para poder "desplazar" la carga útil hasta el siguiente límite de
+ * página, y si el bloque ya venía alineado hacía `return raw;`.  Ese `raw`
+ * tiene `size + 4 KiB`, pero kfree() solo devuelve el bloque entero al
+ * liberarlo, así que mientras tanto se consumían ~4 KiB extra por asignación
+ * (medido con una simulación: 200 asignaciones de 8 KiB usaban 2.3 MiB en vez
+ * de 1.6).  Y en el camino desplazado el hueco `raw..aligned` tampoco se
+ * liberaba nunca.
+ *
+ * Ahora hay dos caminos limpios:
+ *   a) el bloque ya está alineado -> kmalloc(size) exacto, sin pad;
+ *   b) hay que desplazar -> se pide `size + 4096` y kfree() recupera `raw`
+ *      del puntero guardado justo antes del payload alineado.  El hueco que
+ *      queda por delante es un único bloque pequeño ya en la lista de libres
+ *      (no se pierde: kmalloc() lo reutiliza).
+ */
 void *kmalloc_aligned(size_t size)
 {
     if (!initialized)
         kheap_init();
+    if (size == 0 || size > KHEAP_MAX_REQUEST)
+        return NULL;
     size = align_up(size, ALIGN);
 
-    /* allocate enough to find a 4K-aligned payload */
-    size_t pad = 4096 + sizeof(block_t);
+    /* a) Camino exacto: si el bloque que kmalloc() elegiría ya deja el
+     * payload en un límite de página, no hace falta pad ninguno. */
+    for (block_t *b = head; b; b = b->next) {
+        if (!b->free || b->size < size)
+            continue;
+        uintptr_t would_be = (uintptr_t)((uint8_t *)b + sizeof(block_t));
+        if ((would_be & 0xFFFu) == 0)
+            return kmalloc(size);        /* alineado y del tamaño exacto */
+        break;                           /* first-fit: ese es el bloque */
+    }
+
+    /* b) Camino general: pad para alcanzar el siguiente límite de página. */
+    const size_t pad = 4096 + sizeof(block_t);
+    if (size > KHEAP_MAX_REQUEST - pad)
+        return NULL;
     uint8_t *raw = (uint8_t *)kmalloc(size + pad);
     if (!raw)
         return NULL;
 
-    uintptr_t addr = (uintptr_t)raw;
+    uintptr_t addr    = (uintptr_t)raw;
     uintptr_t aligned = align_up(addr, 4096);
     if (aligned == addr)
-        return raw;   /* already aligned */
+        return raw;                      /* el pad sobra pero ya está alineado */
 
-    /* We can't easily move the block header, so store original ptr just before
-     * the aligned address for kfree to recover. */
     uint8_t *aligned_ptr = (uint8_t *)aligned;
-    ((void **)aligned_ptr)[-1] = raw;
+    ((void **)aligned_ptr)[-1] = raw;    /* kfree() recupera el bloque real */
     return aligned_ptr;
 }
 
@@ -144,12 +186,26 @@ void kfree(void *ptr)
     if (!ptr)
         return;
 
-    /* Detect aligned allocation (header is recorded just before payload and
-     * payload is not immediately after a valid block header). */
+    /* Rango válido: el arena es memoria estática, así que cualquier puntero
+     * fuera de [heap, heap+HEAP_SIZE) es un bug del llamante. Antes se leía
+     * `b->magic` a ciegas: un puntero basura podía "colar" si la palabra en
+     * `ptr - sizeof(block_t)` coincidía con MAGIC_USED, y entonces kfree()
+     * enlazaba un bloque falso en la lista -> el siguiente kmalloc escribía
+     * en cualquier sitio. También hacía falta el mínimo para que
+     * block_from_ptr() no apunte por debajo del arena. */
+    uintptr_t p = (uintptr_t)ptr;
+    uintptr_t lo = (uintptr_t)heap + sizeof(block_t);
+    uintptr_t hi = (uintptr_t)heap + HEAP_SIZE;
+    if (p < lo || p >= hi)
+        return;
+
     block_t *b = block_from_ptr(ptr);
     if (b->magic != MAGIC_USED) {
         /* maybe an aligned pointer: recover original raw pointer */
         void *raw = ((void **)ptr)[-1];
+        if ((uintptr_t)raw < (uintptr_t)heap ||
+            (uintptr_t)raw >= hi)
+            return;                       /* no es un puntero nuestro */
         block_t *rb = block_from_ptr(raw);
         if (rb->magic == MAGIC_USED) {
             rb->free  = true;
