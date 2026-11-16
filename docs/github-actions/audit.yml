@@ -96,9 +96,82 @@ jobs:
           exit $rc
 
       # ---------------------------------------------------------------------
-      # 5. El userland (71 programas ring 3) sigue compilando.
+      # 5. Regresiones concretas que ya han aparecido en auditorías.
+      #    (Baratas de comprobar y caras de depurar cuando vuelven.)
       # ---------------------------------------------------------------------
-      - name: 👤 Compilar userland (71 programas)
+      - name: 🛡️ Regresiones de seguridad / robustez
+        run: |
+          fail=0
+          chk() {   # chk <regex> <fichero> <descripción>
+            if grep -qE "$1" "$2"; then
+              echo "  ✅ $3"
+            else
+              echo "  ❌ FALTA: $3  (patrón: $1, en $2)"
+              fail=1
+            fi
+          }
+          # El fd de otro proceso no puede usarse (read/write/close/seek).
+          chk 'static kfd_t \*kfd_get' cpu/syscall.c               "cpu/syscall.c: kfd_get() comprueba owner_pid"
+          # ramfs/diskfile no deben desbordar uint32 en off+size.
+          chk 'RAMFS_MAX_FILE_BYTES' fs/ramfs.c               "fs/ramfs.c: write() acotado (sin overflow off+size)"
+          # vfs_get_path no puede reconstruir con strcat sin límite.
+          # (se ignoran las líneas de comentario: el propio arreglo las menciona)
+          if grep -v '^\s*\*' fs/vfs.c | grep -q 'strcat(tmp, rev)'; then
+            echo "  ❌ fs/vfs.c: vuelve a concatenar sin límite en vfs_get_path"; fail=1
+          else
+            echo "  ✅ fs/vfs.c: vfs_get_path() acotado"
+          fi
+          # path_normalize no puede reconstruir con strcat sobre out.
+          if grep -v '^\s*\*' fs/path.c | grep -q 'strcat(out, comps'; then
+            echo "  ❌ fs/path.c: vuelve a hacer strcat() sobre out en path_normalize"; fail=1
+          else
+            echo "  ✅ fs/path.c: path_normalize() acotado"
+          fi
+          # El buffer de salida de ring 3 debe ser por nivel de anidamiento.
+          chk 'g_exit_stack\[ELF_EXIT_MAX_NEST\]' cpu/syscall.c               "cpu/syscall.c: buffer de longjmp por nivel (no global)"
+          # El heap debe rechazar peticiones imposibles y validar punteros.
+          chk 'KHEAP_MAX_REQUEST' mm/kheap.c \
+              "mm/kheap.c: kmalloc rechaza tamaños imposibles (sin overflow)"
+          chk 'p < lo \|\| p >= hi' mm/kheap.c \
+              "mm/kheap.c: kfree() valida el rango del puntero"
+          # La detección de RAM debe usar el mmap, no solo mem_upper.
+          chk 'MULTIBOOT_FLAG_MMAP' kernel/kernel.c \
+              "kernel/kernel.c: detect_memory usa el mapa de memoria"
+          # Los compiladores in-kernel no deben parchear fuera del buffer.
+          chk 'off \+ 4 > MAX_CODE' shell/tcc.c               "shell/tcc.c: patch32() acotado"
+          chk 'code_offset \+ 4u > ' shell/tasm.c               "shell/tasm.c: fixups acotados"
+          exit $fail
+
+      # ---------------------------------------------------------------------
+      # 6. Análisis estático de GCC (-fanalyzer): NULL derefs, doble free,
+      #    uso después de free, desbordamientos conocidos... Es gratis y ya
+      #    encontró dos NULL deref reales en process_init().
+      # ---------------------------------------------------------------------
+      - name: 🔬 Análisis estático (-fanalyzer)
+        run: |
+          rc=0
+          for f in boot/*.c kernel/*.c drivers/*.c cpu/*.c mm/*.c \
+                   fs/*.c process/*.c shell/*.c auth/*.c lib/*.c user/*.c; do
+            out=$(gcc -m32 -std=gnu11 -ffreestanding -O1 -fanalyzer \
+                        -Wall -Wextra -nostdlib -fno-builtin \
+                        -fno-stack-protector -fno-pic -Iinclude -Ilib \
+                        -c "$f" -o /dev/null 2>&1 || true)
+            # Solo nos interesan los diagnósticos del analizador y los
+            # errores; los avisos de estilo están cubiertos por el paso 4.
+            bad=$(echo "$out" | grep -E '\[-Wanalyzer-|: error:' || true)
+            if [ -n "$bad" ]; then
+              echo "❌ $f"
+              echo "$bad" | head -6
+              rc=1
+            fi
+          done
+          [ $rc -eq 0 ] && echo "✅ -fanalyzer limpio"
+          exit $rc
+
+      # ---------------------------------------------------------------------
+      # 7. El userland (72 programas ring 3) sigue compilando.
+      # ---------------------------------------------------------------------
+      - name: 👤 Compilar userland (72 programas)
         run: |
           cd user/coreutils
           bash build.sh
