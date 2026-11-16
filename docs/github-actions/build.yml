@@ -136,26 +136,26 @@ jobs:
           cp ${{ env.KERNEL_BIN }} iso/boot/${{ env.KERNEL_BIN }}
 
           cat > iso/boot/grub/grub.cfg << 'GRUBEOF'
-set timeout=5
-set default=0
-set menu_color_normal=white/black
-set menu_color_highlight=black/light-gray
-
-menuentry "Trinux — Arranque normal" {
-  multiboot /boot/mykernel.bin
-  boot
-}
-
-menuentry "Trinux — Modo single-user (recovery)" {
-  multiboot /boot/mykernel.bin single
-  boot
-}
-
-menuentry "Trinux — Shell ring-0 (debug)" {
-  multiboot /boot/mykernel.bin oldsh
-  boot
-}
-GRUBEOF
+          set timeout=5
+          set default=0
+          set menu_color_normal=white/black
+          set menu_color_highlight=black/light-gray
+          
+          menuentry "Trinux — Arranque normal" {
+            multiboot /boot/mykernel.bin
+            boot
+          }
+          
+          menuentry "Trinux — Modo single-user (recovery)" {
+            multiboot /boot/mykernel.bin single
+            boot
+          }
+          
+          menuentry "Trinux — Shell ring-0 (debug)" {
+            multiboot /boot/mykernel.bin oldsh
+            boot
+          }
+          GRUBEOF
 
           # Reemplazar "Trinux" con "Trinux vX.Y.Z" en las entradas del menú
           sed -i "s/Trinux —/Trinux ${{ steps.version.outputs.version }} —/g" \
@@ -167,6 +167,20 @@ GRUBEOF
           ls -lh ${{ env.ISO_FILE }}
           file ${{ env.ISO_FILE }}
 
+          # ---- Verificación de que la ISO es realmente arrancable ----
+          # Un grub-mkrescue "con éxito" puede dejar una ISO sin MBR válido o
+          # sin el cfg; el síntoma al arrancar es `grub rescue>`.
+          SIG=$(dd if=${{ env.ISO_FILE }} bs=1 skip=510 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+          if [ "$SIG" != "55aa" ]; then
+            echo "❌ La ISO no tiene firma de arranque 0x55AA en el sector 0"
+            exit 1
+          fi
+          grep -qa "multiboot /boot/${{ env.KERNEL_BIN }}" ${{ env.ISO_FILE }} \
+            || { echo "❌ La ISO no contiene la entrada multiboot"; exit 1; }
+          grep -qa $'\x02\xb0\xad\x1b' ${{ env.KERNEL_BIN }} \
+            || { echo "❌ ${{ env.KERNEL_BIN }} no tiene cabecera Multiboot (0x1BADB002)"; exit 1; }
+          echo "✅ ISO verificada: MBR 0x55AA, grub.cfg con multiboot, kernel con magic Multiboot"
+
       - name: 🔌 Generar imagen USB de ${{ env.USB_SIZE }} MiB
         run: |
           echo "══════════════════════════════════════════════════════"
@@ -174,23 +188,37 @@ GRUBEOF
           echo ""
           echo "  Estructura de la imagen:"
           echo "  ┌──────────────────────────────────────────────────┐"
-          echo "  │  MBR híbrido GRUB (bootea en BIOS y UEFI)       │"
-          echo "  │  Kernel Trinux ${{ steps.version.outputs.version }}                       │"
+          echo "  │  GRUB + kernel en el arranque                   │"
           echo "  ├──────────────────────────────────────────────────┤"
           echo "  │  Zona de persistencia (filesystem del kernel)    │"
           echo "  │  → se graba con 'sync' dentro de Trinux          │"
           echo "  └──────────────────────────────────────────────────┘"
           echo "══════════════════════════════════════════════════════"
 
-          cp ${{ env.ISO_FILE }} ${{ env.USB_IMG }}
+          # OJO: antes esto era `cp trinux.iso trinux-usb.img` + truncate, que
+          # deja un ISO con ceros detrás. El GRUB del ISO busca su /boot/grub
+          # como (cd0); en un pendrive el firmware lo presenta como (hd0) y se
+          # acaba en `grub rescue>`. Se usa el script del repo, que conoce la
+          # estructura correcta, conserva la zona de persistencia al final y
+          # VERIFICA la imagen (firma 0x55AA + grub.cfg + kernel dentro).
+          chmod +x make-usb-image.sh
+          ./make-usb-image.sh ${{ env.USB_SIZE }}
 
-          ISO_BYTES=$(stat -c%s ${{ env.ISO_FILE }})
-          TARGET_BYTES=$(( ${{ env.USB_SIZE }} * 1024 * 1024 ))
-
-          if [ "$TARGET_BYTES" -gt "$ISO_BYTES" ]; then
-            echo "📏 Extendiendo: $((ISO_BYTES/1024/1024)) MiB → ${{ env.USB_SIZE }} MiB"
-            truncate -s "${TARGET_BYTES}" ${{ env.USB_IMG }}
+          # El script escribe mykernel-usb.img; el resto del workflow espera
+          # el nombre de env.USB_IMG.
+          if [ "mykernel-usb.img" != "${{ env.USB_IMG }}" ]; then
+            mv -f mykernel-usb.img ${{ env.USB_IMG }}
           fi
+
+          # Verificación independiente (el script ya aborta si algo falta, pero
+          # aquí se comprueba sobre el fichero final con el nombre definitivo).
+          SIG=$(dd if=${{ env.USB_IMG }} bs=1 skip=510 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+          if [ "$SIG" != "55aa" ]; then
+            echo "❌ ${{ env.USB_IMG }} no tiene firma de arranque 0x55AA"
+            exit 1
+          fi
+          grep -qa "multiboot /boot/${{ env.KERNEL_BIN }}" ${{ env.USB_IMG }} \
+            || { echo "❌ falta la entrada multiboot en la imagen"; exit 1; }
 
           FINAL=$(stat -c%s ${{ env.USB_IMG }})
           echo "✅ Imagen USB lista: $((FINAL/1024/1024)) MiB"

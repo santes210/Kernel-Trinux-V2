@@ -84,16 +84,41 @@ run-curses: $(KERNEL) $(DISK)
 		-drive file=$(DISK),format=raw,if=ide
 
 # ---- ISO (requires grub-mkrescue + xorriso) ----
+# Verifica de verdad que la imagen sirve: antes `grub-mkrescue` podía "tener
+# éxito" y dejar una ISO sin grub.cfg utilizable, cuyo síntoma al arrancar es
+# un `grub rescue>` en vez del menú.
 iso: $(KERNEL)
+	@# El kernel DEBE llevar la cabecera Multiboot v1 (magic 02 b0 ad 1b).
+	@if ! LC_ALL=C grep -qa $$'\x02\xb0\xad\x1b' $(KERNEL); then \
+	    echo "ERROR: $(KERNEL) no tiene el magic Multiboot (0x1BADB002)."; \
+	    echo "       GRUB no lo reconocera como kernel Multiboot."; exit 1; fi
 	mkdir -p iso/boot/grub
 	cp $(KERNEL) iso/boot/$(KERNEL)
 	printf 'set timeout=3\nset default=0\nmenuentry "Trinux" {\n  multiboot /boot/$(KERNEL)\n  boot\n}\nmenuentry "Trinux (single-user / recovery)" {\n  multiboot /boot/$(KERNEL) single\n  boot\n}\n' > iso/boot/grub/grub.cfg
+	grep -q "multiboot /boot/$(KERNEL)" iso/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) iso
-	@echo "Built $(ISO)"
+	@# Firma 0x55AA en el byte 510: sin ella la BIOS no arranca el medio.
+	@sig=$$(dd if=$(ISO) bs=1 skip=510 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n'); \
+	 if [ "$$sig" != "55aa" ]; then \
+	    echo "ERROR: $(ISO) no tiene firma de arranque 0x55AA en el MBR."; exit 1; fi
+	@# Que el cfg y el kernel esten DENTRO de la imagen (lo que busca GRUB).
+	@# Si GRUB arranca pero no los encuentra, el sintoma es `grub rescue>`.
+	@grep -qa "multiboot /boot/$(KERNEL)" $(ISO) \
+	   || { echo "ERROR: $(ISO) no contiene la entrada multiboot en /boot/grub/grub.cfg"; exit 1; }
+	@grep -qa $$'\x02\xb0\xad\x1b' $(ISO) \
+	   || { echo "ERROR: $(ISO) no contiene el kernel $(KERNEL) (sin magic Multiboot)"; exit 1; }
+	@echo "Built $(ISO) ($(shell stat -c%s $(ISO) 2>/dev/null || echo '?') bytes)"
 
 run-iso: iso $(DISK)
 	$(QEMU) -cdrom $(ISO) -m 512M -serial stdio \
 		-drive file=$(DISK),format=raw,if=ide
+
+# ---- Imagen USB (verificada) ----
+# No es un simple `cp` del ISO: el script comprueba firma MBR, grub.cfg y
+# kernel dentro de la imagen, y aborta si algo falta. Un fallo silencioso
+# aquí es exactamente lo que produce `grub rescue>` al arrancar el pendrive.
+usb: $(KERNEL)
+	bash make-usb-image.sh
 
 # ---- Smoke test (lo que ejecuta el CI) ----
 # Arranca el kernel en QEMU headless, captura COM1 y valida la secuencia de
@@ -135,4 +160,4 @@ clean:
 	rm -f $(OBJS) $(KERNEL) $(ISO)
 	rm -rf iso
 
-.PHONY: all run run-curses run-iso iso clean smoke audit analyze
+.PHONY: all run run-curses run-iso iso usb clean smoke audit analyze

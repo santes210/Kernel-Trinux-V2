@@ -31,6 +31,27 @@ Si no hay QEMU instalado, el script avisa y termina en 0 (para no romper
 entornos sin virtualización); en el CI **sí** está instalado y por tanto las
 comprobaciones son obligatorias.
 
+## Historial de correcciones en los workflows
+
+- **`build.yml` no era YAML válido.** El here-doc que genera
+  `iso/boot/grub/grub.cfg` estaba **sin indentar** dentro de un bloque
+  `run: |`. YAML terminaba el bloque escalar en el primer `set timeout=5` y
+  el archivo entero dejaba de parsear, con lo que **GitHub Actions no
+  ejecutaba el workflow** (fallaba como "workflow inválido", no como test en
+  rojo). Corregido indentando el cuerpo del heredoc y el `GRUBEOF`.
+- **La imagen USB era un ISO copiado.** El paso hacía
+  `cp trinux.iso trinux-usb.img` + `truncate`. El GRUB del ISO busca su
+  `/boot/grub` como `(cd0)`; en un pendrive el firmware lo presenta como
+  `(hd0)` y el arranque acaba en `grub rescue>`. Ahora se invoca
+  `./make-usb-image.sh`, que genera la imagen correcta y la verifica.
+- **Verificación añadida.** Tanto el paso de ISO como el de USB comprueban
+  firma `0x55AA` en el sector 0, la entrada `multiboot` del `grub.cfg` y el
+  magic `0x1BADB002` del kernel. Si falta algo, el build **falla** en vez de
+  publicar un medio que no arranca.
+
+Detalle completo del diagnóstico de arranque: `DIAGNOSTICO_UEFI.md` y
+`GRUB_RESCUE.md` en la raíz del repo.
+
 ## Cómo probarlo en local
 
 ```bash
