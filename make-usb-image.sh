@@ -138,6 +138,16 @@ else
   search --no-floppy --file --set=root /boot/__KERNEL__
 fi
 
+# Modulos que el menu NECESITA, cargados EXPLICITAMENTE.
+# grub-mkrescue deja todos los .mod en /boot/grub/i386-pc del ISO y fija
+# `prefix` ahi (lo comprobamos en util/grub-mkrescue.c: su load_cfg embebido
+# solo hace `search --fs-uuid` + `set prefix`, y la lista de modulos la pone
+# el propio ISO). Normalmente GRUB autocarga un modulo cuando el comando no
+# existe, pero de eso a que funcione siempre hay un trecho: si la autocarga
+# falla, `multiboot` da "unknown command" y el arranque muere otra vez.
+insmod multiboot
+insmod relocator
+
 # Video: NO cargamos gfxterm a proposito. El menu se dibuja con la consola del
 # firmware (texto por GOP), que siempre existe, y el framebuffer del KERNEL lo
 # negocia GRUB a partir de la cabecera Multiboot (flags bit 2 = FB_VIDMODE),
@@ -170,11 +180,12 @@ GRUBEOF
 sed -i "s/__KERNEL__/${KERNEL}/g" "$BUILDDIR/grub.cfg"
 grep -q "multiboot /boot/${KERNEL}" "$BUILDDIR/grub.cfg" || \
     die "el grub.cfg no contiene la entrada multiboot esperada"
-# El grub.cfg de la PARTICION: se carga cuando `root` ya apunta a la
-# particion (BIOS: ISO9660; UEFI: FAT). El del memdisk es el que lleva la
-# logica de busqueda; repetirla aqui solo puede fallar de nuevo.
-sed 's|^[[:space:]]*search --no-floppy|# search ya resuelto por el memdisk: no repetir|' \
-    "$BUILDDIR/grub.cfg" > "$ISODIR/boot/grub/grub.cfg"
+# AHORA hay UN SOLO grub.cfg: este. Antes se duplicaba (uno embebido en el
+# .EFI/memdisk y otro en la particion) y el de la particion llevaba el
+# `search` comentado porque "ya lo habia resuelto el memdisk". Eso ya no
+# aplica: grub-mkrescue embebe su propio cargador y el unico cfg que existe
+# es el de la ISO, asi que tiene que llevar la logica de busqueda COMPLETA.
+cp "$BUILDDIR/grub.cfg" "$ISODIR/boot/grub/grub.cfg"
 cp "$KERNEL" "$ISODIR/boot/$KERNEL"
 
 # -------------------------------------------------- ISO (grub-mkrescue) ----
