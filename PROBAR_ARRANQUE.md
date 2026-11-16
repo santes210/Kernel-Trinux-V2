@@ -43,6 +43,40 @@ colgada aunque el kernel esté corriendo.
 
 ---
 
+## Prueba 1b — El mismo test, pero por **UEFI** (el que usa tu portátil)
+
+La Prueba 1 arranca por BIOS (`SeaBIOS`). Tu portátil es UEFI-only, así que hay
+que probar ese camino por separado. **No hace falta descargar nada**: QEMU para
+Windows ya trae el firmware, pero se llama distinto de lo que dicen casi todas
+las guías.
+
+En `C:\Program Files\qemu\share` los ficheros son:
+
+| Fichero | Qué es |
+|---|---|
+| `edk2-x86_64-code.fd` | **OVMF de 64 bits — el que quieres** |
+| `edk2-i386-code.fd` | OVMF de 32 bits (plan B) |
+| `edk2-x86_64-secure-code.fd` | ⚠️ variante **Secure Boot** — NO usar |
+
+No existe `vars.fd` para x86_64 en este paquete; con `-bios` no lo necesitas
+(las variables UEFI no persisten entre reinicios, y aquí solo probamos un
+arranque).
+
+```powershell
+cd "C:\Program Files\qemu"
+qemu-system-x86_64 -nographic -bios "share\edk2-x86_64-code.fd" ^
+  -drive file="C:\Users\<TU_USUARIO>\Downloads\trinus-v0.3.0-45-g4a7d6f0\trinus-usb-512.img",format=raw,if=ide -m 512M
+```
+
+**Qué mirar para saber que es UEFI de verdad:** ya no aparece `SeaBIOS` ni
+`Booting from Hard Disk...`. En su lugar sale la salida de `BdsDxe` / edk2, y
+luego el mismo menú de GRUB 2.06 y el mismo `root@trinux:/#`.
+
+Si sale `qemu: could not load PC BIOS`, la ruta está mal: comprueba con
+`dir "C:\Program Files\qemu\share\edk2*.fd"`.
+
+---
+
 ## Prueba 2 — El menú de diagnóstico (solo si la Prueba 1 es ambigua)
 
 En el menú de GRUB hay una entrada llamada:

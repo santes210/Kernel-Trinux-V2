@@ -138,6 +138,10 @@ run-usb-uefi:
 # /usr/share/edk2/). Se prueban todas antes de rendirse.
 	@OVMF=$$(ls /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF_CODE.fd \
 	              /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.fd \
+	              /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+	              /usr/share/OVMF/OVMF_CODE_4M.fd \
+	              /usr/share/qemu/edk2-x86_64-code.fd \
+	              /usr/share/qemu/edk2-i386-code.fd \
 	              /usr/share/OVMF/OVMF.fd /usr/share/ovmf/OVMF.fd 2>/dev/null | head -1); \
 	 [ -n "$$OVMF" ] || { echo "OVMF no encontrado: apt install ovmf (o edk2-ovmf)"; exit 1; }; \
 	 echo "OVMF: $$OVMF"; \
