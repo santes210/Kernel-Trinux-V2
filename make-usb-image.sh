@@ -240,16 +240,30 @@ mcopy -i "$BUILDDIR/efiboot.img" "$BUILDDIR/grub.cfg" ::/boot/grub.cfg
 CDBOOT="$GRUB_PC_DIR/cdboot.img"
 [ -f "$CDBOOT" ] || die "no existe $CDBOOT — instala grub-pc-bin"
 
-info "Generando el arranque BIOS (i386-pc: core.img + cdboot.img)..."
-grub-mkimage \
+info "Generando el arranque BIOS (i386-pc: standalone + cdboot.img)..."
+# ANTES se usaba `grub-mkimage --prefix=/boot/grub`. Eso hace que GRUB busque
+# sus modulos en ($root)/boot/grub/i386-pc/*.mod, un directorio que NO existe
+# en la imagen (solo ponemos grub.cfg + kernel + bios.img). GRUB arrancaba,
+# imprimia "GRUB" y se quedaba ahi clavado, sin menu y sin escribir nada al
+# puerto serie.
+#
+# Ahora se usa `grub-mkstandalone`, que mete DENTRO de core.img tanto el cfg
+# como los modulos, con prefix=(memdisk). Es el mismo enfoque que ya funciona
+# en la ruta UEFI, y elimina de raiz cualquier busqueda de $prefix en disco.
+grub-mkstandalone \
     --format=i386-pc \
     --output="$BUILDDIR/core.img" \
-    --prefix=/boot/grub \
+    --install-modules="normal multiboot relocator search search_fs_file \
+                       iso9660 biosdisk part_msdos part_gpt fat memdisk tar \
+                       configfile echo test all_video" \
+    --modules="normal multiboot relocator search search_fs_file iso9660 \
+               biosdisk part_msdos part_gpt fat memdisk configfile echo test \
+               all_video" \
+    --locales="" --themes="" --fonts="" \
     --compress=xz \
-    biosdisk iso9660 part_msdos part_gpt fat normal multiboot relocator \
-    search search_fs_file configfile echo test all_video \
-    >/dev/null 2>&1 || die "grub-mkimage (i386-pc) fallo"
-[ -s "$BUILDDIR/core.img" ] || die "grub-mkimage no genero core.img"
+    "boot/grub/grub.cfg=$BUILDDIR/grub.cfg" \
+    >/dev/null 2>&1 || die "grub-mkstandalone (i386-pc) fallo"
+[ -s "$BUILDDIR/core.img" ] || die "grub-mkstandalone no genero core.img"
 
 # cdboot.img debe ir DELANTE: es el que la BIOS ejecuta en modo no-emulacion.
 cat "$CDBOOT" "$BUILDDIR/core.img" > "$BUILDDIR/bios.img"
@@ -354,7 +368,22 @@ if [ "$SIZE_MB" -lt "$MIN_FOR_PERSIST" ]; then
     warn "  El kernel arrancara igual, pero los ficheros se quedaran en RAM."
 fi
 
-rm -rf "$BUILDDIR"
+rm -rf "$BUILDDIR" "$ISODIR"
+
+# Sonda de depuracion: la primera particion del ISO debe ser la imagen de
+# arranque (bios.img), que el BIOS ejecuta en modo no-emulacion.
+#   offset 0x8000 (sector 16) = LBA de inicio de la particion de arranque
+#   offset 0x8007              = tipo de medio (0 = no-emulacion)
+# Si el tipo no es 0, el BIOS carga la imagen EN MODO EMULACION de disquete,
+# lo que rompe GRUB de formas muy dificiles de diagnosticar.
+BOOT_LBA_HEX=$(dd if="$OUT" bs=1 skip=$((0x8000)) count=4 2>/dev/null | od -An -tu4 --endian=little | tr -d ' \n')
+MEDIA_TYPE=$(dd if="$OUT" bs=1 skip=$((0x8007)) count=1 2>/dev/null | od -An -tu1 | tr -d ' \n')
+if [ -n "$BOOT_LBA_HEX" ]; then
+    echo "    [debug] El Torito: LBA de arranque=$BOOT_LBA_HEX  tipo_medio=${MEDIA_TYPE:-?} (0=no-emulacion)"
+    if [ "${MEDIA_TYPE:-0}" != "0" ]; then
+        warn "el tipo de emulacion no es 0: el BIOS cargara bios.img como disquete."
+    fi
+fi
 
 FINAL=$(stat -c%s "$OUT")
 echo

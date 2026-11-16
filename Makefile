@@ -21,6 +21,7 @@ endif
 
 ASM := nasm
 QEMU := qemu-system-i386
+QEMU_SYS64 := qemu-system-x86_64
 
 # ---- Flags ----
 CFLAGS  := $(ARCHFLAGS) -std=gnu11 -ffreestanding -O2 -Wall -Wextra \
@@ -118,6 +119,26 @@ run-iso: iso $(DISK)
 	$(QEMU) -cdrom $(ISO) -m 512M -serial stdio \
 		-drive file=$(DISK),format=raw,if=ide
 
+# ---- Probar la imagen USB en QEMU (BIOS + serie en la MISMA ventana) ----
+# Con `-serial stdio` la consola serie se va a la terminal, asi que la ventana
+# de QEMU se queda SIN VIDEO y parece colgada en "GRUB" aunque el kernel haya
+# arrancado perfectamente. Con `-nographic` el BIOS, GRUB, la salida del
+# kernel y el puerto serie comparten una sola consola: es la forma correcta
+# de ver si GRUB dibuja su menu.
+#   salir: Ctrl-A seguido de X
+run-usb:
+	@[ -f mykernel-usb.img ] || { echo "falta mykernel-usb.img; ejecuta 'make usb'"; exit 1; }
+	$(QEMU) -nographic -drive file=mykernel-usb.img,format=raw,if=ide -m 512M
+
+# Version UEFI (necesita OVMF instalado: apt install ovmf)
+run-usb-uefi:
+	@[ -f mykernel-usb.img ] || { echo "falta mykernel-usb.img; ejecuta 'make usb'"; exit 1; }
+	@OVMF=$$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd \
+	              /usr/share/edk2/ovmf/OVMF_CODE.fd 2>/dev/null | head -1); \
+	 [ -n "$$OVMF" ] || { echo "OVMF no encontrado: apt install ovmf"; exit 1; }; \
+	 $(QEMU_SYS64) -nographic -bios "$$OVMF" \
+		-drive file=mykernel-usb.img,format=raw,if=ide -m 512M
+
 # ---- Imagen USB (verificada) ----
 # No es un simple `cp` del ISO: el script comprueba firma MBR, grub.cfg y
 # kernel dentro de la imagen, y aborta si algo falta. Un fallo silencioso
@@ -165,4 +186,4 @@ clean:
 	rm -f $(OBJS) $(KERNEL) $(ISO)
 	rm -rf iso
 
-.PHONY: all run run-curses run-iso iso usb clean smoke audit analyze
+.PHONY: all run run-curses run-iso iso usb run-usb run-usb-uefi clean smoke audit analyze
