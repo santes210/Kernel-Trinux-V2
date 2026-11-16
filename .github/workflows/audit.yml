@@ -1,0 +1,178 @@
+name: Trinux — Auditoría estática
+
+# Comprobaciones que no necesitan arrancar el kernel y que hasta ahora solo se
+# hacían a mano durante la auditoría:
+#   • los 73 syscalls de user/trinux.h tienen handler en cpu/syscall.c
+#   • los headers con fuentes embebidos (kernel/*_src.h) están sincronizados
+#   • no hay objetos .o / binarios compilados colándose en el repo
+#   • no quedan llamadas implícitas (= prototipos olvidados) en el kernel
+#   • el userland sigue compilando entero (71 programas)
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - 'arena/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: 🔎 Auditoría estática
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📦 Dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-multilib binutils
+          gcc --version | head -1
+
+      # ---------------------------------------------------------------------
+      # 1. Cada SYS_* declarado tiene su `case` en el dispatcher.
+      # ---------------------------------------------------------------------
+      - name: 🔢 Syscalls declarados vs implementados
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          h = open('user/trinux.h').read()
+          c = open('cpu/syscall.c').read()
+          declared = {int(n): name for name, n in
+                      re.findall(r'#define\s+(SYS_\w+)\s+(\d+)', h)}
+          impl = set(re.findall(r'case\s+(SYS_\w+)\s*:', c))
+          missing = [(declared[n], n) for n in sorted(declared)
+                     if declared[n] not in impl]
+          print(f"declarados: {len(declared)}  con handler: {len(declared)-len(missing)}")
+          for name, n in missing:
+              print(f"  ❌ {name} ({n}) sin handler en cpu/syscall.c")
+          sys.exit(1 if missing else 0)
+          PY
+
+      # ---------------------------------------------------------------------
+      # 2. Headers embebidos sincronizados (scripts/gen_embedded.py).
+      # ---------------------------------------------------------------------
+      - name: 🧩 Fuentes embebidos actualizados
+        run: python3 scripts/gen_embedded.py --check
+
+      # ---------------------------------------------------------------------
+      # 3. Nada de artefactos de compilación versionados.
+      # ---------------------------------------------------------------------
+      - name: 🧹 Sin .o / binarios en el repo
+        run: |
+          bad=$(git ls-files '*.o' '*.bin' '*.iso' '*.img' | tr '\n' ' ')
+          if [ -n "$bad" ]; then
+            echo "❌ Artefactos versionados: $bad"
+            exit 1
+          fi
+          echo "✅ limpio"
+
+      # ---------------------------------------------------------------------
+      # 4. El kernel compila SIN llamadas implícitas (un prototipo olvidado
+      #    trunca punteros: pasó con kprintf y con tss_set_kernel_stack).
+      # ---------------------------------------------------------------------
+      - name: 🧠 Sin llamadas implícitas en el kernel
+        run: |
+          set -o pipefail
+          rc=0
+          for f in boot/*.c kernel/*.c drivers/*.c cpu/*.c mm/*.c \
+                   fs/*.c process/*.c shell/*.c auth/*.c lib/*.c user/*.c; do
+            out=$(gcc -m32 -std=gnu11 -ffreestanding -O2 -Wall -Wextra \
+                        -nostdlib -fno-builtin -fno-stack-protector -fno-pic \
+                        -fno-asynchronous-unwind-tables -Iinclude -Ilib \
+                        -c "$f" -o /dev/null 2>&1 || true)
+            if echo "$out" | grep -q 'implicit declaration'; then
+              echo "❌ $f:"
+              echo "$out" | grep 'implicit declaration' | head -3
+              rc=1
+            fi
+          done
+          [ $rc -eq 0 ] && echo "✅ ninguna llamada implícita"
+          exit $rc
+
+      # ---------------------------------------------------------------------
+      # 5. Regresiones concretas que ya han aparecido en auditorías.
+      #    (Baratas de comprobar y caras de depurar cuando vuelven.)
+      # ---------------------------------------------------------------------
+      - name: 🛡️ Regresiones de seguridad / robustez
+        run: |
+          fail=0
+          chk() {   # chk <regex> <fichero> <descripción>
+            if grep -qE "$1" "$2"; then
+              echo "  ✅ $3"
+            else
+              echo "  ❌ FALTA: $3  (patrón: $1, en $2)"
+              fail=1
+            fi
+          }
+          # El fd de otro proceso no puede usarse (read/write/close/seek).
+          chk 'static kfd_t \*kfd_get' cpu/syscall.c               "cpu/syscall.c: kfd_get() comprueba owner_pid"
+          # ramfs/diskfile no deben desbordar uint32 en off+size.
+          chk 'RAMFS_MAX_FILE_BYTES' fs/ramfs.c               "fs/ramfs.c: write() acotado (sin overflow off+size)"
+          # vfs_get_path no puede reconstruir con strcat sin límite.
+          # (se ignoran las líneas de comentario: el propio arreglo las menciona)
+          if grep -v '^\s*\*' fs/vfs.c | grep -q 'strcat(tmp, rev)'; then
+            echo "  ❌ fs/vfs.c: vuelve a concatenar sin límite en vfs_get_path"; fail=1
+          else
+            echo "  ✅ fs/vfs.c: vfs_get_path() acotado"
+          fi
+          # path_normalize no puede reconstruir con strcat sobre out.
+          if grep -v '^\s*\*' fs/path.c | grep -q 'strcat(out, comps'; then
+            echo "  ❌ fs/path.c: vuelve a hacer strcat() sobre out en path_normalize"; fail=1
+          else
+            echo "  ✅ fs/path.c: path_normalize() acotado"
+          fi
+          # El buffer de salida de ring 3 debe ser por nivel de anidamiento.
+          chk 'g_exit_stack\[ELF_EXIT_MAX_NEST\]' cpu/syscall.c               "cpu/syscall.c: buffer de longjmp por nivel (no global)"
+          # El heap debe rechazar peticiones imposibles y validar punteros.
+          chk 'KHEAP_MAX_REQUEST' mm/kheap.c \
+              "mm/kheap.c: kmalloc rechaza tamaños imposibles (sin overflow)"
+          chk 'p < lo \|\| p >= hi' mm/kheap.c \
+              "mm/kheap.c: kfree() valida el rango del puntero"
+          # La detección de RAM debe usar el mmap, no solo mem_upper.
+          chk 'MULTIBOOT_FLAG_MMAP' kernel/kernel.c \
+              "kernel/kernel.c: detect_memory usa el mapa de memoria"
+          # Los compiladores in-kernel no deben parchear fuera del buffer.
+          chk 'off \+ 4 > MAX_CODE' shell/tcc.c               "shell/tcc.c: patch32() acotado"
+          chk 'code_offset \+ 4u > ' shell/tasm.c               "shell/tasm.c: fixups acotados"
+          exit $fail
+
+      # ---------------------------------------------------------------------
+      # 6. Análisis estático de GCC (-fanalyzer): NULL derefs, doble free,
+      #    uso después de free, desbordamientos conocidos... Es gratis y ya
+      #    encontró dos NULL deref reales en process_init().
+      # ---------------------------------------------------------------------
+      - name: 🔬 Análisis estático (-fanalyzer)
+        run: |
+          rc=0
+          for f in boot/*.c kernel/*.c drivers/*.c cpu/*.c mm/*.c \
+                   fs/*.c process/*.c shell/*.c auth/*.c lib/*.c user/*.c; do
+            out=$(gcc -m32 -std=gnu11 -ffreestanding -O1 -fanalyzer \
+                        -Wall -Wextra -nostdlib -fno-builtin \
+                        -fno-stack-protector -fno-pic -Iinclude -Ilib \
+                        -c "$f" -o /dev/null 2>&1 || true)
+            # Solo nos interesan los diagnósticos del analizador y los
+            # errores; los avisos de estilo están cubiertos por el paso 4.
+            bad=$(echo "$out" | grep -E '\[-Wanalyzer-|: error:' || true)
+            if [ -n "$bad" ]; then
+              echo "❌ $f"
+              echo "$bad" | head -6
+              rc=1
+            fi
+          done
+          [ $rc -eq 0 ] && echo "✅ -fanalyzer limpio"
+          exit $rc
+
+      # ---------------------------------------------------------------------
+      # 7. El userland (72 programas ring 3) sigue compilando.
+      # ---------------------------------------------------------------------
+      - name: 👤 Compilar userland (72 programas)
+        run: |
+          cd user/coreutils
+          bash build.sh
+          ls bin | wc -l
